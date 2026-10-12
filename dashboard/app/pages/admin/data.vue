@@ -13,15 +13,17 @@ interface Data { usage: Usage[], projects: { id: string, name: string }[], files
 
 definePageMeta({ admin: true })
 const toast = useToast()
-const { t, dateLocale } = useLang()
-const { data, refresh } = useFetch<Data>('/api/data')
+const { t, when: fmtWhen } = useLang()
+const { data, refresh, error } = useFetch<Data>('/api/data')
+// sizing every project's files takes a while: the page shows its shape until then
+const loading = computed(() => !data.value && !error.value)
 
 const KINDS: Kind[] = ['chat', 'burn', 'task']
 const LEVELS: Level[] = ['content', 'summary', 'delete']
 const kindLabel = (k: Kind) => ({ chat: t('data.kind.chat'), burn: t('data.kind.burn'), task: t('data.kind.task') })[k]
 const levelLabel = (l: Level) => ({ delete: t('data.level.delete'), content: t('data.level.content'), summary: t('data.level.summary') })[l]
 const levelHint = (l: Level) => ({ delete: t('data.level.deleteHint'), content: t('data.level.contentHint'), summary: t('data.level.summaryHint') })[l]
-const when = (iso?: string | null) => iso ? new Date(iso).toLocaleString(dateLocale.value, { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'
+const when = (iso?: string | null) => iso ? fmtWhen(iso) : '—'
 
 // ---- what each project keeps ----
 const projectName = (id: string) => data.value?.projects.find(p => p.id === id)?.name ?? id
@@ -70,16 +72,24 @@ const form = reactive({ project: ALL, kinds: [...KINDS] as Kind[], days: 30, lev
 const projectItems = computed(() => [{ label: t('data.allProjects'), value: ALL }, ...(data.value?.projects ?? []).map(p => ({ label: p.name, value: p.id }))])
 const request = computed(() => ({ project_id: form.project === ALL ? '' : form.project, kinds: form.kinds, older_than_days: form.days, level: form.level }))
 const plan = ref<{ count: number, items: Item[], skipped: Item[], bytes: number, messages: number } | null>(null)
-watch(form, () => { plan.value = null }, { deep: true })
+const planned = ref<typeof request.value | null>(null)
 const planning = ref(false)
+let seq = 0
+watch(form, () => { seq++; plan.value = null; planned.value = null; planning.value = false }, { deep: true })
 async function preview() {
+  const my = ++seq
   planning.value = true
+  const req = { ...request.value, kinds: [...request.value.kinds] }
   try {
-    plan.value = await $fetch('/api/data/plan', { method: 'POST', body: request.value })
+    const res = await $fetch('/api/data/plan', { method: 'POST', body: req })
+    if (my !== seq) return
+    plan.value = res
+    planned.value = req
   } catch (e) {
+    if (my !== seq) return
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
-    planning.value = false
+    if (my === seq) planning.value = false
   }
 }
 function cleanProject(id: string) {
@@ -87,14 +97,20 @@ function cleanProject(id: string) {
   nextTick(() => document.getElementById('data-clean')?.scrollIntoView({ behavior: 'smooth' }))
 }
 const confirmOpen = ref(false)
+const cleaning = ref(false)
 async function clean() {
-  confirmOpen.value = false
+  if (cleaning.value || !planned.value) return
+  cleaning.value = true
   try {
-    await $fetch('/api/data/clean', { method: 'POST', body: request.value })
+    await $fetch('/api/data/clean', { method: 'POST', body: planned.value })
+    confirmOpen.value = false
     plan.value = null
+    planned.value = null
     await refresh()
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
+  } finally {
+    cleaning.value = false
   }
 }
 // while it runs: follow it
@@ -126,12 +142,9 @@ async function saveAuto() {
 </script>
 
 <template>
-  <div class="mx-auto max-w-6xl space-y-4 p-4 sm:p-6">
-    <div class="flex items-center gap-2">
-      <UIcon name="i-lucide-database" class="size-5" />
-      <h1 class="text-lg font-semibold">{{ t('nav.data') }}</h1>
-    </div>
-
+  <PageShell :title="t('nav.data')">
+  <div class="max-w-6xl space-y-4">
+    <UAlert v-if="error" color="error" variant="subtle" icon="i-lucide-triangle-alert" :title="t('common.loadError')" :actions="[{ label: t('common.refresh'), onClick: () => refresh() }]" />
     <!-- what is kept, at a glance -->
     <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
       <UCard v-for="c in [
@@ -141,7 +154,8 @@ async function saveAuto() {
         { label: t('data.dbFile'), size: totals.db, icon: 'i-lucide-hard-drive' }
       ]" :key="c.label" :ui="{ body: 'sm:p-4' }">
         <p class="flex items-center gap-1.5 text-xs text-(--ui-text-muted)"><UIcon :name="c.icon" class="size-4" />{{ c.label }}</p>
-        <p class="mt-1 text-xl font-semibold tabular-nums">{{ fmtBytes(c.size) }}</p>
+        <USkeleton v-if="loading" class="mt-1.5 h-6 w-20" />
+        <p v-else class="mt-1 text-xl font-semibold tabular-nums">{{ fmtBytes(c.size) }}</p>
       </UCard>
       <UCard :ui="{ body: 'sm:p-4' }">
         <p class="flex items-center gap-1.5 text-xs text-(--ui-text-muted)">
@@ -149,7 +163,8 @@ async function saveAuto() {
           <UTooltip :text="t('data.junkHint')"><UIcon name="i-lucide-info" class="size-3.5" /></UTooltip>
         </p>
         <div class="mt-1 flex items-center justify-between gap-2">
-          <span class="text-xl font-semibold tabular-nums">{{ fmtBytes(totals.junk) }}</span>
+          <USkeleton v-if="loading" class="h-6 w-20" />
+          <span v-else class="text-xl font-semibold tabular-nums">{{ fmtBytes(totals.junk) }}</span>
           <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-brush-cleaning" :label="t('data.sweep')" :loading="sweeping" :disabled="!totals.junk" @click="sweep" />
         </div>
       </UCard>
@@ -184,7 +199,8 @@ async function saveAuto() {
               <td class="px-3 py-2 text-right tabular-nums">{{ r.files?.junk ? fmtBytes(r.files.junk) : '—' }}</td>
               <td class="px-3 py-2 text-right"><UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-eraser" :label="t('data.cleanThis')" @click="cleanProject(r.id)" /></td>
             </tr>
-            <tr v-if="!rows.length"><td colspan="8" class="px-4 py-6 text-center text-(--ui-text-muted)">{{ t('data.empty') }}</td></tr>
+            <tr v-if="loading"><td colspan="8" class="p-0"><LoadingRows :n="3" :icon="false" /></td></tr>
+            <tr v-else-if="!rows.length"><td colspan="8" class="px-4 py-6 text-center text-(--ui-text-muted)">{{ t('data.empty') }}</td></tr>
           </tbody>
         </table>
       </div>
@@ -222,12 +238,12 @@ async function saveAuto() {
       </div>
       <div v-else class="flex flex-wrap items-center gap-2">
         <UButton icon="i-lucide-search" :label="t('data.preview')" color="neutral" variant="outline" :loading="planning" :disabled="!form.kinds.length" @click="preview" />
-        <UButton v-if="plan?.count" icon="i-lucide-eraser" :color="form.level === 'delete' ? 'error' : 'primary'" :label="t('data.cleanN', { n: plan.count })" @click="confirmOpen = true" />
+        <UButton v-if="plan?.count" icon="i-lucide-eraser" :color="planned?.level === 'delete' ? 'error' : 'primary'" :label="t('data.cleanN', { n: plan.count })" @click="confirmOpen = true" />
       </div>
 
       <div v-if="plan" class="space-y-2 rounded-lg bg-(--ui-bg-elevated)/50 p-3 text-sm">
         <p>{{ plan.count ? t('data.planSummary', { n: plan.count, size: fmtBytes(plan.bytes), m: plan.messages }) : t('data.planNone') }}</p>
-        <p v-if="form.level === 'summary' && plan.count" class="flex items-start gap-1.5 text-xs text-(--ui-warning)"><UIcon name="i-lucide-info" class="mt-0.5 size-4 shrink-0" />{{ t('data.summaryCost', { n: plan.count }) }}</p>
+        <p v-if="planned?.level === 'summary' && plan.count" class="flex items-start gap-1.5 text-xs text-(--ui-warning)"><UIcon name="i-lucide-info" class="mt-0.5 size-4 shrink-0" />{{ t('data.summaryCost', { n: plan.count }) }}</p>
         <ul class="max-h-56 space-y-0.5 overflow-auto text-xs">
           <li v-for="it in plan.items" :key="it.id" class="flex gap-2">
             <UBadge :label="kindLabel(it.kind)" color="neutral" variant="subtle" size="sm" />
@@ -258,9 +274,10 @@ async function saveAuto() {
     <UCard :ui="{ body: 'space-y-3 sm:p-4' }">
       <div class="flex items-center gap-2">
         <p class="flex flex-1 items-center gap-2 text-sm font-semibold"><UIcon name="i-lucide-calendar-clock" class="size-4" />{{ t('data.autoTitle') }}</p>
-        <USwitch v-model="auto.enabled" />
+        <USwitch v-model="auto.enabled" :disabled="loading" />
       </div>
-      <div class="grid gap-3 sm:grid-cols-3">
+      <LoadingRows v-if="loading" :n="2" :icon="false" />
+      <div v-else class="grid gap-3 sm:grid-cols-3">
         <UFormField :label="t('data.olderThan')">
           <div class="flex items-center gap-2"><UInputNumber v-model="auto.days" :min="1" class="w-32" /><span class="text-sm text-(--ui-text-muted)">{{ t('data.days') }}</span></div>
         </UFormField>
@@ -276,22 +293,23 @@ async function saveAuto() {
       </div>
       <p v-if="auto.enabled && auto.level === 'summary'" class="flex items-start gap-1.5 text-xs text-(--ui-warning)"><UIcon name="i-lucide-info" class="mt-0.5 size-4 shrink-0" />{{ t('data.autoSummaryCost') }}</p>
       <div class="flex flex-wrap items-center gap-3">
-        <UButton size="sm" icon="i-lucide-save" :label="t('common.save')" :loading="savingAuto" :disabled="!auto.kinds.length" @click="saveAuto" />
+        <UButton size="sm" icon="i-lucide-save" :label="t('common.save')" :loading="savingAuto" :disabled="loading || !auto.kinds.length" @click="saveAuto" />
         <span v-if="data?.auto.last_run" class="text-xs text-(--ui-text-muted)">{{ t('data.autoLast', { at: when(data.auto.last_run), msg: data.auto.last_msg ?? '' }) }}</span>
       </div>
     </UCard>
 
     <UModal v-model:open="confirmOpen" :title="t('data.confirmTitle')">
       <template #body>
-        <p class="text-sm">{{ t('data.confirmBody', { n: plan?.count ?? 0, level: levelLabel(form.level), size: fmtBytes(plan?.bytes ?? 0) }) }}</p>
-        <p v-if="form.level === 'delete'" class="mt-2 text-sm text-(--ui-error)">{{ t('data.confirmDelete') }}</p>
+        <p class="text-sm">{{ t('data.confirmBody', { n: plan?.count ?? 0, level: levelLabel(planned?.level ?? form.level), size: fmtBytes(plan?.bytes ?? 0) }) }}</p>
+        <p v-if="planned?.level === 'delete'" class="mt-2 text-sm text-(--ui-error)">{{ t('data.confirmDelete') }}</p>
       </template>
       <template #footer>
         <div class="flex w-full justify-end gap-2">
-          <UButton color="neutral" variant="ghost" :label="t('common.cancel')" @click="confirmOpen = false" />
-          <UButton :color="form.level === 'delete' ? 'error' : 'primary'" icon="i-lucide-eraser" :label="t('data.cleanN', { n: plan?.count ?? 0 })" @click="clean" />
+          <UButton color="neutral" variant="ghost" :label="t('common.cancel')" :disabled="cleaning" @click="confirmOpen = false" />
+          <UButton :color="planned?.level === 'delete' ? 'error' : 'primary'" icon="i-lucide-eraser" :label="t('data.cleanN', { n: plan?.count ?? 0 })" :loading="cleaning" :disabled="cleaning" @click="clean" />
         </div>
       </template>
     </UModal>
   </div>
+  </PageShell>
 </template>

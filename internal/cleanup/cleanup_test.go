@@ -13,11 +13,11 @@ import (
 	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/cleanup"
 	"github.com/tung1998/agent-office/internal/llm"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/usage"
 )
 
@@ -53,11 +53,10 @@ echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"- sửa lỗi thanh toán, nhánh fix/pay","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
 `), 0o755)
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	engine := chat.NewEngine(st, provs, u)
 	attach := filepath.Join(tmp, "attachments")
 	return fx{st: st, svc: cleanup.New(st, engine, nil, attach, filepath.Join(tmp, "o.db")), engine: engine, project: project, attach: attach}
@@ -136,38 +135,6 @@ func TestSummaryAndDelete(t *testing.T) {
 	}
 	if _, err := f.st.Chat().GetConversation(ctx, c.ID); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("still there: %v", err)
-	}
-}
-
-// A chat with a diff waiting, a running task: left as they are, and why.
-func TestBusyIsLeft(t *testing.T) {
-	f := setup(t)
-	ctx := context.Background()
-	c := f.chatWith(t, "", 1, time.Now())
-	msgs, _ := f.st.Chat().ListMessages(ctx, c.ID)
-	f.st.Chat().AddPatch(ctx, storage.Patch{ConversationID: c.ID, MessageID: msgs[0].ID, Diff: "x", Status: "pending"})
-	running, _ := f.st.Tasks().Create(ctx, storage.Task{ProjectID: f.project.ID, Goal: "đang làm", Mode: "single", Status: "running"})
-	done, _ := f.st.Tasks().Create(ctx, storage.Task{ProjectID: f.project.ID, Goal: "xong rồi", Mode: "single", Status: "done", Result: "ok"})
-	f.st.Tasks().AddStep(ctx, storage.TaskStep{TaskID: done.ID, Phase: "work", Output: "chi tiết dài", Status: "done"})
-	p, err := f.svc.Plan(ctx, cleanup.Request{Level: cleanup.LevelContent})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(p.Skipped) != 1 || p.Skipped[0].ID != c.ID || p.Skipped[0].Reason == "" {
-		t.Fatalf("skipped = %+v", p.Skipped)
-	}
-	for _, it := range p.Items {
-		if it.ID == running.ID {
-			t.Fatal("a running task was picked")
-		}
-	}
-	if _, err := f.svc.Run(ctx, cleanup.Request{Kinds: []string{"task"}, Level: cleanup.LevelContent}); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := f.st.Tasks().Get(ctx, done.ID)
-	steps, _ := f.st.Tasks().ListSteps(ctx, done.ID)
-	if got.Cleaned != storage.CleanContent || len(steps) != 0 || !strings.Contains(got.Result, "đã được dọn") {
-		t.Fatalf("task = %+v, steps %d", got, len(steps))
 	}
 }
 

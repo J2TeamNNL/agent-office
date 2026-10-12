@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,10 +247,14 @@ func (d *Discord) addressed(raw json.RawMessage) (Incoming, bool) {
 		GuildID   string `json:"guild_id"`
 		Content   string `json:"content"`
 		Author    struct {
-			ID       string `json:"id"`
-			Username string `json:"username"`
-			Bot      bool   `json:"bot"`
+			ID         string `json:"id"`
+			Username   string `json:"username"`
+			GlobalName string `json:"global_name"`
+			Bot        bool   `json:"bot"`
 		} `json:"author"`
+		Member *struct {
+			Nick string `json:"nick"`
+		} `json:"member"` // on a server: its nickname there
 		Mentions []struct {
 			ID string `json:"id"`
 		} `json:"mentions"`
@@ -272,7 +278,11 @@ func (d *Discord) addressed(raw json.RawMessage) (Incoming, bool) {
 	if m.Type != 0 && m.Type != 19 { // a person's message or reply; not "X started a thread", a pin, a join…
 		return Incoming{}, false
 	}
-	in := Incoming{ChatID: m.ChannelID, UserID: m.Author.ID, UserName: m.Author.Username, Private: m.GuildID == "", MessageID: m.ID, GuildID: m.GuildID}
+	in := Incoming{ChatID: m.ChannelID, UserID: m.Author.ID, UserName: m.Author.Username, Private: m.GuildID == "", MessageID: m.ID, GuildID: m.GuildID,
+		FullName: m.Author.GlobalName}
+	if m.Member != nil && m.Member.Nick != "" {
+		in.FullName = m.Member.Nick
+	}
 	_, in.InThread = d.threads.Load(m.ChannelID)
 	for _, a := range m.Attachments {
 		url := a.URL
@@ -430,8 +440,9 @@ func (d *Discord) SetCommands(ctx context.Context, cmds []Command) {
 // answer edits that reply.
 func (d *Discord) interaction(ctx context.Context, raw json.RawMessage) (Incoming, bool) {
 	type user struct {
-		ID       string `json:"id"`
-		Username string `json:"username"`
+		ID         string `json:"id"`
+		Username   string `json:"username"`
+		GlobalName string `json:"global_name"`
 	}
 	var x struct {
 		ID        string `json:"id"`
@@ -449,7 +460,8 @@ func (d *Discord) interaction(ctx context.Context, raw json.RawMessage) (Incomin
 			} `json:"options"`
 		} `json:"data"`
 		Member *struct {
-			User user `json:"user"`
+			User user   `json:"user"`
+			Nick string `json:"nick"`
 		} `json:"member"`
 		User    *user `json:"user"`
 		Message *struct {
@@ -462,7 +474,13 @@ func (d *Discord) interaction(ctx context.Context, raw json.RawMessage) (Incomin
 	if x.Type == 3 && !strings.HasPrefix(x.Data.CustomID, buttonPrefix) { // a button, not ours
 		return Incoming{}, false
 	}
-	if err := d.do(ctx, "POST", "/interactions/"+x.ID+"/"+x.Token+"/callback", map[string]any{"type": 5}); err != nil {
+	// the callback ack must reach Discord within its 3s interaction window, and
+	// runs synchronously in the Gateway read loop: a long 429 retry here would
+	// both miss that window and stall every other event, so bound it tightly.
+	ackCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	err := d.do(ackCtx, "POST", "/interactions/"+x.ID+"/"+x.Token+"/callback", map[string]any{"type": 5})
+	cancel()
+	if err != nil {
 		return Incoming{}, false
 	}
 	in := Incoming{ChatID: x.ChannelID, Text: "/" + x.Data.Name, Private: x.GuildID == "", Addressed: true, GuildID: x.GuildID}
@@ -482,9 +500,9 @@ func (d *Discord) interaction(ctx context.Context, raw json.RawMessage) (Incomin
 		}
 	}
 	if x.Member != nil {
-		in.UserID, in.UserName = x.Member.User.ID, x.Member.User.Username
+		in.UserID, in.UserName, in.FullName = x.Member.User.ID, x.Member.User.Username, firstNonEmpty(x.Member.Nick, x.Member.User.GlobalName)
 	} else if x.User != nil {
-		in.UserID, in.UserName = x.User.ID, x.User.Username
+		in.UserID, in.UserName, in.FullName = x.User.ID, x.User.Username, x.User.GlobalName
 	}
 	_, app := d.identity()
 	token := x.Token
@@ -511,26 +529,73 @@ func (d *Discord) do(ctx context.Context, method, path string, body any, out ...
 	if body != nil { // none: no "null" (joining a thread takes no body)
 		raw, _ = json.Marshal(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(raw))
-	if err != nil {
-		return err
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(raw))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bot "+d.Token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := d.client.Do(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if attempt < maxRetries {
+				if wait := retryAfter(resp.Header, b); wait <= maxRetryWait {
+					select {
+					case <-time.After(wait):
+						continue
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			}
+			e := &discordError{Path: path, Status: resp.Status, HTTP: resp.StatusCode}
+			_ = json.Unmarshal(b, e)
+			return e
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			e := &discordError{Path: path, Status: resp.Status, HTTP: resp.StatusCode}
+			_ = json.NewDecoder(resp.Body).Decode(e)
+			return e
+		}
+		if len(out) > 0 && out[0] != nil {
+			_ = json.NewDecoder(resp.Body).Decode(out[0])
+		}
+		return nil
 	}
-	req.Header.Set("Authorization", "Bot "+d.Token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return err
+}
+
+// maxRetries caps how many times do() retries a 429 before giving up;
+// maxRetryWait caps how long a single retry_after may ask it to sleep (past
+// that, Discord is throttling hard enough that waiting isn't worth it,
+// especially since do() may run synchronously in the Gateway read loop).
+const (
+	maxRetries   = 5
+	maxRetryWait = 10 * time.Second
+)
+
+// retryAfter is how long to wait before retrying a Discord 429, from the
+// response body's retry_after (seconds, possibly fractional) or, failing
+// that, the Retry-After header; a fallback of 1s if neither parses.
+func retryAfter(header http.Header, body []byte) time.Duration {
+	var e struct {
+		RetryAfter float64 `json:"retry_after"`
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		e := &discordError{Path: path, Status: resp.Status, HTTP: resp.StatusCode}
-		_ = json.NewDecoder(resp.Body).Decode(e)
-		return e
+	_ = json.Unmarshal(body, &e)
+	if e.RetryAfter > 0 {
+		return time.Duration(e.RetryAfter * float64(time.Second))
 	}
-	if len(out) > 0 && out[0] != nil {
-		_ = json.NewDecoder(resp.Body).Decode(out[0])
+	if h := header.Get("Retry-After"); h != "" {
+		if secs, err := strconv.ParseFloat(h, 64); err == nil && secs > 0 {
+			return time.Duration(secs * float64(time.Second))
+		}
 	}
-	return nil
+	return time.Second
 }
 
 // discordError is a refused API call, with Discord's own code and reason

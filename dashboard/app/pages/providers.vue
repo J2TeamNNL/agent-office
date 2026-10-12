@@ -9,11 +9,9 @@ const next = computed(() => {
   return typeof n === 'string' && n.startsWith('/') && !n.startsWith('//') ? n : ''
 })
 
-const _f1 = useLiveFetch<{ providers: Provider[] }>('/api/providers')
-const { data, refresh } = _f1
-const _f2 = useLiveFetch<{ kinds: ProviderKind[], presets: ProviderPreset[] }>('/api/provider-kinds')
-const { data: kindsData } = _f2
-await Promise.all([_f1, _f2]) // started together: one round trip, not 2 (a phone over a VPN)
+const { data, refresh } = await useLiveFetch<{ providers: Provider[] }>('/api/providers')
+// lazy: detecting CLIs on the machine runs each one (seconds), the list does not wait for it
+const { data: kindsData, pending: kindsPending } = useLiveFetch<{ kinds: ProviderKind[], presets: ProviderPreset[] }>('/api/provider-kinds', { lazy: true })
 const { data: statsData, refresh: refreshStats } = useLiveFetch<{ days: number, providers: ProviderStat[], today: { calls: number, errors: number, tokens: number, cost_usd: number } }>('/api/providers/stats', { query: { days: 7 }, lazy: true })
 const providers = computed(() => data.value?.providers ?? [])
 const kinds = computed(() => kindsData.value?.kinds ?? [])
@@ -31,7 +29,8 @@ const formOpen = ref(false)
 const editing = ref<Provider | null>(null)
 const form = reactive({
   name: '', kind: 'anthropic', preset: '', base_url: '', api_key: '', api_key_env: '', keyMode: 'paste' as 'paste' | 'env',
-  tier_models: { strong: '', balanced: '', fast: '' } as Record<ModelTier, string>
+  tier_models: { strong: '', balanced: '', fast: '' } as Record<ModelTier, string>,
+  limit_caps: { five_hour: 0, seven_day: 0 } as Record<'five_hour' | 'seven_day', number>
 })
 const formError = ref('')
 const saving = ref(false)
@@ -40,7 +39,7 @@ const selectedPreset = computed(() => presetOf(form.preset))
 const needsKey = computed(() => selectedPreset.value ? selectedPreset.value.need_key : !!selectedKind.value?.needs_key)
 const commonKinds = computed(() => kinds.value.filter(k => k.common))
 const advancedOpen = ref(false)
-const cliTool = computed(() => ({ claude_cli: 'claude', codex_cli: 'codex' } as Record<string, 'claude' | 'codex'>)[form.kind])
+const cliTool = computed(() => ({ claude_cli: 'claude', codex_cli: 'codex', gemini_cli: 'gemini', antigravity_cli: 'antigravity' } as Record<string, 'claude' | 'codex' | 'gemini' | 'antigravity'>)[form.kind])
 const cliReady = ref(true)
 watch(cliTool, (v) => { if (!v) cliReady.value = true })
 const norm = (u: string) => u.trim().replace(/\/+$/, '')
@@ -48,7 +47,7 @@ const urlChangedWithStoredKey = computed(() => !!editing.value?.has_api_key && f
   && norm(form.base_url) !== norm(editing.value.base_url))
 const keyUrl = computed(() => selectedPreset.value?.key_url ?? ({ anthropic: 'https://console.anthropic.com', openai: 'https://platform.openai.com/api-keys' } as Record<string, string>)[form.kind] ?? '')
 const kindIconOf = (k: string) => ({
-  claude_cli: 'i-lucide-terminal', codex_cli: 'i-lucide-terminal', anthropic: 'i-lucide-key-round',
+  claude_cli: 'i-lucide-terminal', codex_cli: 'i-lucide-terminal', gemini_cli: 'i-lucide-terminal', antigravity_cli: 'i-lucide-terminal', anthropic: 'i-lucide-key-round',
   openai: 'i-lucide-key-round', openai_compatible: 'i-lucide-server'
 } as Record<string, string>)[k] ?? 'i-lucide-plug'
 
@@ -61,6 +60,7 @@ function applyKindDefaults(k: string) {
   form.api_key_env = info?.detected?.env_key ?? ''
   form.keyMode = info?.detected?.env_key ? 'env' : 'paste'
   form.tier_models = { strong: '', balanced: '', fast: '', ...info?.tier_models }
+  form.limit_caps = { five_hour: 0, seven_day: 0 }
 }
 
 // choose a connection type: a kind, or a third-party preset (an OpenAI-compatible API)
@@ -84,6 +84,8 @@ function openCreate() {
   formError.value = ''
   formOpen.value = true
 }
+// the form was opened before the kinds arrived: pick the default again
+watch(kinds, () => { if (formOpen.value && !editing.value && !form.preset && !form.name) openCreate() })
 
 function openEdit(p: Provider) {
   editing.value = p
@@ -92,6 +94,7 @@ function openEdit(p: Provider) {
     keyMode: p.api_key_env ? 'env' : 'paste'
   })
   form.tier_models = { strong: '', balanced: '', fast: '', ...p.tier_models }
+  form.limit_caps = { five_hour: 0, seven_day: 0, ...p.limit_caps }
   formError.value = ''
   advancedOpen.value = false
   formOpen.value = true
@@ -99,6 +102,24 @@ function openEdit(p: Provider) {
 
 async function save() {
   formError.value = ''
+  if (!form.name.trim()) {
+    formError.value = t('prov.errNameRequired')
+    return
+  }
+  if (form.kind === 'openai_compatible' && !form.preset && !form.base_url.trim()) {
+    formError.value = t('prov.errUrlRequired')
+    return
+  }
+  if (needsKey.value && !selectedKind.value?.is_cli) {
+    if (form.keyMode === 'paste' && !form.api_key && !editing.value?.has_api_key) {
+      formError.value = t('prov.errKeyRequired')
+      return
+    }
+    if (form.keyMode === 'env' && !form.api_key_env.trim()) {
+      formError.value = t('prov.errKeyEnvRequired')
+      return
+    }
+  }
   saving.value = true
   const body: Record<string, unknown> = {
     name: form.name,
@@ -106,7 +127,9 @@ async function save() {
     preset: form.kind === 'openai_compatible' ? form.preset : '',
     base_url: form.base_url,
     api_key_env: form.keyMode === 'env' ? form.api_key_env : '',
-    tier_models: Object.fromEntries(Object.entries(form.tier_models).filter(([, v]) => v))
+    tier_models: Object.fromEntries(Object.entries(form.tier_models).filter(([, v]) => v)),
+    // stop thresholds: only Claude Code reports its usage windows
+    ...(form.kind === 'claude_cli' ? { limit_caps: Object.fromEntries(Object.entries(form.limit_caps).map(([k, v]) => [k, Math.min(100, Math.max(0, Math.round(Number(v) || 0)))])) } : {})
   }
   // Only send the key when typed: omitting it keeps the stored one.
   if (form.keyMode === 'paste' && form.api_key) body.api_key = form.api_key
@@ -132,7 +155,7 @@ const testOpen = ref(false)
 const testTarget = ref<Provider | null>(null)
 const testPrompt = ref(t('prov.defaultTestPrompt'))
 const testModel = ref('')
-const testResult = ref<{ ok: boolean, detail: string, models: string[], needs_login?: boolean, cli_tool?: 'claude' | 'codex', response?: { text: string, model: string, input_tokens: number, output_tokens: number, cost_usd?: number, duration_ms: number } } | null>(null)
+const testResult = ref<{ ok: boolean, detail: string, models: string[], needs_login?: boolean, cli_tool?: 'claude' | 'codex' | 'gemini' | 'antigravity', response?: { text: string, model: string, input_tokens: number, output_tokens: number, cost_usd?: number, duration_ms: number } } | null>(null)
 
 async function runTest(p: Provider, prompt = '') {
   testing.value = p.id
@@ -194,8 +217,30 @@ async function setDefault(p: Provider) {
   }
 }
 
+// off: agents on it go on with their next connection
+const toggling = ref<string | null>(null)
+async function setEnabled(p: Provider, enabled: boolean) {
+  toggling.value = p.id
+  try {
+    await $fetch(`/api/providers/${p.id}/enabled`, { method: 'PATCH', body: { enabled } })
+    await refresh()
+  } catch (e) {
+    toast.add({ title: apiError(e), color: 'error' })
+  } finally {
+    toggling.value = null
+  }
+}
+
 async function remove(p: Provider) {
-  if (!confirm(t('prov.confirmDelete', { name: p.name }))) return
+  if (p.is_default) {
+    toast.add({ title: t('prov.cannotDeleteDefault'), color: 'error' })
+    return
+  }
+  const { agents } = await $fetch<{ agents: { id: string, name: string }[] }>(`/api/providers/${p.id}/agents`)
+  const message = agents.length
+    ? t('prov.confirmDeleteWithAgents', { name: p.name, n: agents.length, names: agents.map(a => a.name).join(', ') })
+    : t('prov.confirmDelete', { name: p.name })
+  if (!confirm(message)) return
   try {
     await $fetch(`/api/providers/${p.id}`, { method: 'DELETE' })
     await refresh()
@@ -211,7 +256,7 @@ function menu(p: Provider) {
       { label: t('prov.edit'), icon: 'i-lucide-pencil', onSelect: () => openEdit(p) },
       { label: t('prov.setDefault'), icon: 'i-lucide-star', disabled: p.is_default || !!settingDefault.value, onSelect: () => setDefault(p) }
     ],
-    [{ label: t('prov.delete'), icon: 'i-lucide-trash', color: 'error' as const, onSelect: () => remove(p) }]
+    [{ label: t('prov.delete'), icon: 'i-lucide-trash', color: 'error' as const, disabled: p.is_default, onSelect: () => remove(p) }]
   ]
 }
 
@@ -258,6 +303,7 @@ const statusText = (s: string) => (s === 'ok' ? t('prov.statusOk') : s === 'erro
       <!-- the office-wide limit and the model prices (each project's budget is on the project) -->
       <OfficeBudget v-if="isAdmin" />
       <LimitAlert v-if="isAdmin" />
+      <LanguageSetting v-if="isAdmin" />
       <div v-if="providers.length" class="grid grid-cols-2 overflow-hidden rounded-lg border border-(--ui-border) md:grid-cols-4">
         <div class="p-4">
           <p class="text-xs font-medium tracking-wide text-(--ui-text-muted) uppercase">{{ t('prov.callsToday') }}</p>
@@ -296,7 +342,11 @@ const statusText = (s: string) => (s === 'ok' ? t('prov.statusOk') : s === 'erro
               </p>
             </div>
             <div class="flex shrink-0 items-center gap-1">
-              <UBadge :label="statusText(p.status)" :color="statusColor(p.status)" variant="subtle" size="sm" />
+              <UTooltip v-if="isAdmin" :text="p.enabled ? t('prov.turnOff') : t('prov.turnOn')">
+                <USwitch :model-value="p.enabled" size="sm" :loading="toggling === p.id" :disabled="!!toggling" :aria-label="t('prov.enabled')" @update:model-value="(v: boolean) => setEnabled(p, v)" />
+              </UTooltip>
+              <UBadge v-if="!p.enabled" :label="t('prov.off')" color="neutral" variant="subtle" size="sm" />
+              <UBadge v-else :label="statusText(p.status)" :color="statusColor(p.status)" variant="subtle" size="sm" />
               <UButton
                 v-if="isAdmin" icon="i-lucide-refresh-cw" color="neutral" variant="ghost" size="xs"
                 :loading="testing === p.id" :aria-label="t('prov.testConnection')" @click="runTest(p)"
@@ -340,6 +390,9 @@ const statusText = (s: string) => (s === 'ok' ? t('prov.statusOk') : s === 'erro
           </div>
           <!-- subscription usage windows (Claude Code), as of its latest run -->
           <UsageLimits :provider-id="p.id" class="mt-3 border-t border-(--ui-border) pt-3" />
+          <p v-if="p.limit_caps?.five_hour || p.limit_caps?.seven_day" class="mt-1 text-xs text-(--ui-text-muted)">
+            {{ t('prov.capSummary', { caps: (['five_hour', 'seven_day'] as const).filter(w => p.limit_caps?.[w]).map(w => `${t(`limits.window.${w}`)} ${p.limit_caps?.[w]}%`).join(' · ') }) }}
+          </p>
 
           <p class="mt-2 flex flex-wrap gap-x-3 text-xs text-(--ui-text-muted)">
             <span>{{ ago(statOf(p.id)?.last_used_at ?? null) }}</span>
@@ -358,7 +411,10 @@ const statusText = (s: string) => (s === 'ok' ? t('prov.statusOk') : s === 'erro
       <template #body>
         <form id="provider-form" class="space-y-5" @submit.prevent="save">
           <!-- kind: main accounts, then third-party APIs -->
-          <div v-if="!editing" class="space-y-3">
+          <p v-if="!editing && !kinds.length && kindsPending" class="flex items-center gap-2 text-sm text-(--ui-text-muted)">
+            <UIcon name="i-lucide-loader-circle" class="size-4 animate-spin" /> {{ t('common.loading') }}
+          </p>
+          <div v-else-if="!editing" class="space-y-3">
             <div class="flex flex-wrap items-center gap-2">
               <button
                 v-for="k in kinds.filter(k => k.kind !== 'openai_compatible')" :key="k.kind" type="button"
@@ -438,6 +494,17 @@ const statusText = (s: string) => (s === 'ok' ? t('prov.statusOk') : s === 'erro
               </template>
             </UFormField>
           </template>
+
+          <!-- stop thresholds on the usage windows (ADR-136): only Claude Code reports them -->
+          <UFormField v-if="form.kind === 'claude_cli'" :label="t('prov.capLabel')" :help="t('prov.capHelp')">
+            <div class="grid gap-3 sm:grid-cols-2">
+              <UFormField v-for="w in (['five_hour', 'seven_day'] as const)" :key="w" :label="t(`limits.window.${w}`)" size="sm">
+                <UInput v-model.number="form.limit_caps[w]" type="number" :min="0" :max="100" placeholder="0" class="w-full" size="sm">
+                  <template #trailing><span class="text-xs text-(--ui-text-muted)">%</span></template>
+                </UInput>
+              </UFormField>
+            </div>
+          </UFormField>
 
           <!-- advanced -->
           <UCollapsible v-model:open="advancedOpen">

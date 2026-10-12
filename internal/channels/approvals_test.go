@@ -13,11 +13,11 @@ import (
 	"github.com/tung1998/agent-office/internal/channels"
 	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/llm"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/trigger"
 	"github.com/tung1998/agent-office/internal/usage"
 )
@@ -66,11 +66,10 @@ func TestApprovalsFromChat(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	provs := provider.NewService(st, box, llm.Options{})
 	u := usage.New(st, time.UTC)
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	engine := chat.NewEngine(st, provs, u)
 	runner := trigger.New(st, chatExec{engine})
 	bot := &fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}
@@ -120,7 +119,7 @@ func TestApprovalsFromChat(t *testing.T) {
 		jobs, _ := st.Jobs().List(ctx, storage.JobFilter{OriginID: rule.ID})
 		for _, j := range jobs {
 			var p trigger.ChannelPayload
-			if json.Unmarshal([]byte(j.Payload), &p) == nil && p.ConversationID == conv.ID && strings.Contains(p.Message, "pnpm lint") && strings.Contains(p.Message, "Làm tiếp") {
+			if json.Unmarshal([]byte(j.Payload), &p) == nil && p.ConversationID == conv.ID && strings.Contains(p.Message, "pnpm lint") && strings.Contains(p.Message, "Go on with") {
 				resumed = true
 			}
 		}

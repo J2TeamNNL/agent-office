@@ -40,10 +40,13 @@ type User struct {
 	Disabled     bool
 	// MustChange: the default admin of a first run; it sets a real email and
 	// password before anything else.
-	MustChange  bool
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	LastLoginAt *time.Time
+	MustChange bool
+	// DiscordID, TelegramID: the account's own user ids on the bots'
+	// platforms ("" = none); a message to a bot from one is shown as theirs.
+	DiscordID, TelegramID string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+	LastLoginAt           *time.Time
 }
 
 // Session is a logged-in browser. Only the SHA-256 of the token is stored.
@@ -109,7 +112,6 @@ type Store interface {
 	Audit() AuditRepo
 
 	Providers() ProviderRepo
-	OrgModels() OrgModelRepo
 	Agents() AgentRepo
 	Repos() RepoRepo
 	Revisions() RevisionRepo
@@ -132,6 +134,10 @@ type Store interface {
 	MCPCalls() MCPCallRepo
 	// Data is what the projects keep, for cleanup (ADR-095).
 	Data() DataRepo
+	// Workflows are how a project's agents work together, and their runs
+	// (spec 2026-10-07-workflows-design).
+	Workflows() WorkflowRepo
+	WorkflowRuns() WorkflowRunRepo
 
 	// InTx runs fn in one transaction; the Store passed to fn is bound to it.
 	InTx(ctx context.Context, fn func(Store) error) error
@@ -148,6 +154,10 @@ type UserRepo interface {
 	// SetCredentials sets a new email, name and password and clears MustChange.
 	SetCredentials(ctx context.Context, id, email, name, hash string) error
 	SetDisabled(ctx context.Context, id string, disabled bool) error
+	// SetChatIDs sets the account's Discord and Telegram user ids ("" = none).
+	SetChatIDs(ctx context.Context, id, discordID, telegramID string) error
+	// ByChatID is the account a bot's platform user id is linked to.
+	ByChatID(ctx context.Context, kind, chatUserID string) (User, error)
 	TouchLogin(ctx context.Context, id string, at time.Time) error
 	Delete(ctx context.Context, id string) error
 }
@@ -329,8 +339,11 @@ type Memory struct {
 	ID, ProjectID, AgentID string
 	Text                   string
 	Source                 string // person | agent | compact
-	CreatedBy              string
-	CreatedAt, UpdatedAt   time.Time
+	// Topic: a short slug; "" = core, always in the prompt, else loaded on
+	// demand with its Summary a line of the index (ADR-134).
+	Topic, Summary       string
+	CreatedBy            string
+	CreatedAt, UpdatedAt time.Time
 }
 
 // MemoryRevision is the notes as they were before a compaction or a restore.
@@ -346,7 +359,8 @@ type MemoryRepo interface {
 	List(ctx context.Context, projectID, agentID string) ([]Memory, error)
 	Get(ctx context.Context, id string) (Memory, error)
 	Create(ctx context.Context, m Memory) (Memory, error)
-	Update(ctx context.Context, id, text string) error
+	// Update sets m.ID's text, topic and summary.
+	Update(ctx context.Context, m Memory) error
 	Delete(ctx context.Context, id string) error
 	// Replace puts items in place of all of the agent's notes (one transaction).
 	Replace(ctx context.Context, projectID, agentID string, items []Memory) error

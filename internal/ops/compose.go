@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tung1998/agent-office/internal/storage"
@@ -342,8 +343,9 @@ func (m *Manager) ComposeAction(ctx context.Context, projectID, file, action, se
 	}
 	p.def = storage.Process{ID: actionKey(projectID), ProjectID: projectID, Name: "docker compose " + action, Kind: "job",
 		Command: "docker " + strings.Join(quoted, " ")}
+	startGen := p.gen
 	p.mu.Unlock()
-	return m.launch(p, dir)
+	return m.launch(p, dir, startGen)
 }
 
 // ActionKey is the id to stream an action's output with Since.
@@ -365,6 +367,9 @@ func (m *Manager) ComposeLogs(ctx context.Context, projectID, file, service stri
 	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", file, "--profile", "*", "logs", "--follow", "--tail", "300", "--no-color", "--no-log-prefix", service)
 	cmd.Dir = dir
 	cmd.Env = m.env
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own group: kill reaches children docker may spawn
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 5 * time.Second // force-close pipes if Wait() still blocks after Cancel
 	pr, pw := io.Pipe()
 	cmd.Stdout, cmd.Stderr = pw, pw
 	if err := cmd.Start(); err != nil {

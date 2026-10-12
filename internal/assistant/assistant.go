@@ -8,20 +8,14 @@ import (
 	"errors"
 	"os"
 
-	"github.com/tung1998/agent-office/internal/orgmodel"
+	"github.com/tung1998/agent-office/internal/prompts"
 	"github.com/tung1998/agent-office/internal/storage"
 )
 
 const settingKey = "office_assistant_project"
 
 // Instructions of the assistant agent.
-const Instructions = `Bạn là trợ lý của toàn office (agent-office), không thuộc project nào.
-- Việc của bạn: trả lời về tình hình các project, thống kê và báo cáo (chi phí, job, lỗi), cài đặt (tự động hóa, agent, quyền, giám sát, kết nối AI, ngân sách), điều phối việc sang đúng project.
-- Luôn gọi projects trước để biết project nào; chưa rõ project thì hỏi lại người dùng.
-- Số liệu: jobs_query, usage_summary; tình hình vận hành: ops_overview/process_logs/monitor_detail với project.
-- Mọi thay đổi đều qua thẻ duyệt: propose_change (xem describe/list/get trước), run_automation. Không nói là đã làm khi mới đề xuất.
-- Việc cần đọc hay sửa code thì dùng handoff để chuyển sang Chat của project đó (đưa người dùng liên kết); bạn không sửa code.
-- Trả lời ngắn gọn bằng tiếng Việt, có số liệu thật.`
+var Instructions = prompts.Text("assistant/instructions")
 
 // ID is the assistant's project id ("" = not set up).
 func ID(ctx context.Context, store storage.Store) string {
@@ -34,12 +28,13 @@ func ID(ctx context.Context, store storage.Store) string {
 
 // Ensure sets the assistant up once (dir is its empty working folder) and
 // returns its project id.
-func Ensure(ctx context.Context, store storage.Store, org *orgmodel.Service, dir string) (string, error) {
+func Ensure(ctx context.Context, store storage.Store, dir string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 	if id := ID(ctx, store); id != "" {
-		if _, err := store.Repos().Get(ctx, id); err == nil {
+		if repo, err := store.Repos().Get(ctx, id); err == nil {
+			refresh(ctx, store, repo)
 			return id, nil
 		}
 	}
@@ -47,28 +42,31 @@ func Ensure(ctx context.Context, store storage.Store, org *orgmodel.Service, dir
 	if err != nil {
 		return "", err
 	}
-	tpl, err := store.OrgModels().GetTemplateByKey(ctx, "solo")
-	if err != nil {
-		return "", errors.New("thiếu mô hình mẫu solo để dựng trợ lý")
-	}
-	m, err := org.ApplyToRepo(ctx, repo.ID, tpl.ID, false)
+	a, err := store.Agents().Create(ctx, storage.Agent{
+		ProjectID: repo.ID, Key: "office-assistant", Name: "Trợ lý office", Role: "Trợ lý toàn office: điều phối, thống kê, cài đặt",
+		Instructions: Instructions, ModelTier: storage.TierBalanced,
+		Permissions: storage.Permissions{Level: "read", ReadOnly: true},
+		Avatar:      storage.Avatar{Color: "violet", Icon: "i-lucide-sparkles"},
+	})
 	if err != nil {
 		return "", err
 	}
-	agents, err := store.Agents().List(ctx, m.ID)
-	if err != nil || len(agents) == 0 {
-		return "", errors.New("trợ lý chưa có agent")
-	}
-	a := agents[0]
-	a.Name, a.Key, a.Role = "Trợ lý office", "office-assistant", "Trợ lý toàn office: điều phối, thống kê, cài đặt"
-	a.Instructions = Instructions
-	a.ModelTier = storage.TierBalanced
-	a.Permissions = storage.Permissions{Level: "read", ReadOnly: true}
-	a.Avatar = storage.Avatar{Color: "violet", Icon: "i-lucide-sparkles"}
-	if err := store.Agents().Update(ctx, a); err != nil {
+	repo.DefaultAgentID = a.ID
+	if err := store.Repos().Update(ctx, repo); err != nil {
 		return "", err
 	}
 	return repo.ID, store.Settings().Set(ctx, settingKey, repo.ID)
+}
+
+// refresh gives an assistant made by an older office today's instructions
+// (its project is hidden: nobody edits them by hand), as English prompts (ADR-121).
+func refresh(ctx context.Context, store storage.Store, repo storage.Repo) {
+	a, err := store.Agents().Get(ctx, repo.DefaultAgentID)
+	if err != nil || a.Key != "office-assistant" || a.Instructions == Instructions {
+		return
+	}
+	a.Instructions = Instructions
+	_ = store.Agents().Update(ctx, a)
 }
 
 // The assistant's rights (ADR-059).

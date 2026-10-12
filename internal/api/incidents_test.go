@@ -3,7 +3,6 @@ package api_test
 import (
 	"context"
 	"github.com/tung1998/agent-office/internal/assistant"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"testing"
 	"time"
 
@@ -71,7 +70,11 @@ func TestIncidentActions(t *testing.T) {
 	if got["automation"]["id"] != a.ID || got["jobs"]["id"] == "" || got["jobs"]["key"] == "" {
 		t.Fatalf("incidents = %v", got)
 	}
-	if resp, _ := do(t, admin, "POST", e.srv.URL+"/api/incidents/dismiss", map[string]any{"key": got["jobs"]["key"]}, nil); resp.StatusCode != 204 {
+	// several at once (Bỏ qua tất cả); a card to decide is never let go this way
+	if resp, _ := do(t, admin, "POST", e.srv.URL+"/api/incidents/dismiss", map[string]any{"keys": []string{got["jobs"]["key"].(string), "approval:x"}}, nil); resp.StatusCode != 400 {
+		t.Fatalf("dismiss with a card = %d", resp.StatusCode)
+	}
+	if resp, _ := do(t, admin, "POST", e.srv.URL+"/api/incidents/dismiss", map[string]any{"keys": []string{got["jobs"]["key"].(string)}}, nil); resp.StatusCode != 204 {
 		t.Fatalf("dismiss = %d", resp.StatusCode)
 	}
 	if resp, _ := do(t, admin, "POST", e.srv.URL+"/api/incidents/retry", map[string]any{"kind": "automation", "id": a.ID}, nil); resp.StatusCode != 200 {
@@ -89,6 +92,42 @@ func TestIncidentActions(t *testing.T) {
 	e.st.Jobs().Create(ctx, storage.Job{ProjectID: pid, Kind: "task", Origin: "user", Status: "failed", Error: "y", Title: "Sửa lỗi 2", FinishedAt: &later, CreatedAt: later})
 	if _, ok := list()["jobs"]; !ok {
 		t.Fatal("a new failure after the dismissal is not shown")
+	}
+}
+
+// Retrying a disabled automation must not overwrite an edit made meanwhile
+// (incidents.go retryIncident, case "automation" — only turns it back on).
+func TestIncidentRetryAutomationKeepsConcurrentEdit(t *testing.T) {
+	e := setup(t)
+	admin := e.client(t)
+	login(t, e, admin, "admin@x.io", "admin-password")
+	ctx := context.Background()
+	_, body := do(t, admin, "POST", e.srv.URL+"/api/projects", map[string]any{"path": t.TempDir(), "name": "shop"}, nil)
+	pid := body["project"].(map[string]any)["id"].(string)
+	a, _ := e.st.Automations().Create(ctx, storage.Automation{ProjectID: pid, Name: "Báo cáo", Source: "webhook", Action: "script", DisabledCode: "failures", DisabledReason: "script lỗi"})
+
+	// an edit lands before the retry call; end-to-end check that retrying
+	// a disabled automation never drops its Config (race ordering itself
+	// is covered by TestReenableKeepsConcurrentEdit in sqlite).
+	edited := a
+	edited.Config.Keywords = []string{"edited"}
+	if err := e.st.Automations().Update(ctx, edited); err != nil {
+		t.Fatalf("concurrent update: %v", err)
+	}
+
+	if resp, _ := do(t, admin, "POST", e.srv.URL+"/api/incidents/retry", map[string]any{"kind": "automation", "id": a.ID}, nil); resp.StatusCode != 200 {
+		t.Fatalf("retry = %d", resp.StatusCode)
+	}
+
+	got, err := e.st.Automations().Get(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Config.Keywords) != 1 || got.Config.Keywords[0] != "edited" {
+		t.Fatalf("retry overwrote the concurrent edit: Config.Keywords = %v", got.Config.Keywords)
+	}
+	if !got.Enabled || got.Failures != 0 || got.DisabledCode != "" || got.DisabledReason != "" {
+		t.Fatalf("automation not re-enabled: %+v", got)
 	}
 }
 
@@ -143,7 +182,7 @@ func TestJobGroupLinks(t *testing.T) {
 	admin := e.client(t)
 	login(t, e, admin, "admin@x.io", "admin-password")
 	ctx := context.Background()
-	aid, _ := assistant.Ensure(ctx, e.st, orgmodel.NewService(e.st), t.TempDir())
+	aid, _ := assistant.Ensure(ctx, e.st, t.TempDir())
 	ac, _ := e.st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: aid, Title: "Báo cáo", CreatedBy: "human:admin@x.io"})
 	e.st.Jobs().Create(ctx, storage.Job{ProjectID: aid, Kind: "chat_turn", Origin: "user", CreatedBy: "human:admin@x.io", ConversationID: ac.ID, Status: "done"})
 	_, body := do(t, admin, "POST", e.srv.URL+"/api/projects", map[string]any{"path": t.TempDir(), "name": "shop"}, nil)

@@ -20,7 +20,7 @@ export interface ProposedAction {
   // config_change: a settings change (ADR-045)
   change?: { resource: string, op: 'create' | 'update' | 'delete', id?: string, patch?: Record<string, unknown>, before?: Record<string, unknown> }
   // create_automation / update_automation: the proposed automation
-  automation?: { name: string, source: string, every_minutes?: number, cron?: string, timezone?: string, action: string, prompt?: string,
+  automation?: { name: string, source: string, every_minutes?: number, cron?: string, timezone?: string, action: string, workflow?: string, prompt?: string,
     script?: { lang: string, body: string, timeout_s?: number }, escalate?: { when?: string, action?: string, agent_id?: string, prompt?: string } }
 }
 
@@ -45,7 +45,7 @@ const alwaysInfo = computed(() => {
   return t(p.new_pack ? 'action.alwaysInfoNew' : 'action.alwaysInfo', { pattern: p.pattern, pack: p.pack })
 })
 
-const icon = computed(() => props.action.kind === 'send_message' ? 'i-lucide-send' : props.action.kind.endsWith('_automation') ? 'i-lucide-alarm-clock' : props.action.kind === 'git_commit' ? 'i-lucide-git-commit-horizontal'
+const icon = computed(() => props.action.kind === 'workflow_gate' ? 'i-lucide-user-check' : props.action.kind === 'send_message' ? 'i-lucide-send' : props.action.kind.endsWith('_automation') ? 'i-lucide-alarm-clock' : props.action.kind === 'git_commit' ? 'i-lucide-git-commit-horizontal'
   : props.action.kind === 'git_branch' ? 'i-lucide-git-branch'
     : props.action.kind === 'git_push' ? 'i-lucide-upload'
       : props.action.kind.startsWith('stop') ? 'i-lucide-square'
@@ -68,7 +68,8 @@ const kindLabels: Record<string, string> = {
   run_automation: 'action.kind.run_automation',
   remember: 'action.kind.remember',
   mcp_call: 'action.kind.mcp_call',
-  send_message: 'action.kind.send_message'
+  send_message: 'action.kind.send_message',
+  workflow_gate: 'action.kind.workflow_gate'
 }
 const kindLabel = computed(() => {
   const key = kindLabels[props.action.kind]
@@ -146,7 +147,7 @@ async function decide(approve: boolean, always = false, skip = false) {
       <div v-if="spec" class="mt-1 space-y-1 text-xs">
         <p class="text-(--ui-text-muted)">
           <UIcon name="i-lucide-clock" class="me-1 inline size-3.5 align-[-2px]" />{{ when }}
-          · {{ spec.action === 'script' ? t('auto.actionScript') : t('auto.actionChat') }}
+          · {{ spec.action === 'script' ? t('auto.actionScript') : spec.action === 'workflow' ? t('auto.toWorkflow', { key: spec.workflow ?? '' }) : t('auto.actionChat') }}
           <template v-if="spec.action === 'script'"> · {{ t(`auto.escalate.${spec.escalate?.when || 'failure'}` as MessageKey) }}</template>
         </p>
         <pre v-if="spec.script?.body" class="max-h-64 overflow-auto rounded bg-(--ui-bg-elevated) px-2 py-1 font-mono">{{ spec.script.lang }} ·

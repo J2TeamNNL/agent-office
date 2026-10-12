@@ -256,7 +256,7 @@ const { data: libData, refresh: refreshLib, error: libError } = useLiveFetch<{ i
 const library = computed(() => libData.value?.items ?? [])
 
 const editOpen = ref(false)
-const editing = ref<{ isNew: boolean, name: string, content: string, description: string, files: Record<string, string> }>({ isNew: true, name: '', content: '', description: '', files: {} })
+const editing = ref<{ isNew: boolean, name: string, content: string, description: string, files: Record<string, string>, template?: MCPTemplate }>({ isNew: true, name: '', content: '', description: '', files: {} })
 const editError = ref('')
 const editFindings = ref<Finding[]>([])
 
@@ -272,7 +272,7 @@ async function openEdit(item?: LibraryItem) {
   editError.value = ''
   editFindings.value = []
   if (!item) {
-    editing.value = { isNew: true, name: '', content: starter[props.kind], description: '', files: {} }
+    editing.value = { isNew: true, name: '', content: starter[props.kind], description: '', files: {}, template: undefined }
   } else {
     const full = await $fetch<LibraryItem>(`/api/automation/library/${props.kind}/${item.name}`)
     const files = full.files ?? {}
@@ -281,6 +281,7 @@ async function openEdit(item?: LibraryItem) {
       name: full.name,
       description: full.template?.description ?? '',
       files,
+      template: full.template,
       content: props.kind === 'mcp' ? JSON.stringify(full.template?.config ?? {}, null, 2) : props.kind === 'skill' ? files['SKILL.md'] ?? '' : Object.values(files)[0] ?? ''
     }
   }
@@ -314,7 +315,21 @@ async function saveEdit() {
       editError.value = t('tools.invalidJson')
       return
     }
-    body = { template: { name: e.name, title: e.name, description: e.description, config: cfg, inputs: inputsFrom(cfg) } }
+    const newInputs = inputsFrom(cfg)
+    const prevInputs = e.template?.inputs ?? []
+    const inputs = newInputs.map(i => prevInputs.find(p => p.key === i.key) ?? i)
+    body = {
+      template: {
+        ...e.template,
+        source: undefined,
+        id: undefined,
+        name: e.name,
+        title: e.template?.title || e.name,
+        description: e.description,
+        config: cfg,
+        inputs
+      }
+    }
   } else if (props.kind === 'skill') {
     body = { files: { ...e.files, 'SKILL.md': e.content } }
   } else {
@@ -462,7 +477,7 @@ const summary = (tpl: MCPTemplate) => {
               </UTooltip>
               <template v-if="kind === 'mcp' && candOf(i)">
                 <UTooltip v-if="inOffice(candOf(i))" :text="t('tools.mcpInOfficeInfo', { name: candOf(i)!.moved_as || candOf(i)!.suggested })">
-                  <NuxtLink to="/library?kind=mcp#office-mcp">
+                  <NuxtLink to="/mcp#office-mcp">
                     <UBadge color="primary" variant="subtle" size="sm" icon="i-lucide-network" :label="t('tools.mcpInOffice')" />
                   </NuxtLink>
                 </UTooltip>
@@ -511,12 +526,13 @@ const summary = (tpl: MCPTemplate) => {
           {{ t('tools.libraryIntro') }}
         </p>
         <UAlert v-if="libError" color="error" variant="subtle" icon="i-lucide-triangle-alert" :title="t('common.loadError')" :actions="[{ label: t('common.refresh'), onClick: () => refreshLib() }]" />
+        <div v-else-if="!libData" class="rounded-lg border border-(--ui-border)"><LoadingRows :n="4" /></div>
         <div v-else-if="!library.length" class="rounded-lg border border-dashed border-(--ui-border) p-10 text-center">
           <UIcon name="i-lucide-library" class="mx-auto size-8 text-(--ui-text-dimmed)" />
           <p class="mt-2 font-medium">{{ t('tools.libraryEmptyTitle') }}</p>
           <p class="text-sm text-(--ui-text-muted)">
             <template v-if="scoped">
-              {{ t('tools.libraryEmptyScopedHintPrefix') }} <NuxtLink to="/library" class="text-(--ui-primary)">{{ t('tools.libraryPageTitle') }}</NuxtLink>.
+              {{ t('tools.libraryEmptyScopedHintPrefix') }} <NuxtLink :to="kind === 'mcp' ? '/mcp' : '/skills'" class="text-(--ui-primary)">{{ kind === 'mcp' ? t('tools.mcpTab') : t('tools.skillsTab') }}</NuxtLink>.
             </template>
             <template v-else>{{ t('tools.libraryEmptyHint') }}</template>
           </p>

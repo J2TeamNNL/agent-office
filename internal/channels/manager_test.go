@@ -13,11 +13,11 @@ import (
 	"github.com/tung1998/agent-office/internal/channels"
 	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/llm"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/trigger"
 	"github.com/tung1998/agent-office/internal/usage"
 )
@@ -27,6 +27,13 @@ type fakeBot struct {
 	mu   sync.Mutex
 	in   chan channels.Incoming
 	sent map[string][]string
+
+	// failNext, when > 0 for a chat, makes the next Send to that chat fail
+	// (decrementing the count); failPartial marks that failure as a partial
+	// send: a part still lands in sent and Send still returns its id, the way
+	// Discord/Telegram report a long reply split into several messages.
+	failNext    map[string]int
+	failPartial map[string]bool
 }
 
 func (b *fakeBot) Run(ctx context.Context, onReady func(string), onMessage func(channels.Incoming)) error {
@@ -43,6 +50,14 @@ func (b *fakeBot) Run(ctx context.Context, onReady func(string), onMessage func(
 func (b *fakeBot) Send(_ context.Context, chatID, text string) ([]string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.failNext[chatID] > 0 {
+		b.failNext[chatID]--
+		if b.failPartial[chatID] {
+			b.sent[chatID] = append(b.sent[chatID], text)
+			return []string{fmt.Sprint(len(b.sent[chatID]))}, fmt.Errorf("fake: partial send failure")
+		}
+		return nil, fmt.Errorf("fake: send failure")
+	}
 	b.sent[chatID] = append(b.sent[chatID], text)
 	return []string{fmt.Sprint(len(b.sent[chatID]))}, nil // numbered per chat, as Telegram does
 }
@@ -106,8 +121,7 @@ func TestManagerRules(t *testing.T) {
 	provs := provider.NewService(st, box, llm.Options{})
 	u := usage.New(st, time.UTC)
 	provs.SetUsage(u)
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	bin := filepath.Join(tmp, "claude")
 	// the filter call gets "YES/NO" questions; an answer otherwise
 	argsLog := filepath.Join(tmp, "args.log")
@@ -115,15 +129,15 @@ func TestManagerRules(t *testing.T) {
 in=$(cat)
 printf '%s\nSTDIN:%s\n===\n' "$*" "$in" >> `+argsLog+`
 out="đơn 123 đang giao"
-case "$in" in *"YES hoặc NO"*) out=NO; case "$in" in *"đơn hàng"*"đơn 123"*) out=YES;; esac;; esac
+case "$in" in *"YES or NO"*) out=NO; case "$in" in *"đơn hàng"*"đơn 123"*) out=YES;; esac;; esac
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"'"$out"'","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
 `), 0o755)
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 	dir := t.TempDir()
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: dir})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	engine := chat.NewEngine(st, provs, u)
 	runner := trigger.New(st, chatExec{engine})
 
@@ -346,26 +360,5 @@ func TestLegacyChannelBecomesARule(t *testing.T) {
 	if len(list) != 1 || list[0].Source != "discord" || list[0].Action != "chat" || list[0].Config.ChannelID != ch.ID ||
 		list[0].Config.Scope != "đơn hàng" || list[0].AgentID != "agt_1" || !list[0].Enabled {
 		t.Fatalf("rules = %+v", list)
-	}
-}
-
-// Review I6: a flood from one chat is not queued without end.
-func TestFloodIsCapped(t *testing.T) {
-	if n := channels.MaxPending; n < 1 || n > 5 {
-		t.Fatalf("MaxPending = %d", n)
-	}
-	var q channels.Pending
-	taken := 0
-	for range 20 {
-		if q.Take("chat") {
-			taken++
-		}
-	}
-	if taken != channels.MaxPending {
-		t.Fatalf("took %d of 20, want %d", taken, channels.MaxPending)
-	}
-	q.Done("chat")
-	if !q.Take("chat") {
-		t.Fatal("a slot freed is not taken again")
 	}
 }

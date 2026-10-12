@@ -5,7 +5,7 @@ import type { MessageKey } from '~/locales/vi'
 
 const props = defineProps<{ filter?: { project?: string, resource?: string, resource_id?: string }, showFilters?: boolean, projects?: { id: string, name: string }[], compact?: boolean }>()
 const toast = useToast()
-const { t, dateLocale } = useLang()
+const { t, when } = useLang()
 
 const kind = ref('')
 const via = ref('')
@@ -31,16 +31,20 @@ function query(before = '') {
   q.set('limit', '50')
   return q.toString()
 }
+let loadToken = 0
 async function load(more = false) {
+  const token = ++loadToken
   loading.value = true
   try {
     const res = await $fetch<{ entries: AuditEntry[], next_before: string }>(`/api/audit?${query(more ? nextBefore.value : '')}`)
+    if (token !== loadToken) return // a newer load() started since: drop this stale response
     entries.value = more ? [...entries.value, ...res.entries] : res.entries
     nextBefore.value = res.next_before
   } catch (e) {
+    if (token !== loadToken) return
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
-    loading.value = false
+    if (token === loadToken) loading.value = false
   }
 }
 watch([kind, via, resource, project, since, () => props.filter?.resource_id], () => load(), { immediate: true })
@@ -67,7 +71,6 @@ function label(prefix: string, v: string) {
   const s = t(k)
   return s === k ? v : s
 }
-const when = (d: string) => new Date(d).toLocaleString(dateLocale.value, { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })
 const targetName = (e: AuditEntry) => String(e.after?.name ?? e.before?.name ?? e.resource_id ?? '')
 const show = (v: unknown) => v === '***' ? t('audit.secretChanged') : v === undefined ? '—' : typeof v === 'string' ? v : JSON.stringify(v)
 
@@ -103,23 +106,24 @@ useLive(['audit_log'], () => load())
     </div>
 
     <UCard :ui="{ body: 'p-0 sm:p-0' }">
-      <p v-if="!entries.length && !loading" class="p-4 text-sm text-(--ui-text-muted)">{{ t('audit.empty') }}</p>
+      <LoadingRows v-if="!entries.length && loading" :n="5" :icon="false" />
+      <p v-else-if="!entries.length" class="p-4 text-sm text-(--ui-text-muted)">{{ t('audit.empty') }}</p>
       <div class="overflow-x-auto">
-        <table v-if="entries.length" class="w-full text-sm">
+        <table v-if="entries.length" class="w-full table-fixed text-sm">
           <thead class="text-left text-xs text-(--ui-text-muted)">
             <tr class="border-b border-(--ui-border)">
-              <th class="px-4 py-2 font-medium">{{ t('audit.colTime') }}</th>
-              <th class="px-2 py-2 font-medium">{{ t('audit.colWho') }}</th>
-              <th class="px-2 py-2 font-medium">{{ t('audit.colChange') }}</th>
+              <th class="w-20 px-2 py-2 font-medium sm:w-28 sm:px-4">{{ t('audit.colTime') }}</th>
+              <th class="w-36 px-2 py-2 font-medium max-sm:hidden">{{ t('audit.colWho') }}</th>
+              <th class="w-20 px-2 py-2 font-medium sm:w-28">{{ t('audit.colChange') }}</th>
               <th class="px-2 py-2 font-medium">{{ t('audit.colTarget') }}</th>
-              <th v-if="!compact" class="px-4 py-2 font-medium">{{ t('audit.colSource') }}</th>
+              <th v-if="!compact" class="w-16 px-2 py-2 font-medium sm:w-36 sm:px-4">{{ t('audit.colSource') }}</th>
             </tr>
           </thead>
           <tbody>
             <template v-for="e in entries" :key="e.id">
               <tr class="cursor-pointer border-b border-(--ui-border) last:border-0 hover:bg-(--ui-bg-elevated)/40" @click="open = open === e.id ? null : e.id">
-                <td class="whitespace-nowrap px-4 py-2 text-xs text-(--ui-text-muted)">{{ when(e.at) }}</td>
-                <td class="max-w-56 px-2 py-2">
+                <td class="truncate px-2 py-2 text-xs text-(--ui-text-muted) sm:px-4">{{ when(e.at) }}</td>
+                <td class="px-2 py-2 max-sm:hidden">
                   <span class="flex items-center gap-1.5">
                     <UIcon :name="whoIcon(e.actor_kind)" class="size-3.5 shrink-0 text-(--ui-text-muted)" :title="label('audit.kind.', e.actor_kind)" />
                     <span class="truncate">{{ e.actor_name || label('audit.kind.', e.actor_kind) }}</span>
@@ -133,12 +137,13 @@ useLive(['audit_log'], () => load())
                     <UBadge v-if="!e.ok" color="error" variant="subtle" size="sm" :label="t('audit.failed')" />
                   </span>
                 </td>
-                <td class="max-w-64 px-2 py-2">
+                <td class="px-2 py-2">
                   <span class="block truncate" :title="targetName(e)">{{ targetName(e) || '—' }}</span>
                   <span v-if="!compact && !filter?.project && e.project_name" class="block truncate text-xs text-(--ui-text-muted)">{{ e.project_name }}</span>
+                  <span class="block truncate text-xs text-(--ui-text-muted) sm:hidden">{{ e.actor_name || label('audit.kind.', e.actor_kind) }}</span>
                 </td>
-                <td v-if="!compact" class="whitespace-nowrap px-4 py-2" @click.stop>
-                  <span class="mr-1 text-xs text-(--ui-text-muted)">{{ label('audit.via.', e.via) }}</span>
+                <td v-if="!compact" class="whitespace-nowrap px-2 py-2 sm:px-4" @click.stop>
+                  <span class="mr-1 text-xs text-(--ui-text-muted) max-sm:hidden">{{ label('audit.via.', e.via) }}</span>
                   <UButton v-if="e.conversation_id && e.project_id" size="xs" color="neutral" variant="ghost" icon="i-lucide-messages-square" :title="t('audit.openChat')" :aria-label="t('audit.openChat')" @click="openChat(e)" />
                   <UButton v-if="e.job_id" size="xs" color="neutral" variant="ghost" icon="i-lucide-list-checks" :title="t('audit.openJob')" :aria-label="t('audit.openJob')" @click="jobId = e.job_id" />
                 </td>

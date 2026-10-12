@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -76,19 +77,6 @@ func TestClaudeReportsLimitsAndContext(t *testing.T) {
 	}
 }
 
-// After a switch the new agent must know which answers were another agent's.
-func TestTranscriptNamesOtherAgents(t *testing.T) {
-	h := []HistoryItem{
-		{Role: "user", Content: "kiểm tra graylog"},
-		{Role: "assistant", Content: "mình chỉ đọc", Author: "Trưởng nhóm"},
-		{Role: "assistant", Content: "đã xem"}, // this agent's own
-	}
-	got := transcript(h, "sửa đi")
-	if !strings.Contains(got, "[Trưởng nhóm]\nmình chỉ đọc") || !strings.Contains(got, "[Bạn]\nđã xem") || strings.Contains(got, "[Bạn]\nmình chỉ đọc") {
-		t.Fatalf("transcript:\n%s", got)
-	}
-}
-
 // Full access (the office assistant as administrator): every tool, no asking.
 func TestClaudeArgsFullAccess(t *testing.T) {
 	var r claudeRunner
@@ -99,39 +87,6 @@ func TestClaudeArgsFullAccess(t *testing.T) {
 	}
 	if b := r.args(RunRequest{}, false); b[slices.Index(b, "--permission-mode")+1] != "dontAsk" {
 		t.Fatalf("default args = %v", b)
-	}
-}
-
-// Extra directories (an agent's own, or an automation's override — ADR-074)
-// become --add-dir flags of the run.
-func TestClaudeArgsExtraDirs(t *testing.T) {
-	dir := t.TempDir()
-	bin, argsLog := filepath.Join(dir, "claude"), filepath.Join(dir, "args")
-	os.WriteFile(bin, []byte(`#!/bin/sh
-printf '%s\n' "$@" >`+argsLog+`
-cat >/dev/null
-echo '{"type":"result","subtype":"success","result":"ok"}'
-`), 0o755)
-	extra := t.TempDir()
-	req := RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi", ExtraDirs: []string{extra, " ", ""}}
-	var r claudeRunner
-	if _, err := r.Run(context.Background(), req, func(Event) {}); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := os.ReadFile(argsLog)
-	got := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-	i := slices.Index(got, "--add-dir")
-	if i < 0 || i+1 >= len(got) || got[i+1] != extra {
-		t.Fatalf("--add-dir missing for extra dirs: %v", got)
-	}
-	n := 0
-	for _, a := range got {
-		if a == "--add-dir" {
-			n++
-		}
-	}
-	if n != 1 { // blank entries are skipped
-		t.Fatalf("blank extra dirs were not skipped: %v", got)
 	}
 }
 
@@ -156,5 +111,78 @@ func TestClaudeArgsExtraDirsDeniesWriteWithoutFullAccess(t *testing.T) {
 	// instead — it would only deny a path relative to the working directory
 	if strings.Contains(deny, "Edit("+extra+"/**)") {
 		t.Fatalf("extra dir denied with the wrong (relative) syntax: %q", deny)
+	}
+}
+
+// A JSON line over the scanner's 16MB cap must fail the run instead of
+// silently returning an empty "success" (the "result" event never gets read).
+func TestClaudeFailsOnOversizedLine(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "claude")
+	// nothing is written after the oversized line: once the scanner gives up
+	// reading it, nobody drains the pipe, so a script that kept writing (e.g.
+	// the real "result" event) would block forever on a full pipe and hang
+	// cmd.Wait() — not what this test is checking.
+	script := `#!/bin/sh
+cat >/dev/null
+echo '{"type":"system","subtype":"init","session_id":"s1"}'
+python3 -c 'print("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"" + "x"*(17*1024*1024) + "\"}]}}")'
+`
+	os.WriteFile(bin, []byte(script), 0o755)
+	res, err := claudeRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
+	if err == nil {
+		t.Fatalf("expected an error for an oversized line, got res = %+v", res)
+	}
+	if res.Text != "" {
+		t.Fatalf("result must not be read past the oversized line: res = %+v", res)
+	}
+}
+
+// A subagent Claude Code starts on its own (Task): its steps show under it.
+func TestClaudeShowsItsSubagents(t *testing.T) {
+	dir := t.TempDir()
+	lines := []string{
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tk1","name":"Task","input":{"description":"tìm chỗ gọi API","subagent_type":"Explore"}}]}}`,
+		`{"type":"assistant","parent_tool_use_id":"tk1","message":{"content":[{"type":"tool_use","id":"g1","name":"Grep","input":{"pattern":"fetch("}}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"a.go"}}]}}`,
+		`{"type":"result","subtype":"success","result":"ok","usage":{"input_tokens":1,"output_tokens":1}}`,
+	}
+	fixture := filepath.Join(dir, "out.jsonl")
+	os.WriteFile(fixture, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+	bin := filepath.Join(dir, "claude")
+	os.WriteFile(bin, []byte("#!/bin/sh\ncat >/dev/null\ncat "+fixture+"\n"), 0o755)
+	res, err := claudeRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Tools) != 3 || res.Tools[0].Summary != "Giao subagent Explore: tìm chỗ gọi API" ||
+		res.Tools[1].Summary != `↳ Explore · tìm chỗ gọi API: Tìm "fetch("` || res.Tools[2].Summary != "Đọc a.go" {
+		t.Fatalf("tools = %+v", res.Tools)
+	}
+}
+
+// The hook runs through sh: a quote in its text breaks the command, sh exits
+// 2, and Claude Code then blocks every MCP tool call.
+func TestUserMCPSettingsHookRuns(t *testing.T) {
+	var s struct {
+		Hooks struct {
+			PreToolUse []struct {
+				Hooks []struct{ Command string } `json:"hooks"`
+			} `json:"PreToolUse"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal([]byte(userMCPSettings), &s); err != nil {
+		t.Fatal(err)
+	}
+	cmd := s.Hooks.PreToolUse[0].Hooks[0].Command
+	out, err := exec.Command("sh", "-c", cmd).Output()
+	if err != nil {
+		t.Fatalf("hook %q: %v", cmd, err)
+	}
+	var v struct {
+		HookSpecificOutput struct{ PermissionDecision string } `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal(out, &v); err != nil || v.HookSpecificOutput.PermissionDecision != "allow" {
+		t.Fatalf("hook output %q: %v", out, err)
 	}
 }

@@ -131,13 +131,23 @@ func TestCheckExtraDirRejectsAnyDotOfficeFolder(t *testing.T) {
 	}
 }
 
-// A dir unrelated to .office/.agent-office is still accepted, same as before.
-func TestCheckExtraDirAcceptsUnrelatedDir(t *testing.T) {
-	fakeHome(t)
+// ADR-074: on a case-insensitive filesystem (macOS APFS), ".ssh" and ".SSH"
+// name the same real directory — EvalSymlinks does not canonicalize case, so
+// the check must still catch it.
+func TestCheckExtraDirRejectsCaseVariantSensitiveDir(t *testing.T) {
+	home := fakeHome(t)
 	project := t.TempDir()
-	other := t.TempDir()
-	if err := perm.CheckExtraDir(project, other); err != nil {
-		t.Fatalf("an unrelated dir was rejected: %v", err)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	caseVariant := filepath.Join(home, ".SSH")
+	if err := perm.CheckExtraDir(project, caseVariant); err == nil {
+		t.Fatal("a case-variant path to ~/.ssh was accepted")
+	}
+	sub := filepath.Join(home, ".SSH", "sub")
+	if err := perm.CheckExtraDir(project, sub); err == nil {
+		t.Fatal("a case-variant path under ~/.ssh was accepted")
 	}
 }
 

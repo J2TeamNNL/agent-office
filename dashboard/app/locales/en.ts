@@ -11,9 +11,13 @@ import watchScreen from './parts/watch.en'
 import files from './parts/files.en'
 import chatTags from './parts/tags.en'
 import dataPage from './parts/data.en'
+import team from './parts/team.en'
+import workflows from './parts/workflows.en'
 
 const en: Record<MessageKey, string> = {
   ...dataPage,
+  ...team,
+  ...workflows,
   ...watchScreen,
   ...files,
   ...chatTags,
@@ -36,8 +40,6 @@ const en: Record<MessageKey, string> = {
   'nav.addProject': 'Add a project',
   'nav.providers': 'AI connections',
   'nav.costs': 'Costs',
-  'nav.templates': 'Org models',
-  'nav.library': 'Library',
   'nav.admin': 'Administration',
   'nav.users': 'Accounts',
   'nav.audit': 'Audit log',
@@ -78,6 +80,7 @@ const en: Record<MessageKey, string> = {
   'account.newHint': 'At least 10 characters',
   'account.confirm': 'Confirm new password',
   'account.mismatch': 'The new passwords do not match',
+'account.tooShort': 'The new password must be at least 10 characters',
   'account.saved': 'Password changed',
   'account.savedDesc': 'Other sessions have been signed out.',
   'common.save': 'Save',
@@ -85,6 +88,7 @@ const en: Record<MessageKey, string> = {
   'common.delete': 'Delete',
   'common.edit': 'Edit',
   'common.close': 'Close',
+  'common.leaveUnsaved': 'You have unsaved changes. Leave and discard them?',
   'common.add': 'Add',
   'common.create': 'Create',
   'common.search': 'Search',
@@ -112,10 +116,6 @@ const en: Record<MessageKey, string> = {
   'log.empty': 'No logs yet.',
   'log.toBottom': '↓ Jump to latest',
   'soon.badge': 'Coming in {milestone}',
-  'noModel.title': 'This project has no org model yet',
-  'noModel.desc': 'An org model is needed for chat and tasks. Let AI propose one, or pick Solo, Team or Three powers yourself.',
-  'noModel.setupAi': 'Set up with AI',
-  'noModel.choose': 'Choose a model',
 }
 
 export default en

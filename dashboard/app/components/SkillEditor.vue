@@ -14,6 +14,10 @@ const parsed = ref<SkillMd | null>(null) // the saved SKILL.md: its other frontm
 const otherFiles = ref<Record<string, string>>({}) // the skill's other files, kept
 const loaded = ref(!editing.value)
 const skillMd = () => writeSkillMd({ name: form.name, description: form.description, body: form.body, entries: parsed.value?.entries })
+// what Save last wrote (or what was opened): leaving with more asks first
+const savedSnap = ref(JSON.stringify(form))
+const markSaved = () => { savedSnap.value = JSON.stringify(form) }
+useLeaveGuard(() => loaded.value && JSON.stringify(form) !== savedSnap.value)
 
 let edited: ReturnType<typeof refOf> | undefined
 let editedFrom: string | undefined
@@ -38,6 +42,7 @@ onMounted(async () => {
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
     loaded.value = true
+    markSaved()
   }
 })
 
@@ -71,6 +76,9 @@ onMounted(() => {
     if (raw) applyPatch(JSON.parse(raw))
   } catch { /* nothing handed over */ }
 })
+// its chat: found again by the skill (a new one is tied to it once saved)
+const conversationId = ref('')
+const subjectOf = (name: string) => `skill:${scope.value}:${name}`
 const pageContext = () => JSON.stringify({ page: editing.value ? 'skill.edit' : 'skill.new', scope: scope.value, draft: { ...form }, other_files: Object.keys(otherFiles.value) })
 const hl = (k: string) => highlight.value.includes(k) ? 'rounded-lg ring-2 ring-primary/60 ring-offset-2 ring-offset-(--ui-bg) transition' : ''
 
@@ -91,7 +99,9 @@ async function save(accept = false) {
         edited: editing.value ? edited : undefined, version: editing.value ? editedFrom : undefined
       }
     })
+    if (conversationId.value && !editing.value) await $fetch(`/api/conversations/${conversationId.value}/subject`, { method: 'PUT', body: { subject: subjectOf(form.name.trim()) } }).catch(() => {})
     toast.add({ title: t('skill.saved'), color: 'success' })
+    markSaved()
     await navigateTo({ path: `/projects/${props.projectId}`, query: { tab: 'skill' } })
   } catch (e) {
     const data = (e as { data?: { code?: string, findings?: Finding[] } }).data
@@ -126,7 +136,7 @@ async function save(accept = false) {
             <UTextarea v-model="form.description" :rows="2" autoresize class="w-full" :placeholder="t('skill.descriptionPlaceholder')" />
           </UFormField>
           <UFormField :label="t('skill.body')" :help="t('skill.bodyHelp')" :class="hl('body')">
-            <UTextarea v-model="form.body" :rows="18" autoresize class="w-full font-mono text-xs" :placeholder="t('skill.bodyPlaceholder')" />
+            <UTextarea v-model="form.body" :rows="8" autoresize class="w-full font-mono text-xs" :placeholder="t('skill.bodyPlaceholder')" />
           </UFormField>
           <p v-if="Object.keys(otherFiles).length" class="text-xs text-(--ui-text-muted)">
             {{ t('skill.otherFiles', { files: Object.keys(otherFiles).join(', ') }) }}
@@ -146,7 +156,10 @@ async function save(accept = false) {
       </div>
     </div>
     <div class="h-[32rem] lg:h-auto lg:min-h-0">
-      <ChatPanel :project-id="projectId" purpose="skill" :page-context="pageContext" @skill-patch="applyPatch" @history="replay" />
+      <ChatPanel
+        :project-id="projectId" purpose="skill" :subject="editing ? subjectOf(name!) : undefined" :page-context="pageContext"
+        @skill-patch="applyPatch" @history="replay" @conversation="(id) => { conversationId = id }"
+      />
     </div>
   </div>
 </template>

@@ -12,7 +12,7 @@ interface Status {
 }
 
 const toast = useToast()
-const { t, dateLocale } = useLang()
+const { t, when } = useLang()
 const { data, refresh } = await useLiveFetch<Status>('/api/system/update')
 const runTests = ref(true)
 const starting = ref(false)
@@ -34,7 +34,10 @@ function watchUpdate() {
     } catch { waitForRestart() } // the server went away: it is restarting
   }, 1500)
 }
-onMounted(() => { if (running.value) { showLog.value = true; watchUpdate() } })
+watch(() => state.value?.status, (status) => {
+  if (status === 'running') { showLog.value = true; watchUpdate() }
+  else if (status === 'restarting') { showLog.value = true; waitForRestart() }
+}, { immediate: true })
 onBeforeUnmount(() => { clearInterval(poll); clearInterval(restartPoll) })
 
 async function start(force = false) {
@@ -102,7 +105,6 @@ const lastMeta = computed(() => ({
   rolled_back: { color: 'warning' as const, icon: 'i-lucide-undo-2', title: t('admin.updateLastRolledBack') },
   failed: { color: 'error' as const, icon: 'i-lucide-circle-x', title: t('admin.updateLastFailed') }
 }))
-const when = (d: string) => new Date(d).toLocaleString(dateLocale.value)
 </script>
 
 <template>

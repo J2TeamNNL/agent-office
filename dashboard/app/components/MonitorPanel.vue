@@ -20,6 +20,7 @@ interface Monitor {
   uptime_24h: number | null
   avg_latency_ms: number
   trend: Point[]
+  version: string
 }
 interface MonitorEvent { id: string, monitor_id: string, monitor_name: string, kind: 'up' | 'down', message: string, analysis: string, analysis_status: string, cost_usd: number, at: string }
 interface Proc { id: string, name: string, kind: string, state: { status: string, port?: number } }
@@ -27,7 +28,7 @@ interface ComposeView { files: string[], file: string, services: { name: string,
 
 const props = defineProps<{ projectId: string }>()
 const emit = defineEmits<{ askAgent: [text: string, files: never[], send?: boolean] }>()
-const { t, dateLocale } = useLang()
+const { t, when: fmtWhen } = useLang()
 function fixEvent(e: MonitorEvent) {
   const m = monitors.value.find(x => x.id === e.monitor_id)
   const target = m ? `${typeMeta.value[m.type].label} ${m.type === 'process' ? targetLabel(m) : m.target}` : ''
@@ -79,7 +80,7 @@ const typeMeta = computed<Record<Monitor['type'], { label: string, icon: string 
 }))
 const maxLatency = computed(() => Math.max(1, ...monitors.value.map(m => m.avg_latency_ms)))
 const pct = (v: number | null) => v === null ? '—' : `${v >= 99.95 ? 100 : v.toFixed(v >= 99 ? 2 : 1)}%`
-const when = (d: string) => new Date(d).toLocaleString(dateLocale.value, { hour: '2-digit', minute: '2-digit', second: '2-digit', day: '2-digit', month: '2-digit' })
+const when = (d: string) => fmtWhen(d, { seconds: true })
 const every = (s: number) => s < 60 ? t('monitor.every.seconds', { n: s }) : s < 3600 ? t('monitor.every.minutes', { n: Math.round(s / 60) }) : t('monitor.every.hours', { n: Math.round(s / 3600) })
 function targetLabel(m: Monitor) {
   if (m.type === 'process') return procs.value.find(p => p.id === m.target)?.name ?? t('monitor.processDeleted')
@@ -161,7 +162,8 @@ async function saveForm() {
   if (saving.value) return
   const body = {
     name: form.name, type: form.type, target: form.target, interval_s: form.interval_s, ai_enabled: form.ai_enabled, ai_budget_usd: Number(form.ai_budget_usd) || 0,
-    config: { expect_status: form.expect_status || undefined, keyword: form.keyword || undefined, timeout_ms: Number(form.timeout_ms) || undefined, file: form.type === 'container' ? form.file : undefined }
+    config: { expect_status: form.expect_status || undefined, keyword: form.keyword || undefined, timeout_ms: Number(form.timeout_ms) || undefined, file: form.type === 'container' ? form.file : undefined },
+    version: editing.value?.version
   }
   saving.value = true
   try {
@@ -173,6 +175,7 @@ async function saveForm() {
     else formOpen.value = false
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
+    await refresh()
   } finally {
     saving.value = false
   }
@@ -207,18 +210,25 @@ function toggle(k: string) {
   else s.add(k)
   picked.value = s
 }
+const adding = ref(false)
 async function addSuggested() {
-  for (const s of suggestions.value.filter(s => picked.value.has(s.key))) {
-    try {
-      await $fetch(`/api/projects/${props.projectId}/monitors`, {
-        method: 'POST', body: { name: s.name, type: s.type, target: s.target, interval_s: 60, config: s.file ? { file: s.file } : {} }
-      })
-    } catch (e) {
-      toast.add({ title: `${s.name}: ${apiError(e)}`, color: 'error' })
+  if (adding.value) return
+  adding.value = true
+  try {
+    for (const s of suggestions.value.filter(s => picked.value.has(s.key))) {
+      try {
+        await $fetch(`/api/projects/${props.projectId}/monitors`, {
+          method: 'POST', body: { name: s.name, type: s.type, target: s.target, interval_s: 60, config: s.file ? { file: s.file } : {} }
+        })
+      } catch (e) {
+        toast.add({ title: `${s.name}: ${apiError(e)}`, color: 'error' })
+      }
     }
+    suggestOpen.value = false
+    setTimeout(refresh, 1500)
+  } finally {
+    adding.value = false
   }
-  suggestOpen.value = false
-  setTimeout(refresh, 1500)
 }
 </script>
 
@@ -460,8 +470,8 @@ async function addSuggested() {
       </template>
       <template #footer>
         <div class="flex w-full justify-end gap-2">
-          <UButton color="neutral" variant="ghost" :label="t('monitor.suggest.cancel')" @click="suggestOpen = false" />
-          <UButton :label="t('monitor.suggest.add', { n: picked.size })" :disabled="!picked.size" @click="addSuggested" />
+          <UButton color="neutral" variant="ghost" :label="t('monitor.suggest.cancel')" :disabled="adding" @click="suggestOpen = false" />
+          <UButton :label="t('monitor.suggest.add', { n: picked.size })" :loading="adding" :disabled="!picked.size || adding" @click="addSuggested" />
         </div>
       </template>
     </UModal>

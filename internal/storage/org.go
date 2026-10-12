@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -17,19 +18,23 @@ const (
 	ProviderOpenAICompatible ProviderKind = "openai_compatible" // any /v1/chat/completions endpoint
 	ProviderClaudeCLI        ProviderKind = "claude_cli"        // local `claude -p`
 	ProviderCodexCLI         ProviderKind = "codex_cli"         // local `codex exec`
+	ProviderGeminiCLI        ProviderKind = "gemini_cli"        // local `gemini` (headless)
+	ProviderAntigravityCLI   ProviderKind = "antigravity_cli"   // local `agy` (print mode)
 )
 
 // Valid reports whether k is known.
 func (k ProviderKind) Valid() bool {
 	switch k {
-	case ProviderAnthropic, ProviderOpenAI, ProviderOpenAICompatible, ProviderClaudeCLI, ProviderCodexCLI:
+	case ProviderAnthropic, ProviderOpenAI, ProviderOpenAICompatible, ProviderClaudeCLI, ProviderCodexCLI, ProviderGeminiCLI, ProviderAntigravityCLI:
 		return true
 	}
 	return false
 }
 
 // IsCLI reports whether the provider runs a local binary instead of an HTTP API.
-func (k ProviderKind) IsCLI() bool { return k == ProviderClaudeCLI || k == ProviderCodexCLI }
+func (k ProviderKind) IsCLI() bool {
+	return k == ProviderClaudeCLI || k == ProviderCodexCLI || k == ProviderGeminiCLI || k == ProviderAntigravityCLI
+}
 
 // Model tiers let templates say "strong model" without naming a vendor model.
 const (
@@ -52,6 +57,7 @@ type Provider struct {
 	APIKeyEnv    string
 	APIKeyHint   string
 	TierModels   map[string]string
+	LimitCaps    map[string]int // usage window (five_hour, seven_day) → stop at this percent; 0/missing = off (ADR-136)
 	Models       []string
 	IsDefault    bool
 	Enabled      bool
@@ -61,47 +67,6 @@ type Provider struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
-
-// Org model kinds.
-const (
-	KindSolo    = "solo"
-	KindTeam    = "team"
-	KindCouncil = "council"
-	KindCustom  = "custom"
-)
-
-// Governance says how the agents of an org model reach a decision.
-type Governance struct {
-	Mode   string   `json:"mode"`             // single | hierarchy | council
-	Quorum int      `json:"quorum,omitempty"` // council: votes needed
-	Veto   []string `json:"veto,omitempty"`   // agent keys that can block side effects
-	Notes  string   `json:"notes,omitempty"`
-}
-
-// OrgModel is a template (RepoID empty) or a repo's instance.
-type OrgModel struct {
-	ID               string
-	RepoID           string
-	SourceTemplateID string
-	Key              string
-	Name             string
-	Description      string
-	Kind             string
-	Governance       Governance
-	Builtin          bool
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-}
-
-// IsTemplate reports whether m lives in the library.
-func (m OrgModel) IsTemplate() bool { return m.RepoID == "" }
-
-// Agent tiers.
-const (
-	TierLead    = "lead"
-	TierManager = "manager"
-	TierWorker  = "worker"
-)
 
 // Permissions bound what an agent may do.
 type Permissions struct {
@@ -129,16 +94,15 @@ type Permissions struct {
 	ExtraDirs []string `json:"extra_dirs,omitempty"`
 }
 
-// Agent belongs to one org model.
+// Agent belongs to one project. How agents work together is a workflow
+// (internal/workflow), not a hierarchy (ADR-099).
 type Agent struct {
 	ID           string
-	OrgModelID   string
+	ProjectID    string
 	Key          string
 	Name         string
-	Tier         string // lead | manager | worker
 	Role         string
 	Description  string
-	ReportsTo    []string // agent keys in the same org model
 	ProviderID   string
 	ModelTier    string
 	LLMModel     string
@@ -153,10 +117,27 @@ type Agent struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	// FallbackProviderIDs: the connections tried next, top to bottom, when
-	// the agent's own one (ProviderID, or the default) fails or is over its limit.
+	// the agent's own one (ProviderID, or the default) fails, is over its
+	// limit or is turned off. An entry may name a model ("id|model",
+	// FallbackEntry): the same connection can come back with another model.
 	FallbackProviderIDs []string
 	// Effort: how hard it thinks by default (ValidEffort; "" = the CLI's own).
 	Effort string
+}
+
+// FallbackEntry is a fallback list entry: a connection id, and a model of it
+// ("" = the agent's tier model there).
+func FallbackEntry(providerID, model string) string {
+	if model = strings.TrimSpace(model); model != "" {
+		return providerID + "|" + model
+	}
+	return providerID
+}
+
+// SplitFallback reads an entry FallbackEntry made.
+func SplitFallback(entry string) (providerID, model string) {
+	id, model, _ := strings.Cut(strings.TrimSpace(entry), "|")
+	return strings.TrimSpace(id), strings.TrimSpace(model)
 }
 
 // Efforts are the thinking levels a turn may ask for, lowest first ("max" is
@@ -164,6 +145,32 @@ type Agent struct {
 var Efforts = []string{"low", "medium", "high", "xhigh", "max"}
 
 func ValidEffort(e string) bool { return e == "" || slices.Contains(Efforts, e) }
+
+// EffortsFor are the levels a model takes on a kind of connection, lowest
+// first; none = it has no choice. Antigravity names the level in the model
+// (gemini-3.8-flash-high) or takes none (claude-sonnet-4-6): only its own
+// default model picks one, up to high.
+func EffortsFor(kind ProviderKind, model string) []string {
+	if kind == ProviderAntigravityCLI {
+		if model != "" {
+			return nil
+		}
+		return Efforts[:3]
+	}
+	return Efforts
+}
+
+// FitEffort is the level a turn asks that model for: e when it takes it,
+// else the highest it takes below e, else "" (left to the model).
+func FitEffort(kind ProviderKind, model, e string) string {
+	fit, want := "", slices.Index(Efforts, e)
+	for _, x := range EffortsFor(kind, model) {
+		if slices.Index(Efforts, x) <= want {
+			fit = x
+		}
+	}
+	return fit
+}
 
 // OffNotice is what anyone calling a paused agent gets (chat, delegate, bots,
 // automations), instead of an AI run.
@@ -200,8 +207,44 @@ type Repo struct {
 	Path        string
 	GitRemote   string
 	Description string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// DefaultAgentID answers a new chat, bots and automations that name no
+	// agent ("" or paused = the first agent on; see DefaultAgent).
+	DefaultAgentID string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// DefaultAgent is the project's default agent among agents (sorted): the one
+// named by the project if it is on, otherwise the first agent on.
+func DefaultAgent(r Repo, agents []Agent) (Agent, bool) {
+	for _, a := range agents {
+		if a.ID == r.DefaultAgentID && !a.Disabled {
+			return a, true
+		}
+	}
+	for _, a := range agents {
+		if !a.Disabled {
+			return a, true
+		}
+	}
+	return Agent{}, false
+}
+
+// DefaultAgentAny is DefaultAgent, or when every agent is paused the default
+// one anyway (callers then answer with OffNotice).
+func DefaultAgentAny(r Repo, agents []Agent) (Agent, bool) {
+	if a, ok := DefaultAgent(r, agents); ok {
+		return a, true
+	}
+	for _, a := range agents {
+		if a.ID == r.DefaultAgentID {
+			return a, true
+		}
+	}
+	if len(agents) > 0 {
+		return agents[0], true
+	}
+	return Agent{}, false
 }
 
 // ProviderRepo manages AI connections.
@@ -213,48 +256,45 @@ type ProviderRepo interface {
 	Delete(ctx context.Context, id string) error
 	SetDefault(ctx context.Context, id string) error
 	SetStatus(ctx context.Context, id, status, detail string, models []string, at time.Time) error
+	// SetTierModels writes auto-filled tier models only if the row still matches
+	// prevTiers/baseURL/kind (unchanged since they were read); it is a no-op,
+	// not an error, if a concurrent edit moved the row in the meantime.
+	SetTierModels(ctx context.Context, id string, newTiers, prevTiers map[string]string, baseURL string, kind ProviderKind) (bool, error)
 }
 
-// OrgModelRepo manages templates and repo instances.
-type OrgModelRepo interface {
-	Create(ctx context.Context, m OrgModel) (OrgModel, error)
-	Update(ctx context.Context, m OrgModel) error
-	Get(ctx context.Context, id string) (OrgModel, error)
-	GetTemplateByKey(ctx context.Context, key string) (OrgModel, error)
-	GetForRepo(ctx context.Context, repoID string) (OrgModel, error)
-	ListTemplates(ctx context.Context) ([]OrgModel, error)
-	Delete(ctx context.Context, id string) error
-}
-
-// AgentRepo manages agents of an org model.
+// AgentRepo manages the agents of a project.
 type AgentRepo interface {
 	Create(ctx context.Context, a Agent) (Agent, error)
 	Update(ctx context.Context, a Agent) error
+	// UpdateIf is Update, but refuses with ErrConflict when the row's
+	// content columns no longer match prev (a write landed between the
+	// caller's Get and this Update).
+	UpdateIf(ctx context.Context, a, prev Agent) error
 	Get(ctx context.Context, id string) (Agent, error)
-	List(ctx context.Context, orgModelID string) ([]Agent, error)
+	List(ctx context.Context, projectID string) ([]Agent, error) // by sort
 	Delete(ctx context.Context, id string) error
 	// SetEnabled pauses or resumes an agent; Update never touches it.
 	SetEnabled(ctx context.Context, id string, enabled bool) error
 }
 
-// Revision is a snapshot of an org model taken before a change.
+// Revision is a snapshot of a project's agents taken before a change.
 type Revision struct {
 	ID         string
-	OrgModelID string
-	Action     string // what was about to happen: agent.update, model.update, restore…
+	ProjectID  string
+	Action     string // what was about to happen: agent.update, agent.delete, restore…
 	Actor      string
 	AgentCount int
-	Snapshot   []byte // JSON of orgmodel.Template
+	Snapshot   []byte // JSON of team.Snapshot
 	CreatedAt  time.Time
 }
 
-// RevisionRepo stores org model snapshots.
+// RevisionRepo stores snapshots of projects' agents.
 type RevisionRepo interface {
 	Create(ctx context.Context, r Revision) (Revision, error)
 	Get(ctx context.Context, id string) (Revision, error)
-	List(ctx context.Context, orgModelID string, limit int) ([]Revision, error)
-	// Prune keeps the newest keep revisions of a model.
-	Prune(ctx context.Context, orgModelID string, keep int) error
+	List(ctx context.Context, projectID string, limit int) ([]Revision, error)
+	// Prune keeps the newest keep revisions of a project.
+	Prune(ctx context.Context, projectID string, keep int) error
 }
 
 // Run is one model call.
@@ -329,6 +369,7 @@ type Conversation struct {
 	TaskID       string // set for the follow-up talk about one task
 	Purpose      string // "" = a chat of the project; "automation" = builds one automation (not listed)
 	AutomationID string // purpose automation: the automation it builds, once saved
+	Subject      string // purpose skill/workflow: what it writes ("skill:<scope>:<name>", "wf:<id>", "lib:<key>")
 	Effort       string // this chat's thinking level over its agent's ("" = the agent's)
 	Cleaned      string // data cleanup: CleanContent | CleanSummary ("" = as it was); takes no more messages
 	CleanedAt    *time.Time
@@ -374,8 +415,24 @@ type Message struct {
 	Attachments    []Attachment
 	RunID          string
 	Author         string
+	AgentID        string // the agent that sent it (assistant messages only; "" if none)
 	CreatedAt      time.Time
-	Context        string // the page the person was on (sent to the agent as data)
+	Context        string  // the page the person was on (sent to the agent as data)
+	Sender         *Sender // who wrote it from outside office (a bot's chat); nil = in office
+}
+
+// Sender is the person who wrote to a bot (Discord, Telegram), as the
+// platform names them.
+type Sender struct {
+	Kind     string `json:"kind"`               // discord | telegram
+	ID       string `json:"id"`                 // the platform's user id
+	Username string `json:"username,omitempty"` // @handle
+	Name     string `json:"name,omitempty"`     // display name (nickname on the server, else global)
+	Private  bool   `json:"private,omitempty"`  // a direct message, not a server or group
+	Link     string `json:"link,omitempty"`     // the message on the platform
+	// the office account this platform id is linked to (Users), if any
+	AccountID string `json:"account_id,omitempty"`
+	Account   string `json:"account,omitempty"` // its name, else its email
 }
 
 // Attachment references a file a person attached (see internal/attach).
@@ -408,10 +465,33 @@ type Patch struct {
 // ChatRepo stores conversations, messages and patches.
 // Change is a chat written, for the dashboard's live data (ADR-078): a
 // message added (with it), a conversation made, changed or deleted.
+// QueuedMessage is a message written while its chat answered: office sends
+// the chat's waiting ones together as the next message once it is free.
+type QueuedMessage struct {
+	ID, ConversationID string
+	Author             string // who wrote it (actor)
+	Text, Context      string
+	Attachments        []Attachment
+	Options            QueuedOptions
+	CreatedAt          time.Time
+}
+
+// QueuedOptions are the chat settings sent with it, applied when it goes.
+type QueuedOptions struct {
+	Mode     string  `json:"mode,omitempty"`
+	EditMode string  `json:"edit_mode,omitempty"`
+	AgentID  string  `json:"agent_id,omitempty"`
+	Effort   *string `json:"effort,omitempty"`
+}
+
 type Change struct {
 	Kind           string // message | conversation | conversation.deleted
 	ConversationID string
 	Message        *Message
+	// ProjectID/CreatedBy: the deleted conversation's, so a listener can still
+	// scope visibility (e.g. a private assistant chat) once it is gone.
+	ProjectID string
+	CreatedBy string
 }
 
 // MessageHit is a message found by a search of the chats (ADR-086).
@@ -451,8 +531,13 @@ type ChatRepo interface {
 	// ListConversationsBefore is the next page: those updated before (zero: the newest).
 	ListConversationsBefore(ctx context.Context, projectID, source string, before time.Time, limit int) ([]Conversation, error)
 	// ListConversationsTagged is ListConversationsBefore keeping only the chats
-	// that have every one of tags (none: all).
-	ListConversationsTagged(ctx context.Context, projectID, source string, tags []string, before time.Time, limit int) ([]Conversation, error)
+	// that have every one of tags (none: all); createdBy not "": only that
+	// person's chats (the assistant's own chats are private per person).
+	ListConversationsTagged(ctx context.Context, projectID, source string, tags []string, before time.Time, limit int, createdBy string) ([]Conversation, error)
+	// ListAgentConversations lists a project's chats (as ListConversationsFrom
+	// with source "all") owned by agentID or that it is a member of, updated at
+	// or after since (zero: no lower bound), newest first, capped at limit.
+	ListAgentConversations(ctx context.Context, projectID, agentID string, since time.Time, limit int) ([]Conversation, error)
 	// SetConversationTags replaces a chat's tags.
 	SetConversationTags(ctx context.Context, conversationID string, tags []string) error
 	// ProjectTags lists the tags of a project's chats, the last used first;
@@ -461,6 +546,11 @@ type ChatRepo interface {
 	TaskConversation(ctx context.Context, taskID string) (Conversation, error)
 	// AutomationConversation is the chat that builds an automation.
 	AutomationConversation(ctx context.Context, automationID string) (Conversation, error)
+	// SubjectConversation is the latest editor chat (skill, workflow) of a
+	// subject; createdBy not "": only that person's.
+	SubjectConversation(ctx context.Context, projectID, purpose, subject, createdBy string) (Conversation, error)
+	// SetConversationSubject ties an editor chat to what it writes.
+	SetConversationSubject(ctx context.Context, conversationID, subject string) error
 	// LinkAutomation ties a building chat to the automation once it is saved.
 	LinkAutomation(ctx context.Context, conversationID, automationID string) error
 	DeleteConversation(ctx context.Context, id string) error
@@ -478,6 +568,15 @@ type ChatRepo interface {
 	Members(ctx context.Context, conversationID string) ([]ChatMember, error)
 	ListMessages(ctx context.Context, conversationID string) ([]Message, error)
 
+	// QueueMessage keeps a message written while the chat answers (sent next).
+	QueueMessage(ctx context.Context, q QueuedMessage) (QueuedMessage, error)
+	// QueuedMessages lists a chat's waiting messages, oldest first.
+	QueuedMessages(ctx context.Context, conversationID string) ([]QueuedMessage, error)
+	// QueuedConversations lists the chats with waiting messages.
+	QueuedConversations(ctx context.Context) ([]string, error)
+	// DeleteQueued drops those of a chat's waiting messages (none named: all).
+	DeleteQueued(ctx context.Context, conversationID string, ids ...string) error
+
 	AddPatch(ctx context.Context, p Patch) (Patch, error)
 	GetPatch(ctx context.Context, id string) (Patch, error)
 	// SetPatchDiff replaces a diff and its files (a worktree's, refreshed onto the project).
@@ -488,7 +587,7 @@ type ChatRepo interface {
 	DecidePatch(ctx context.Context, id, status, detail, by string, at time.Time) error
 }
 
-// Task is a goal given to a project's whole org model.
+// Task is a goal given to a project's agents (old Việc data, ADR-057).
 type Task struct {
 	ID          string
 	ProjectID   string
@@ -502,7 +601,7 @@ type Task struct {
 	CostUSD     float64
 	ModeLevel   string // permission mode (internal/perm level), a ceiling for this task
 	EditMode    string // where it changes code: perm.EditWorktree (default) or perm.EditDirect
-	AssigneeID  string // one agent does it alone ("" = the team, by the org model)
+	AssigneeID  string // one agent does it alone ("" = the team)
 	Attachments []Attachment
 	CreatedBy   string
 	CreatedAt   time.Time
@@ -541,6 +640,9 @@ type TaskRepo interface {
 	AddStep(ctx context.Context, s TaskStep) (TaskStep, error)
 	UpdateStep(ctx context.Context, s TaskStep) error
 	ListSteps(ctx context.Context, taskID string) ([]TaskStep, error)
+	// ListByAgentSince lists a project's tasks created at or after since that
+	// have at least one step run by agentID.
+	ListByAgentSince(ctx context.Context, projectID, agentID string, since time.Time) ([]Task, error)
 	// CleanTask takes a finished task's steps and diffs out; result replaces its result.
 	CleanTask(ctx context.Context, id, state, result string) error
 	ListPatches(ctx context.Context, taskID string) ([]Patch, error)
@@ -552,6 +654,12 @@ type TaskRepo interface {
 type RepoRepo interface {
 	Create(ctx context.Context, r Repo) (Repo, error)
 	Update(ctx context.Context, r Repo) error
+	// UpdateInfo writes only name and description, leaving other fields untouched.
+	UpdateInfo(ctx context.Context, id, name, description string) error
+	// UpdateInfoRemote writes name, description and git remote, leaving other fields (notably default_agent_id) untouched.
+	UpdateInfoRemote(ctx context.Context, id, name, description, gitRemote string) error
+	// SetDefaultAgent writes only the default agent, leaving other fields untouched.
+	SetDefaultAgent(ctx context.Context, id, agentID string) error
 	Get(ctx context.Context, id string) (Repo, error)
 	GetByPath(ctx context.Context, path string) (Repo, error)
 	List(ctx context.Context) ([]Repo, error)
@@ -569,6 +677,7 @@ type Process struct {
 	Source      string
 	Autostart   bool
 	Autorestart bool
+	Env         map[string]string // over the office's environment when it runs (PORT…)
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -641,6 +750,7 @@ type MonitorRepo interface {
 	Create(ctx context.Context, m Monitor) (Monitor, error)
 	Update(ctx context.Context, m Monitor) error     // definition fields
 	SaveStatus(ctx context.Context, m Monitor) error // status fields
+	SavePing(ctx context.Context, id string, at time.Time) error
 	Get(ctx context.Context, id string) (Monitor, error)
 	GetByToken(ctx context.Context, token string) (Monitor, error)
 	List(ctx context.Context, projectID string) ([]Monitor, error) // "" = all
@@ -654,6 +764,9 @@ type MonitorRepo interface {
 	UpdateEvent(ctx context.Context, e MonitorEvent) error
 	Events(ctx context.Context, projectID string, limit int) ([]MonitorEvent, error) // "" = all
 	AICostSince(ctx context.Context, monitorID string, since time.Time) (float64, error)
+	// RecentAnalysis reports whether monitorID has a running or completed
+	// analysis event (other than excludeID) since the given time.
+	RecentAnalysis(ctx context.Context, monitorID, excludeID string, since time.Time) (bool, error)
 }
 
 // Action is an operation an agent proposed; it runs only after approval.
@@ -690,6 +803,9 @@ type ActionArgs struct {
 	Change *ConfigChange `json:"change,omitempty"`
 	// mcp_call: a call of an office MCP tool that writes (ADR-093)
 	MCP *MCPCallArgs `json:"mcp,omitempty"`
+	// remember: the topic the note goes under and its index line ("" = core, ADR-134)
+	Topic   string `json:"topic,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 // MCPCallArgs is a tool call waiting for a person.

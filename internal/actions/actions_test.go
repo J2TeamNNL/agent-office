@@ -2,6 +2,7 @@ package actions
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -166,5 +167,34 @@ func TestRunCommand(t *testing.T) {
 	sc.RunRef = "c3"
 	if a, _ := svc.Propose(ctx, sc, "run_command", "cat missing.txt", "x"); a.Status != "failed" {
 		t.Fatalf("a failing command is failed: %+v", a)
+	}
+}
+
+// TestRunCommandRisky: a risky pattern saved to an agent's commands before
+// putPolicy rejected them (or by any other path) must still never auto-run.
+func TestRunCommandRisky(t *testing.T) {
+	ctx := context.Background()
+	st, _ := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
+	defer st.Close()
+	st.Migrate(ctx)
+	proj, _ := st.Repos().Create(ctx, storage.Repo{Name: "r", Path: t.TempDir()})
+	svc := New(st, nil)
+	acc := perm.Access{Level: perm.Operate, Caps: []string{perm.CapPropose, perm.CapCommands},
+		Commands: []string{"git push *", "go version *", "git -C *", "git --no-pager *", "git -c *"}}
+	sc := Scope{ProjectID: proj.ID, RunRef: "r1", Agent: "a", Level: perm.Operate, Access: acc}
+
+	if a, err := svc.Propose(ctx, sc, "run_command", "git push origin main --force", "x"); err != nil || a.Status != "pending" {
+		t.Fatalf("a risky pattern must wait for a person, even with CapCommands: %v %+v", err, a)
+	}
+	// git's global options before the subcommand don't hide a push or reset
+	for i, line := range []string{"git -C . push origin main", "git --no-pager push", "git -c x=y reset --hard"} {
+		sc.RunRef = fmt.Sprintf("g%d", i)
+		if a, err := svc.Propose(ctx, sc, "run_command", line, "x"); err != nil || a.Status != "pending" {
+			t.Fatalf("%q must wait for a person: %v %+v", line, err, a)
+		}
+	}
+	sc.RunRef = "r2"
+	if a, err := svc.Propose(ctx, sc, "run_command", "go version", "x"); err != nil || a.Status != "done" {
+		t.Fatalf("a non-risky allowed command still runs on its own: %v %+v", err, a)
 	}
 }

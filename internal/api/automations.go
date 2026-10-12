@@ -14,6 +14,7 @@ import (
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/trigger"
+	"github.com/tung1998/agent-office/internal/workflow"
 )
 
 // Automations: schedules and webhooks that start jobs (ADR-040).
@@ -82,7 +83,7 @@ type automationDTO struct {
 func (s *server) toAutomationDTO(r *http.Request, a storage.Automation) automationDTO {
 	c := a.Config
 	cfg := map[string]any{"every_minutes": c.EveryMinutes, "cron": c.Cron, "timezone": c.Timezone, "auth": c.Auth, "auth_name": c.AuthName,
-		"pull_request": c.PullRequest, "notify_channel_id": c.NotifyChannelID, "notify_chat_id": c.NotifyChatID, "ends_at": c.EndsAt}
+		"pull_request": c.PullRequest, "notify_channel_id": c.NotifyChannelID, "notify_chat_id": c.NotifyChatID, "ends_at": c.EndsAt, "goal": c.Goal}
 	if trigger.IsChannel(a.Source) {
 		keywords := c.Keywords
 		if keywords == nil {
@@ -107,8 +108,18 @@ func (s *server) toAutomationDTO(r *http.Request, a storage.Automation) automati
 	if trigger.IsChannel(a.Source) {
 		d.Bot, d.BotStatus = s.botOf(r, a)
 	}
-	if jobs, err := s.cfg.Store.Jobs().List(r.Context(), storage.JobFilter{Origin: "automation", OriginID: a.ID, Limit: 1}); err == nil && len(jobs) > 0 {
-		j := s.toJobDTO(r, jobs[0], nil)
+	// a "skipped/busy" trace (ADR-082: a tick dropped for hitting Parallel())
+	// must not hide a run still going: look a little further back for the
+	// latest job that isn't one of those before falling back to it.
+	if jobs, err := s.cfg.Store.Jobs().List(r.Context(), storage.JobFilter{Origin: "automation", OriginID: a.ID, Limit: 5}); err == nil && len(jobs) > 0 {
+		last := jobs[0]
+		for _, j := range jobs {
+			if !(j.Status == "skipped" && j.ErrorCode == "busy") {
+				last = j
+				break
+			}
+		}
+		j := s.toJobDTO(r, last, nil)
 		d.LastJob = &j
 	}
 	return d
@@ -194,8 +205,22 @@ func (s *server) applyAutomation(r *http.Request, in automationInput, a *storage
 		return errors.New("cấp model phải là mạnh, cân bằng hoặc nhanh")
 	}
 	a.ModelTier = in.ModelTier
-	if in.Action != "chat" && in.Action != "script" {
-		return errors.New("hành động phải là gửi tin (chat) hoặc chạy code (script)")
+	if in.Action != "chat" && in.Action != "script" && in.Action != "workflow" {
+		return errors.New("hành động phải là gửi tin (chat), chạy code (script) hoặc chạy quy trình (workflow)")
+	}
+	workflowKey := ""
+	if in.Action == "workflow" { // ADR-109: a workflow of the project, on and callable from a chat
+		workflowKey = strings.TrimSpace(in.Config.Workflow)
+		if workflowKey == "" {
+			return errors.New("hãy chọn quy trình để chạy")
+		}
+		wf, err := s.cfg.Store.Workflows().GetByKey(r.Context(), a.ProjectID, workflowKey)
+		if err != nil {
+			return errors.New("project chưa cài quy trình #" + workflowKey)
+		}
+		if def, err := workflow.Parse(wf.Source); err == nil && def.Callable == workflow.CallableSub {
+			return errors.New("quy trình #" + workflowKey + " chỉ để quy trình khác gọi (callable: sub)")
+		}
 	}
 	if in.Action == "script" {
 		src := in.Source
@@ -278,15 +303,23 @@ func (s *server) applyAutomation(r *http.Request, in automationInput, a *storage
 		}
 		cfg.PullRequest = in.Config.PullRequest // a GitHub/Bitbucket PR webhook
 	}
-	if !trigger.IsChannel(in.Source) && strings.TrimSpace(in.Config.NotifyChannelID) != "" { // its answers go to a bot's chat of the project too
+	if !trigger.IsChannel(in.Source) && strings.TrimSpace(in.Config.NotifyChannelID) != "" { // its answers go to a bot's chat too: the project's, or one borrowed from another
 		ch, err := s.cfg.Store.Channels().Get(r.Context(), strings.TrimSpace(in.Config.NotifyChannelID))
-		if err != nil || ch.ProjectID != a.ProjectID {
-			return errors.New("hãy chọn bot của project này để gửi kết quả")
+		if err != nil {
+			return errors.New("không có bot này")
 		}
 		cfg.NotifyChannelID, cfg.NotifyChatID = ch.ID, strings.TrimSpace(in.Config.NotifyChatID)
 		if cfg.NotifyChatID == "" {
 			return errors.New("hãy điền channel/chat id để gửi kết quả")
 		}
+	}
+	cfg.Workflow = workflowKey
+	if !trigger.IsChannel(in.Source) { // run until its goal is reached (ADR-132); a bot's reply is one turn
+		goal, err := trigger.CleanGoal(in.Config.Goal, in.Action)
+		if err != nil {
+			return err
+		}
+		cfg.Goal = goal
 	}
 	tags, err := cleanTags(in.Config.Tags) // put on the chat of each run
 	if err != nil {
@@ -394,6 +427,7 @@ func (s *server) createAutomation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := commitBot(); err != nil {
+		_ = s.cfg.Store.Automations().Delete(r.Context(), a.ID)
 		s.internal(w, r, err)
 		return
 	}
@@ -432,6 +466,14 @@ func (s *server) updateAutomation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.lockAutomations(a.ProjectID)()
+	a, err = s.cfg.Store.Automations().Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeDomainError(w, r, err)
+		return
+	}
+	if conflicted(w, in.Version, automationVersion(a)) {
+		return
+	}
 	old := a
 	wasWebhook := a.Source == "webhook"
 	newBot, commitBot, err := s.saveBot(r, &in, a.ProjectID)
@@ -458,6 +500,11 @@ func (s *server) updateAutomation(w http.ResponseWriter, r *http.Request) {
 	change := audit.Change{Action: "automation.update", ResourceID: a.ID, ProjectID: a.ProjectID,
 		Before: s.toAutomationDTO(r, old), After: s.toAutomationDTO(r, a), Detail: map[string]any{"name": a.Name, "enabled": a.Enabled}}
 	if err := s.cfg.Store.Automations().Update(r.Context(), a); err != nil {
+		if errors.Is(err, storage.ErrConflict) {
+			s.dropBot(r, newBot)
+			writeSaveConflict(w) // a write landed between this Get and Update (e.g. the Runner's safety-disable)
+			return
+		}
 		change.Err = err
 		s.audit(r, change)
 		s.internal(w, r, err)
@@ -484,6 +531,12 @@ func (s *server) updateAutomation(w http.ResponseWriter, r *http.Request) {
 func (s *server) deleteAutomation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	old, err := s.cfg.Store.Automations().Get(r.Context(), id)
+	if err != nil {
+		s.writeDomainError(w, r, err)
+		return
+	}
+	defer s.lockAutomations(old.ProjectID)()
+	old, err = s.cfg.Store.Automations().Get(r.Context(), id)
 	if err != nil {
 		s.writeDomainError(w, r, err)
 		return
@@ -527,13 +580,19 @@ func (s *server) rotateSecret(w http.ResponseWriter, r *http.Request) {
 		s.writeDomainError(w, r, err)
 		return
 	}
+	defer s.lockAutomations(a.ProjectID)()
+	a, err = s.cfg.Store.Automations().Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeDomainError(w, r, err)
+		return
+	}
 	if a.Source != "webhook" {
 		writeError(w, http.StatusBadRequest, "chỉ webhook mới có secret")
 		return
 	}
 	var secret string
 	secret, a.Config.SecretHash = trigger.NewSecret()
-	if err := s.cfg.Store.Automations().Update(r.Context(), a); err != nil {
+	if err := s.cfg.Store.Automations().UpdateSecretHash(r.Context(), a.ID, a.Config.SecretHash); err != nil {
 		s.internal(w, r, err)
 		return
 	}
@@ -568,14 +627,9 @@ func (s *server) automationWeeklyReset(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"weekly_reset": nil}
 	if s.cfg.Burn != nil {
 		agentID := r.URL.Query().Get("agent_id")
-		if agentID == "" { // the lead that is on
-			if agents, err := s.cfg.Chat.Agents(r.Context(), r.PathValue("id")); err == nil {
-				for _, a := range storage.OnAgents(agents) {
-					if a.Tier == storage.TierLead {
-						agentID = a.ID
-						break
-					}
-				}
+		if agentID == "" { // the project's default agent
+			if a, err := s.cfg.Chat.DefaultAgent(r.Context(), r.PathValue("id")); err == nil {
+				agentID = a.ID
 			}
 		}
 		if t, ok := s.cfg.Burn.WeeklyReset(r.Context(), agentID); ok {

@@ -35,7 +35,7 @@ func (h HistoryItem) Said() string {
 	if h.Author == "" {
 		return h.Content
 	}
-	return "(" + h.Author + " trả lời trước đây) " + h.Content // i18n-ignore
+	return "(" + h.Author + " answered earlier) " + h.Content
 }
 
 // RunRequest is one agent turn.
@@ -66,9 +66,17 @@ type RunRequest struct {
 	// UserMCP lets it use the MCP servers of the person's own setup
 	// (perm.CapUserMCP); otherwise only office's tools.
 	UserMCP bool
+	// QuickCheck: each edited file is checked at once, what is wrong goes
+	// back to the agent (perm.Policy.QuickCheck, ADR-133; Claude Code only)
+	QuickCheck bool
+	// QuickChecks: the project's own, by file ending (perm.Policy.QuickChecks, ADR-135)
+	QuickChecks string
 	// NoTools: people outside office drive this run (a Telegram/Discord
 	// channel, ADR-048): no file, MCP or office tools at all.
 	NoTools bool
+	// NoSubagents: no subagents of its own (a workflow's role: the office
+	// hands out the work); only full access has them otherwise
+	NoSubagents bool
 }
 
 // OfficeAccess lets one run read the project's operations data: Claude Code
@@ -85,7 +93,7 @@ type OfficeAccess struct {
 	GatewayTools GatewayTools
 }
 
-// ClientHeader tells the gateway which AI calls (claude | codex).
+// ClientHeader tells the gateway which AI calls (claude | codex | gemini).
 const ClientHeader = "X-Office-Client"
 
 // GatewayTools are the gateway's tools for an API run: office calls them
@@ -122,6 +130,10 @@ func runnerFor(kind storage.ProviderKind) Runner {
 		return claudeRunner{}
 	case storage.ProviderCodexCLI:
 		return codexRunner{}
+	case storage.ProviderGeminiCLI:
+		return geminiRunner{}
+	case storage.ProviderAntigravityCLI:
+		return antigravityRunner{}
 	case storage.ProviderAnthropic:
 		return anthropicRunner{}
 	default:

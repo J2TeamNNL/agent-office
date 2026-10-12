@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/tung1998/agent-office/internal/officetools"
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,13 +22,13 @@ var workspaceTools = []struct {
 	Name, Description string
 	Schema            map[string]any
 }{
-	{"list_dir", "Liệt kê file và thư mục con trong một thư mục của project (đường dẫn tương đối, '.' là gốc).",
+	{"list_dir", "List the files and subfolders in a folder of the project (relative path, '.' is the root).",
 		map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []string{"path"}}},
-	{"read_file", "Đọc một file văn bản của project, có đánh số dòng. Dùng start/end để đọc một đoạn.",
+	{"read_file", "Read a text file of the project, with line numbers. Use start/end to read a range.",
 		map[string]any{"type": "object", "properties": map[string]any{
 			"path": map[string]any{"type": "string"}, "start": map[string]any{"type": "integer"}, "end": map[string]any{"type": "integer"}},
 			"required": []string{"path"}}},
-	{"search_text", "Tìm các dòng khớp biểu thức chính quy (không phân biệt hoa thường) trong project. glob tùy chọn, ví dụ *.vue.",
+	{"search_text", "Find lines matching a regular expression (case-insensitive) in the project. glob is optional, e.g. *.vue.",
 		map[string]any{"type": "object", "properties": map[string]any{"pattern": map[string]any{"type": "string"}, "glob": map[string]any{"type": "string"}},
 			"required": []string{"pattern"}}},
 }
@@ -36,10 +38,10 @@ var writeTools = []struct {
 	Name, Description string
 	Schema            map[string]any
 }{
-	{"write_file", "Tạo mới hoặc ghi đè toàn bộ một file (đường dẫn tương đối từ gốc).",
+	{"write_file", "Create a file or overwrite it whole (path relative to the root).",
 		map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}},
 			"required": []string{"path", "content"}}},
-	{"edit_file", "Sửa một file: thay đoạn old (phải khớp đúng một chỗ, kể cả khoảng trắng) bằng new. Đọc file trước khi sửa.",
+	{"edit_file", "Edit a file: replace old (must match exactly one place, whitespace included) with new. Read the file before editing.",
 		map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}, "old": map[string]any{"type": "string"}, "new": map[string]any{"type": "string"}},
 			"required": []string{"path", "old", "new"}}},
 }
@@ -193,6 +195,7 @@ func (anthropicRunner) Run(ctx context.Context, req RunRequest, emit func(Event)
 	res := RunResult{}
 	start := time.Now()
 	var answer strings.Builder
+	exhausted := true
 	for round := 0; round < maxToolRounds; round++ {
 		var out struct {
 			Model      string            `json:"model"`
@@ -242,6 +245,7 @@ func (anthropicRunner) Run(ctx context.Context, req RunRequest, emit func(Event)
 			}
 		}
 		if out.StopReason != "tool_use" || len(results) == 0 {
+			exhausted = false
 			break
 		}
 		messages = append(messages, map[string]any{"role": "user", "content": results})
@@ -252,6 +256,14 @@ func (anthropicRunner) Run(ctx context.Context, req RunRequest, emit func(Event)
 	}
 	res.Text = strings.TrimSpace(answer.String())
 	res.Usage.DurationMS = time.Since(start).Milliseconds()
+	if exhausted {
+		note := "(dừng: đã hết " + strconv.Itoa(maxToolRounds) + " vòng gọi công cụ, việc có thể chưa xong)"
+		if res.Text == "" {
+			return res, errors.New("hết vòng gọi công cụ mà không có câu trả lời")
+		}
+		res.Text += "\n\n" + note
+		emit(Event{Type: "text", Text: "\n\n" + note})
+	}
 	return res, nil
 }
 
@@ -291,6 +303,7 @@ func (r openAIRunner) Run(ctx context.Context, req RunRequest, emit func(Event))
 	res := RunResult{}
 	start := time.Now()
 	var answer strings.Builder
+	exhausted := true
 	for round := 0; round < maxToolRounds; round++ {
 		var out struct {
 			Model   string `json:"model"`
@@ -310,6 +323,7 @@ func (r openAIRunner) Run(ctx context.Context, req RunRequest, emit func(Event))
 		res.Usage.InputTokens += out.Usage.PromptTokens
 		res.Usage.OutputTokens += out.Usage.CompletionTokens
 		if len(out.Choices) == 0 {
+			exhausted = false
 			break
 		}
 		var msg struct {
@@ -329,6 +343,7 @@ func (r openAIRunner) Run(ctx context.Context, req RunRequest, emit func(Event))
 			emit(Event{Type: "text", Text: msg.Content})
 		}
 		if len(msg.ToolCalls) == 0 {
+			exhausted = false
 			break
 		}
 		for _, call := range msg.ToolCalls {
@@ -347,5 +362,13 @@ func (r openAIRunner) Run(ctx context.Context, req RunRequest, emit func(Event))
 	}
 	res.Text = strings.TrimSpace(answer.String())
 	res.Usage.DurationMS = time.Since(start).Milliseconds()
+	if exhausted {
+		note := "(dừng: đã hết " + strconv.Itoa(maxToolRounds) + " vòng gọi công cụ, việc có thể chưa xong)"
+		if res.Text == "" {
+			return res, errors.New("hết vòng gọi công cụ mà không có câu trả lời")
+		}
+		res.Text += "\n\n" + note
+		emit(Event{Type: "text", Text: "\n\n" + note})
+	}
 	return res, nil
 }

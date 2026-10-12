@@ -63,6 +63,22 @@ func WithSkill(ctx context.Context, name string) context.Context {
 
 func skillOf(ctx context.Context) string { s, _ := ctx.Value(skillKey{}).(string); return s }
 
+type senderKey struct{}
+
+// WithSender: who wrote, from a bot's chat, the message ctx sends; it is
+// kept on that message.
+func WithSender(ctx context.Context, s *storage.Sender) context.Context {
+	if s == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, senderKey{}, s)
+}
+
+func senderOf(ctx context.Context) *storage.Sender {
+	s, _ := ctx.Value(senderKey{}).(*storage.Sender)
+	return s
+}
+
 type noToolsKey struct{}
 
 // WithNoTools makes the runs of ctx tool-less (untrusted text drives them,
@@ -76,7 +92,7 @@ func noTools(ctx context.Context) bool { v, _ := ctx.Value(noToolsKey{}).(bool);
 type turnTimeoutKey struct{}
 
 // WithTurnTimeout is how long a turn may take (0: no limit) instead of the
-// chat's 20 minutes: an automation's own (ADR-082); its hand-offs keep it.
+// chat's none: an automation's own (ADR-082); its hand-offs keep it.
 func WithTurnTimeout(ctx context.Context, d time.Duration) context.Context {
 	return context.WithValue(ctx, turnTimeoutKey{}, d)
 }
@@ -89,8 +105,9 @@ func turnTimeout(ctx context.Context) time.Duration {
 	return defaultTurnTimeout
 }
 
-// defaultTurnTimeout: a chat's turn, when nothing says otherwise.
-const defaultTurnTimeout = 20 * time.Minute
+// defaultTurnTimeout: a chat's turn, when nothing says otherwise: no limit,
+// it runs until done or stopped (a big task outlasts any fixed cut).
+const defaultTurnTimeout time.Duration = 0
 
 // withTimeout bounds ctx by d (0: only cancelled).
 func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
@@ -105,17 +122,41 @@ type treeKey struct{}
 type treeOpt struct {
 	name    string
 	noPatch bool
+	pinned  bool
 }
 
 // WithTree runs the turn in the worktree name (a Burn item's own) instead of
 // the chat's; noPatch: its changes stay there (committed by the caller), no
 // diff to approve.
 func WithTree(ctx context.Context, name string, noPatch bool) context.Context {
-	return context.WithValue(ctx, treeKey{}, treeOpt{name, noPatch})
+	return context.WithValue(ctx, treeKey{}, treeOpt{name: name, noPatch: noPatch})
+}
+
+// WithPinnedTree is WithTree, no diff, for a worktree its caller keeps on a
+// base of its own (a Burn piece, on its run's, ADR-123): it does not follow
+// the project before each turn.
+func WithPinnedTree(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, treeKey{}, treeOpt{name, true, true})
 }
 
 func treeOf(ctx context.Context) string { o, _ := ctx.Value(treeKey{}).(treeOpt); return o.name }
-func noPatch(ctx context.Context) bool  { o, _ := ctx.Value(treeKey{}).(treeOpt); return o.noPatch }
+func pinnedTree(ctx context.Context) bool {
+	o, _ := ctx.Value(treeKey{}).(treeOpt)
+	return o.pinned
+}
+func noPatch(ctx context.Context) bool { o, _ := ctx.Value(treeKey{}).(treeOpt); return o.noPatch }
+
+type sessionCapKey struct{}
+
+// WithSessionCap starts the agent's session afresh once it holds tokens or
+// more (ADR-125): for a caller whose every turn says all it needs (a Burn's
+// coordination turn), not to read an ever longer session each time. 1: a new
+// session this turn.
+func WithSessionCap(ctx context.Context, tokens int) context.Context {
+	return context.WithValue(ctx, sessionCapKey{}, tokens)
+}
+
+func sessionCap(ctx context.Context) int { v, _ := ctx.Value(sessionCapKey{}).(int); return v }
 
 type ceilingKey struct{}
 

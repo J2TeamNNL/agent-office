@@ -14,6 +14,7 @@ import (
 
 	"github.com/tung1998/agent-office/internal/actions"
 	"github.com/tung1998/agent-office/internal/actor"
+	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/trigger"
@@ -91,8 +92,62 @@ func (m *Manager) withPending(channelID, chatID string, fn func()) {
 	fn()
 }
 
-// proposals are what waits for a person in a conversation.
+// threadLock gives the one mutex that serializes a (channelID, chatID)'s
+// conversation-mapping read-check-create-write (thread(), threadMade,
+// startKeep): two messages for the same chat arriving at once would
+// otherwise both see no mapping, both create a conversation, and the later
+// write would silently orphan the earlier one.
+func (m *Manager) threadLock(channelID, chatID string) *sync.Mutex {
+	key := channelID + "/" + chatID
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.threadLocks == nil {
+		m.threadLocks = map[string]*sync.Mutex{}
+	}
+	lk := m.threadLocks[key]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		m.threadLocks[key] = lk
+	}
+	return lk
+}
+
+// withThread runs fn with the (channelID, chatID) thread-mapping lock held.
+func (m *Manager) withThread(channelID, chatID string, fn func()) {
+	lk := m.threadLock(channelID, chatID)
+	lk.Lock()
+	defer lk.Unlock()
+	fn()
+}
+
+// proposals are what waits for a person in a conversation, and in the own
+// chats of the workflows it called that still run (each keeps its chat).
 func (m *Manager) proposals(ctx context.Context, conversationID string) []proposal {
+	out := m.ownProposals(ctx, conversationID)
+	callers := []string{conversationID} // and the sub-workflows those called (ADR-102)
+	for depth := 0; len(callers) > 0 && depth < 8; depth++ {
+		var next []string
+		for _, c := range callers {
+			runs, err := m.store.WorkflowRuns().List(ctx, "", c, 20)
+			if err != nil {
+				continue
+			}
+			for _, r := range runs {
+				if r.Status == storage.RunRunning && r.CallerConversationID == c && r.ConversationID != c {
+					for _, p := range m.ownProposals(ctx, r.ConversationID) {
+						p.Conv = r.ConversationID
+						out = append(out, p)
+					}
+					next = append(next, r.ConversationID)
+				}
+			}
+		}
+		callers = next
+	}
+	return out
+}
+
+func (m *Manager) ownProposals(ctx context.Context, conversationID string) []proposal {
 	var out []proposal
 	if ps, err := m.store.Chat().ListPatches(ctx, conversationID); err == nil {
 		for _, p := range ps {
@@ -153,7 +208,10 @@ func (m *Manager) announce(ctx context.Context, ch storage.Channel, ad Adapter, 
 			if known[p.ID] {
 				continue
 			}
-			p.N, next, p.Conv = next, next+1, conversationID
+			p.N, next = next, next+1
+			if p.Conv == "" {
+				p.Conv = conversationID
+			}
 			list = append(list, p)
 			asked = true
 		}
@@ -405,6 +463,12 @@ func (m *Manager) approvals(ctx context.Context, ch storage.Channel, in Incoming
 	// the agent's answer is over: it goes on with what was decided (it would
 	// otherwise stand still until someone wrote again)
 	for conv, done := range decided {
+		if c, err := m.store.Chat().GetConversation(ctx, conv); err == nil && c.Purpose == chat.RunPurpose {
+			for _, line := range done { // a workflow's own chat: its coordinator goes on there
+				m.engine.Decided(conv, by, line)
+			}
+			continue
+		}
 		m.resume(ctx, ch, in, conv, done, MayDecide(ch, in.UserID))
 	}
 	// all decided: numbers start again (re-read fresh under lock: list was
@@ -487,9 +551,9 @@ func (m *Manager) resume(ctx context.Context, ch storage.Channel, in Incoming, c
 		return
 	}
 	who := firstNonEmpty(in.UserName, in.UserID)
-	text := "[office] " + who + " đã quyết các đề xuất của bạn:\n" + strings.Join(done, "\n") +
-		"\n\nLàm tiếp việc đang dở theo kết quả trên (không đề xuất lại những gì đã duyệt); xong thì báo ngắn gọn."
-	p := trigger.ChannelPayload{Message: text, User: who, UserID: in.UserID, ChatID: in.ChatID, ChannelID: ch.ID, ConversationID: conv, Admin: admin}
+	text := chat.DecidedPrompt(who, done)
+	p := trigger.ChannelPayload{Message: text, User: who, UserID: in.UserID, ChatID: in.ChatID, ChannelID: ch.ID, ConversationID: conv, Admin: admin,
+		Sender: m.senderOf(ctx, ch, in)}
 	raw, _ := json.Marshal(p)
 	actx := actor.With(ctx, ch.Kind+":"+who)
 	m.mu.Lock() // registered before the runner can answer
@@ -507,6 +571,25 @@ func (m *Manager) resume(ctx context.Context, ch storage.Channel, in Incoming, c
 	}
 	if m.root != nil {
 		m.runner.StartReady(m.root, time.Now().UTC())
+	}
+}
+
+// AnnounceRun tells a bot's chat what a workflow it called waits on a
+// person for (a gate, a change to approve), while the run goes on.
+func (m *Manager) AnnounceRun(ctx context.Context, callerConversationID string) {
+	channelID, chatID := m.chatOf(ctx, actions.Scope{ConversationID: callerConversationID})
+	if channelID == "" {
+		return
+	}
+	ch, err := m.store.Channels().Get(ctx, channelID)
+	if err != nil || !ch.Enabled {
+		return
+	}
+	m.mu.Lock()
+	ad := m.adapters[ch.ID]
+	m.mu.Unlock()
+	if ad != nil {
+		m.announce(ctx, ch, ad, chatID, callerConversationID)
 	}
 }
 

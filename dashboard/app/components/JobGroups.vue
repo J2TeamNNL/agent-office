@@ -3,7 +3,7 @@
 // runs) with how its jobs went, not one per answer. A row opens that work.
 const props = defineProps<{ project?: string, projects?: { id: string, name: string }[] }>()
 const toast = useToast()
-const { t, dateLocale } = useLang()
+const { t, when } = useLang()
 
 interface Group {
   key: string, kind: 'chat' | 'task' | 'automation' | 'job', project_id: string, project_name: string, source: Source,
@@ -37,26 +37,59 @@ function query(before = '') {
   set('limit', '20')
   return q.toString()
 }
+let loadToken = 0
+let pagesLoaded = 0
 async function load(more = false) {
+  const token = ++loadToken
   loading.value = true
   try {
     const res = await $fetch<{ groups: Group[], next_before: string }>(`/api/jobs/groups?${query(more ? nextBefore.value : '')}`)
+    if (token !== loadToken) return
     groups.value = more ? [...groups.value, ...res.groups] : res.groups
     nextBefore.value = res.next_before
+    pagesLoaded = more ? pagesLoaded + 1 : 1
   } catch (e) {
+    if (token !== loadToken) return
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
-    loading.value = false
+    if (token === loadToken) loading.value = false
+  }
+}
+// background refresh: re-fetches every page already shown (so "more" results and
+// pages loaded via it survive), instead of load()'s single first page that would
+// otherwise wipe out anything loaded past page 1
+let refreshing = false
+async function refresh() {
+  if (loading.value || refreshing || !pagesLoaded) return
+  const token = loadToken // any load() started before or during this refresh invalidates it
+  refreshing = true
+  try {
+    const merged: Group[] = []
+    let before = ''
+    for (let i = 0; i < pagesLoaded; i++) {
+      if (loading.value || token !== loadToken) return
+      const res = await $fetch<{ groups: Group[], next_before: string }>(`/api/jobs/groups?${query(before)}`)
+      merged.push(...res.groups)
+      before = res.next_before
+      if (!before) break
+    }
+    if (loading.value || token !== loadToken) return // a load() ran (fully or partly) while refreshing, don't overwrite it
+    groups.value = merged
+    nextBefore.value = before
+  } catch {
+    // background refresh: stay quiet on failure, next tick retries
+  } finally {
+    refreshing = false
   }
 }
 watch([origin, searchQ, status, project, since], () => load(), { immediate: true })
-useLive(['jobs', 'conversations'], () => load()) // retried, dismissed, removed: the table follows
+useLive(['jobs', 'conversations'], () => refresh()) // retried, dismissed, removed: the table follows
 
 // follow what is still running
 let timer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
   timer = setInterval(() => {
-    if (groups.value.some(g => g.active > 0)) load()
+    if (groups.value.some(g => g.active > 0)) refresh()
   }, 5000)
 })
 onBeforeUnmount(() => clearInterval(timer))
@@ -72,7 +105,6 @@ const selectItems = computed(() => ({
 }))
 const activeFilters = computed(() => [origin.value !== 'all', !!status.value, !!project.value && !props.project, since.value !== '168h'].filter(Boolean).length)
 
-const when = (d: string) => new Date(d).toLocaleString(dateLocale.value, { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })
 const usd = (v: number) => v >= 1 ? `$${v.toFixed(2)}` : v > 0 ? `$${v.toFixed(3)}` : ''
 const kindIcon = (g: Group) => g.active ? 'i-lucide-loader-circle'
   : g.source !== 'web' ? sourceIcon[g.source]
@@ -138,13 +170,13 @@ function open(g: Group) {
       <LoadingRows v-if="loading && !groups.length" :n="6" />
       <p v-else-if="!groups.length" class="p-4 text-sm text-(--ui-text-muted)">{{ t('job.empty') }}</p>
       <div v-else class="overflow-x-auto">
-        <table class="w-full text-sm">
+        <table class="w-full table-fixed text-sm">
           <thead class="border-b border-(--ui-border) text-left text-xs text-(--ui-text-muted)">
             <tr>
               <th class="px-4 py-2 font-medium">{{ t('job.colWork') }}</th>
               <th
-                v-for="c in ([['runs', 'job.colRuns'], ['failed', 'job.colFailRate'], ['cost', 'job.colCost'], ['last', 'job.colLast']] as const)" :key="c[0]"
-                class="px-3 py-2 font-medium whitespace-nowrap" :class="[c[0] === 'last' ? 'text-right' : '', c[0] !== 'cost' ? 'max-sm:hidden' : 'max-sm:text-right']"
+                v-for="c in ([['runs', 'job.colRuns', 'w-36'], ['failed', 'job.colFailRate', 'w-24'], ['cost', 'job.colCost', 'w-20 sm:w-36'], ['last', 'job.colLast', 'w-28']] as const)" :key="c[0]"
+                class="px-3 py-2 font-medium whitespace-nowrap" :class="[c[2], c[0] === 'last' ? 'text-right' : '', c[0] !== 'cost' ? 'max-sm:hidden' : 'max-sm:text-right']"
               >
                 <button type="button" class="inline-flex items-center gap-1 hover:text-(--ui-text)" :class="sortBy === c[0] && 'text-(--ui-text)'" @click="sortBy = c[0]">
                   {{ t(c[1]) }}<UIcon v-if="sortBy === c[0]" name="i-lucide-arrow-down" class="size-3" />
@@ -154,7 +186,7 @@ function open(g: Group) {
           </thead>
           <tbody class="divide-y divide-(--ui-border)">
             <tr v-for="g in sorted" :key="g.key" class="cursor-pointer transition hover:bg-(--ui-bg-elevated)/60" @click="open(g)">
-              <td class="max-w-0 px-4 py-2.5 max-sm:px-3">
+              <td class="px-4 py-2.5 max-sm:px-3">
                 <div class="flex min-w-0 items-center gap-3">
                   <span class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-(--ui-bg-elevated)">
                     <UIcon :name="kindIcon(g)" class="size-4 text-(--ui-text-muted)" :class="{ 'animate-spin text-primary': g.active }" />
@@ -178,7 +210,7 @@ function open(g: Group) {
                 <span v-if="g.failed" class="text-(--ui-error)">{{ failRate(g) }}%<span class="text-xs text-(--ui-text-muted)"> · {{ g.failed }}</span></span>
                 <span v-else class="text-(--ui-text-dimmed)">0%</span>
               </td>
-              <td class="w-36 px-3 py-2.5 max-sm:w-auto max-sm:text-right">
+              <td class="w-20 px-3 py-2.5 text-right sm:w-36 sm:text-left">
                 <!-- a phone: the cost, and when, under it -->
                 <p class="text-xs text-(--ui-text-muted) sm:hidden">{{ ago(g.last_at) }}</p>
                 <div class="flex items-center gap-2 max-sm:justify-end">

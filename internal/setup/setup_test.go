@@ -11,22 +11,23 @@ import (
 	"testing"
 
 	"github.com/tung1998/agent-office/internal/llm"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/provider"
+	"github.com/tung1998/agent-office/internal/scan"
 	"github.com/tung1998/agent-office/internal/secrets"
 	"github.com/tung1998/agent-office/internal/setup"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
+	"github.com/tung1998/agent-office/internal/team"
 )
 
 const aiAnswer = "Đây là đề xuất:\n```json\n" + `{
   "description": "Storefront Nuxt bán hàng, thanh toán Stripe.",
-  "template_key": "team",
+  "pack_key": "team",
   "reason": "Có frontend, thanh toán và vận hành",
   "confidence": 0.8,
   "agent_changes": [
     {"action": "update", "key": "engineer", "instructions": "Dùng pnpm, chạy pnpm test trước khi commit.", "reason": "Quy ước trong CLAUDE.md"},
-    {"action": "add", "key": "graylog-reader", "name": "Graylog Reader", "tier": "worker", "reports_to": ["qa-lead"], "source": ".claude/skills/fetch-graylog-logs/SKILL.md", "reason": "Project log qua Graylog"},
+    {"action": "add", "key": "graylog-reader", "name": "Graylog Reader", "source": ".claude/skills/fetch-graylog-logs/SKILL.md", "reason": "Project log qua Graylog"},
     {"action": "remove", "key": "monitor", "reason": "Đã có graylog-reader"}
   ],
   "notes": ["Nên kết nối Stripe read-only"]
@@ -37,8 +38,7 @@ func env(t *testing.T, answer string) (*setup.Assistant, storage.Store, *provide
 	st, _ := sqlite.Open(filepath.Join(dir, "o.db"))
 	t.Cleanup(func() { st.Close() })
 	st.Migrate(context.Background())
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(context.Background())
+	org := team.NewService(st, nil)
 	box, _ := secrets.Load(filepath.Join(dir, "k"))
 	var gotPrompt string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -62,20 +62,23 @@ func env(t *testing.T, answer string) (*setup.Assistant, storage.Store, *provide
 func TestProposeAndAccept(t *testing.T) {
 	a, st, _, _ := env(t, aiAnswer)
 	ctx := context.Background()
-	res, err := a.Propose(ctx, "", "shop", "Project: shop\nFramework: Nuxt", "")
+	res, err := a.Propose(ctx, "", "shop", "Project: shop\nFramework: Nuxt", &scan.Summary{Tests: []string{"Go"}}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Proposal.TemplateKey != "team" || len(res.Proposal.Changes) != 3 || len(res.Problems) != 0 {
+	if res.Proposal.PackKey != "team" || len(res.Proposal.Changes) != 3 || len(res.Problems) != 0 {
 		t.Fatalf("result = %+v", res)
 	}
-	var eng, reader *orgmodel.AgentSpec
-	for i, ag := range res.Template.Agents {
+	if len(res.SuggestedWorkflows) != 0 { // team pack already has fix-tests
+		t.Fatalf("suggested workflows = %v", res.SuggestedWorkflows)
+	}
+	var eng, reader *team.AgentSpec
+	for i, ag := range res.Pack.Agents {
 		switch ag.Key {
 		case "engineer":
-			eng = &res.Template.Agents[i]
+			eng = &res.Pack.Agents[i]
 		case "graylog-reader":
-			reader = &res.Template.Agents[i]
+			reader = &res.Pack.Agents[i]
 		case "monitor":
 			t.Fatal("monitor should be removed")
 		}
@@ -91,32 +94,46 @@ func TestProposeAndAccept(t *testing.T) {
 	}
 
 	repo, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: "/code/shop"})
-	m, err := a.Accept(ctx, repo.ID, res.Proposal.TemplateKey, res.Proposal.Changes[:2]) // user unticked "remove monitor"
-	if err != nil {
+	if _, err := a.Accept(ctx, repo.ID, res.Proposal.PackKey, res.Proposal.Changes[:2]); err != nil { // user unticked "remove monitor"
 		t.Fatal(err)
 	}
-	agents, _ := st.Agents().List(ctx, m.ID)
+	agents, _ := st.Agents().List(ctx, repo.ID)
 	keys := map[string]bool{}
 	for _, ag := range agents {
 		keys[ag.Key] = true
 	}
-	if !keys["graylog-reader"] || !keys["monitor"] || m.RepoID != repo.ID || m.SourceTemplateID == "" {
-		t.Fatalf("installed = %+v %v", m, keys)
+	if r, _ := st.Repos().Get(ctx, repo.ID); !keys["graylog-reader"] || !keys["monitor"] || r.DefaultAgentID != agents[0].ID || agents[0].Key != "team-lead" {
+		t.Fatalf("installed = %v, default %q", keys, r.DefaultAgentID)
 	}
 }
 
 func TestBuildReportsProblems(t *testing.T) {
-	a, _, _, _ := env(t, aiAnswer)
-	_, problems, err := a.Build(context.Background(), "team", []setup.AgentChange{
-		{Action: "add", Key: "orphan", Tier: "worker", Reason: "x"}, // no reports_to
-	})
+	_, problems, _, err := setup.Build("team", []setup.AgentChange{
+		{Action: "add", Key: "Bad Key", Reason: "x"},
+	}, nil)
 	if err != nil || len(problems) == 0 {
 		t.Fatalf("problems = %v, %v", problems, err)
 	}
-	if _, _, err := a.Build(context.Background(), "nope", nil); err == nil {
-		t.Fatal("unknown template must fail")
+	if _, _, _, err := setup.Build("nope", nil, nil); err == nil {
+		t.Fatal("unknown pack must fail")
 	}
 }
+
+func TestBuildInvalidLevelIsDroppedWithWarning(t *testing.T) {
+	pack, problems, warnings, err := setup.Build("team", []setup.AgentChange{
+		{Action: "update", Key: "engineer", Level: ptr("god-mode"), Reason: "x"},
+	}, nil)
+	if err != nil || len(problems) != 0 || len(warnings) == 0 {
+		t.Fatalf("problems = %v, warnings = %v, err = %v", problems, warnings, err)
+	}
+	for _, a := range pack.Agents {
+		if a.Key == "engineer" && a.Permissions.Level == "god-mode" {
+			t.Fatalf("invalid level must not be kept: %+v", a.Permissions)
+		}
+	}
+}
+
+func ptr(s string) *string { return &s }
 
 func TestNoProvider(t *testing.T) {
 	dir := t.TempDir()
@@ -124,16 +141,68 @@ func TestNoProvider(t *testing.T) {
 	defer st.Close()
 	st.Migrate(context.Background())
 	box, _ := secrets.Load(filepath.Join(dir, "k"))
-	org := orgmodel.NewService(st)
-	a := setup.New(st, provider.NewService(st, box, llm.Options{}), org)
-	if _, err := a.Propose(context.Background(), "", "x", "", "goal"); !errors.Is(err, setup.ErrNoProvider) {
+	a := setup.New(st, provider.NewService(st, box, llm.Options{}), team.NewService(st, nil))
+	if _, err := a.Propose(context.Background(), "", "x", "", nil, "goal"); !errors.Is(err, setup.ErrNoProvider) {
 		t.Fatalf("err = %v", err)
 	}
 }
 
 func TestBadJSON(t *testing.T) {
 	a, _, _, _ := env(t, "Xin lỗi, tôi không chắc.")
-	if _, err := a.Propose(context.Background(), "", "x", "p", ""); err == nil || !strings.Contains(err.Error(), "JSON") {
+	if _, err := a.Propose(context.Background(), "", "x", "p", nil, ""); err == nil || !strings.Contains(err.Error(), "JSON") {
 		t.Fatalf("err = %v", err)
 	}
+}
+
+func TestSuggestWorkflows(t *testing.T) {
+	has := func(list []string, v string) bool {
+		for _, x := range list {
+			if x == v {
+				return true
+			}
+		}
+		return false
+	}
+	t.Run("go tests suggest fix-tests", func(t *testing.T) {
+		got := setup.SuggestWorkflows(&scan.Summary{Tests: []string{"Go"}}, nil)
+		if !has(got, "fix-tests") {
+			t.Fatalf("got %v", got)
+		}
+	})
+	t.Run("js tests suggest fix-tests", func(t *testing.T) {
+		got := setup.SuggestWorkflows(&scan.Summary{Tests: []string{"JS/TS"}}, nil)
+		if !has(got, "fix-tests") {
+			t.Fatalf("got %v", got)
+		}
+	})
+	t.Run("php tests suggest fix-tests", func(t *testing.T) {
+		got := setup.SuggestWorkflows(&scan.Summary{Tests: []string{"PHP"}}, nil)
+		if !has(got, "fix-tests") {
+			t.Fatalf("got %v", got)
+		}
+	})
+	t.Run("github actions suggests review-pr", func(t *testing.T) {
+		got := setup.SuggestWorkflows(&scan.Summary{Infra: []string{"GitHub Actions"}}, nil)
+		if !has(got, "review-pr") {
+			t.Fatalf("got %v", got)
+		}
+	})
+	t.Run("no signals, no suggestion", func(t *testing.T) {
+		got := setup.SuggestWorkflows(&scan.Summary{}, nil)
+		if len(got) != 0 {
+			t.Fatalf("got %v", got)
+		}
+	})
+	t.Run("already in pack, not suggested again", func(t *testing.T) {
+		got := setup.SuggestWorkflows(&scan.Summary{Tests: []string{"Go"}}, []string{"fix-tests"})
+		if has(got, "fix-tests") {
+			t.Fatalf("got %v", got)
+		}
+	})
+	t.Run("nil summary, no suggestion", func(t *testing.T) {
+		got := setup.SuggestWorkflows(nil, nil)
+		if len(got) != 0 {
+			t.Fatalf("got %v", got)
+		}
+	})
 }

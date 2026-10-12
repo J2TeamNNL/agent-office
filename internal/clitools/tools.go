@@ -1,5 +1,5 @@
 // Package clitools installs and signs in the AI command-line tools the office
-// can use (Claude Code, Codex) on the machine that runs the office server.
+// can use (Claude Code, Codex, Gemini CLI) on the machine that runs the office server.
 // Only commands defined here can run: the API never accepts a command string.
 package clitools
 
@@ -10,9 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tung1998/agent-office/internal/llm"
 )
 
 // Method is one way to install a tool.
@@ -28,7 +32,7 @@ type Method struct {
 
 // Tool is a CLI the office can drive.
 type Tool struct {
-	ID       string `json:"id"` // claude | codex
+	ID       string `json:"id"` // claude | codex | gemini
 	Name     string `json:"name"`
 	Bin      string `json:"bin"`
 	DocsURL  string `json:"docs_url"`
@@ -37,6 +41,12 @@ type Tool struct {
 	methods   []Method
 	loginArgv []string
 	status    func(ctx context.Context, bin string, env []string) Auth
+	// loginEnv / prepareLogin set up a sign-in that is no subcommand of its
+	// own; loginDone ends it once signed in (Gemini's sign-in opens its chat).
+	loginEnv     []string
+	loginTerm    term
+	prepareLogin func() error
+	loginDone    func(ctx context.Context, bin string, env []string) bool
 }
 
 // Auth is a tool's sign-in state.
@@ -83,6 +93,97 @@ var tools = []Tool{
 		},
 		status: codexStatus,
 	},
+	{
+		ID: "gemini", Name: "Gemini CLI", Bin: "gemini", DocsURL: "https://github.com/google-gemini/gemini-cli",
+		// Gemini signs in when it starts; NO_BROWSER prints the URL and asks for the code
+		LoginCmd: "gemini", loginArgv: []string{"gemini"},
+		loginEnv: []string{"NO_BROWSER=true", "GEMINI_CLI_TRUST_WORKSPACE=true"},
+		methods: []Method{
+			{ID: "npm", Label: "npm (cần Node 20+)", Command: "npm install -g @google/gemini-cli", Requires: "npm", Recommended: true,
+				argv: []string{"npm", "install", "-g", "@google/gemini-cli"}},
+			{ID: "brew", Label: "Homebrew", Command: "brew install gemini-cli", Requires: "brew",
+				argv: []string{"brew", "install", "gemini-cli"}},
+		},
+		status:       geminiStatus,
+		prepareLogin: geminiPrepareLogin,
+		loginDone:    func(context.Context, string, []string) bool { return llm.GeminiSignedIn() },
+	},
+	{
+		// Antigravity CLI replaces Gemini CLI for Google accounts (AI Pro/Ultra
+		// and free) since June 2026 (ADR-106)
+		ID: "antigravity", Name: "Antigravity CLI", Bin: "agy", DocsURL: "https://antigravity.google/docs/cli",
+		LoginCmd: "agy", loginArgv: []string{"agy"},
+		// a full-screen sign-in: it waits for answers to its terminal queries,
+		// wraps the link at the window width, and starts on a method menu
+		loginTerm: term{cols: 1000, answer: true, keys: []autoKey{{after: "Select login method", keys: "\r"}}},
+		methods: []Method{
+			// a cask straight from the internet waits on a Gatekeeper dialog
+			// nobody at the dashboard can click; Google signs the binary
+			{ID: "brew", Label: "Homebrew", Command: "brew install --cask antigravity-cli", Requires: "brew", Recommended: true,
+				argv: []string{"/bin/sh", "-c", `brew install --cask antigravity-cli && xattr -dr com.apple.quarantine "$(brew --prefix)/Caskroom/antigravity-cli"`}},
+		},
+		status: antigravityStatus,
+		loginDone: func(ctx context.Context, bin string, env []string) bool {
+			_, err := llm.AntigravityModels(ctx, bin, env)
+			return err == nil
+		},
+	},
+}
+
+// antigravityStatus asks Antigravity CLI for its models, which needs a
+// signed-in account; it has no status subcommand.
+func antigravityStatus(ctx context.Context, bin string, env []string) Auth {
+	if _, err := llm.AntigravityModels(ctx, bin, env); err != nil {
+		return Auth{Detail: err.Error()}
+	}
+	return Auth{LoggedIn: true}
+}
+
+// geminiStatus: Gemini CLI has no status subcommand; read its credentials.
+func geminiStatus(ctx context.Context, bin string, env []string) Auth {
+	if ok, account := llm.GeminiAccount(); ok {
+		return Auth{LoggedIn: true, Account: account}
+	}
+	return Auth{Detail: "chưa đăng nhập Google hoặc chưa có GEMINI_API_KEY"}
+}
+
+// geminiPrepareLogin picks "Login with Google" in ~/.gemini/settings.json when
+// no sign-in method is chosen yet, so the CLI goes straight to the URL instead
+// of a menu the dashboard cannot drive.
+func geminiPrepareLogin() error {
+	home := os.Getenv("GEMINI_CLI_HOME")
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	dir := filepath.Join(home, ".gemini")
+	path := filepath.Join(dir, "settings.json")
+	settings := map[string]any{}
+	if raw, err := os.ReadFile(path); err == nil {
+		if json.Unmarshal(raw, &settings) != nil {
+			return nil // comments or a format we would lose: leave it, the CLI asks
+		}
+	}
+	sec, _ := settings["security"].(map[string]any)
+	if sec == nil {
+		sec = map[string]any{}
+	}
+	auth, _ := sec["auth"].(map[string]any)
+	if auth == nil {
+		auth = map[string]any{}
+	}
+	if t, _ := auth["selectedType"].(string); t != "" {
+		return nil
+	}
+	auth["selectedType"] = "oauth-personal"
+	sec["auth"], settings["security"] = auth, sec
+	raw, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o600)
 }
 
 // claudeStatus reads `claude auth status --json`.
@@ -141,8 +242,17 @@ func NewManager() *Manager {
 
 func toolEnv() []string {
 	home, _ := os.UserHomeDir()
-	extra := []string{filepath.Join(home, ".local", "bin"), filepath.Join(home, ".claude", "local"), "/opt/homebrew/bin", "/usr/local/bin"}
-	if out, err := exec.Command("npm", "prefix", "-g").Output(); err == nil {
+	// the person's own Node first: a system npm (/usr/local) installs into
+	// a root-owned folder and fails with EACCES
+	extra := append(nodeBins(home), filepath.Join(home, ".local", "bin"), filepath.Join(home, ".claude", "local"), "/opt/homebrew/bin", "/usr/local/bin")
+	npm := "npm"
+	for _, d := range extra {
+		if _, err := os.Stat(filepath.Join(d, "npm")); err == nil {
+			npm = filepath.Join(d, "npm")
+			break
+		}
+	}
+	if out, err := exec.Command(npm, "prefix", "-g").Output(); err == nil {
 		extra = append(extra, filepath.Join(strings.TrimSpace(string(out)), "bin"))
 	}
 	env := os.Environ()
@@ -153,6 +263,42 @@ func toolEnv() []string {
 		}
 	}
 	return append(env, "PATH="+strings.Join(extra, string(os.PathListSeparator)), "TERM=xterm-256color", "NO_COLOR=1")
+}
+
+// nodeBins finds Node installed by a version manager (nvm, Volta), which a
+// service started outside a login shell does not have on PATH: the active
+// nvm one, else the newest.
+func nodeBins(home string) []string {
+	var out []string
+	if b := os.Getenv("NVM_BIN"); b != "" {
+		out = append(out, b)
+	} else if dirs, _ := filepath.Glob(filepath.Join(home, ".nvm", "versions", "node", "v*", "bin")); len(dirs) > 0 {
+		slices.SortFunc(dirs, func(a, b string) int { return semverCmp(versionOf(b), versionOf(a)) })
+		out = append(out, dirs[0])
+	}
+	if _, err := os.Stat(filepath.Join(home, ".volta", "bin")); err == nil {
+		out = append(out, filepath.Join(home, ".volta", "bin"))
+	}
+	return out
+}
+
+// versionOf reads [major minor patch] from ".../v22.3.1/bin".
+func versionOf(binDir string) [3]int {
+	var v [3]int
+	parts := strings.SplitN(strings.TrimPrefix(filepath.Base(filepath.Dir(binDir)), "v"), ".", 3)
+	for i, p := range parts {
+		v[i], _ = strconv.Atoi(p)
+	}
+	return v
+}
+
+func semverCmp(a, b [3]int) int {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] - b[i]
+		}
+	}
+	return 0
 }
 
 // Env is the environment tools run with (PATH includes the usual install
@@ -237,6 +383,23 @@ func (m *Manager) Status(ctx context.Context, id string) (Status, error) {
 	return s, nil
 }
 
+// Detect is the cheap part of Status: installed and version, no sign-in check
+// (those can take seconds, e.g. Antigravity lists its models).
+func (m *Manager) Detect(ctx context.Context, id string) (installed bool, version string, err error) {
+	t, ok := m.find(id)
+	if !ok {
+		return false, "", ErrUnknownTool
+	}
+	path := m.lookPath(t.Bin)
+	if path == "" {
+		return false, "", nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	v, _ := runOut(ctx, m.env, path, "--version")
+	return true, strings.TrimSpace(strings.SplitN(v, "\n", 2)[0]), nil
+}
+
 // Install starts an install job with one of the tool's methods.
 func (m *Manager) Install(id, method string) (*Job, error) {
 	t, ok := m.find(id)
@@ -250,7 +413,9 @@ func (m *Manager) Install(id, method string) (*Job, error) {
 		if m.lookPath(meth.Requires) == "" {
 			return nil, ErrUnknownMethod
 		}
-		return m.start(id, "install", meth.argv, 15*time.Minute)
+		// brew asks [y/n] before installing (the default since Homebrew 6, or
+		// HOMEBREW_ASK before); the install box cannot answer
+		return m.start(id, "install", meth.argv, 15*time.Minute, term{}, "HOMEBREW_NO_ASK=1", "HOMEBREW_ASK=")
 	}
 	return nil, ErrUnknownMethod
 }
@@ -265,11 +430,37 @@ func (m *Manager) Login(id string) (*Job, error) {
 	if path == "" {
 		return nil, ErrNotInstalled
 	}
+	if t.prepareLogin != nil {
+		if err := t.prepareLogin(); err != nil {
+			return nil, err
+		}
+	}
 	argv := append([]string{path}, t.loginArgv[1:]...)
-	return m.start(id, "login", argv, 15*time.Minute)
+	j, err := m.start(id, "login", argv, 15*time.Minute, t.loginTerm, t.loginEnv...)
+	if err == nil && t.loginDone != nil {
+		go func() {
+			tick := time.NewTicker(2 * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-j.done:
+					return
+				case <-tick.C:
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					done := t.loginDone(ctx, path, m.Env())
+					cancel()
+					if done {
+						j.finish()
+						return
+					}
+				}
+			}
+		}()
+	}
+	return j, err
 }
 
-func (m *Manager) start(tool, action string, argv []string, timeout time.Duration) (*Job, error) {
+func (m *Manager) start(tool, action string, argv []string, timeout time.Duration, tm term, env ...string) (*Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if j := m.last[tool]; j != nil && j.Snapshot().State == "running" {
@@ -278,12 +469,24 @@ func (m *Manager) start(tool, action string, argv []string, timeout time.Duratio
 	if p := m.lookPathLocked(argv[0]); p != "" {
 		argv = append([]string{p}, argv[1:]...)
 	}
-	j, err := startJob(tool, action, argv, m.env, timeout)
+	j, err := startJob(tool, action, argv, append(slices.Clone(m.env), env...), timeout, tm)
 	if err != nil {
 		return nil, err
 	}
 	m.jobs[j.ID], m.last[tool] = j, j
+	go m.expireJob(j)
 	return j, nil
+}
+
+// expireJob drops a finished job from m.jobs a while after it ends, so
+// m.jobs doesn't grow without bound over a long-lived server; m.last[tool]
+// keeps its own reference for Status(), unaffected by this.
+func (m *Manager) expireJob(j *Job) {
+	<-j.done
+	time.Sleep(10 * time.Minute)
+	m.mu.Lock()
+	delete(m.jobs, j.ID)
+	m.mu.Unlock()
 }
 
 func (m *Manager) lookPathLocked(bin string) string {

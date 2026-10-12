@@ -89,18 +89,20 @@ func telegramURL(bot, chat, msg string) string {
 
 // threadMade binds a new thread to the conversation of the message it grew from.
 func (m *Manager) threadMade(ctx context.Context, ch storage.Channel, in Incoming) {
-	conv, err := m.store.Channels().Thread(ctx, ch.ID, msgKey(in.ThreadOf))
-	if (err != nil || conv == "") && in.ParentID != "" { // a bot answer remembered before threads were (its reply key)
-		conv, err = m.store.Channels().Thread(ctx, ch.ID, "msg:"+in.ParentID+":"+in.ThreadOf)
-	}
-	if err != nil || conv == "" {
-		return // a thread of a message office did not take part in
-	}
-	if cur, _ := m.store.Channels().Thread(ctx, ch.ID, inKey(in.ChatID)); cur == conv {
-		return // bound already (an open thread seen again on connect)
-	}
-	_ = m.store.Channels().SetThread(ctx, ch.ID, inKey(in.ChatID), conv)
-	_ = m.store.Settings().Set(ctx, linkKey+conv, discordURL(in.GuildID, in.ChatID, ""))
+	m.withThread(ch.ID, in.ChatID, func() {
+		conv, err := m.store.Channels().Thread(ctx, ch.ID, msgKey(in.ThreadOf))
+		if (err != nil || conv == "") && in.ParentID != "" { // a bot answer remembered before threads were (its reply key)
+			conv, err = m.store.Channels().Thread(ctx, ch.ID, "msg:"+in.ParentID+":"+in.ThreadOf)
+		}
+		if err != nil || conv == "" {
+			return // a thread of a message office did not take part in
+		}
+		if cur, _ := m.store.Channels().Thread(ctx, ch.ID, inKey(in.ChatID)); cur == conv {
+			return // bound already (an open thread seen again on connect)
+		}
+		_ = m.store.Channels().SetThread(ctx, ch.ID, inKey(in.ChatID), conv)
+		_ = m.store.Settings().Set(ctx, linkKey+conv, discordURL(in.GuildID, in.ChatID, ""))
+	})
 }
 
 // ThreadMaker is an adapter that can open a thread (Discord): from a message
@@ -198,25 +200,30 @@ func closedKey(channelID, chatID string) string { return "channel_closed/" + cha
 // the bot's latest answer here (tagging, then keeping: nothing lost), unless
 // that one was closed with /close-conversation (then a fresh one).
 func (m *Manager) startKeep(ctx context.Context, ch storage.Channel, chatID string) string {
-	var last, closed string
-	_, _ = m.store.Settings().Get(ctx, lastKey(ch.ID, chatID), &last)
-	_, _ = m.store.Settings().Get(ctx, closedKey(ch.ID, chatID), &closed)
-	msg := m.setKeep(ctx, ch.ID, chatID, true)
-	if last == "" || last == closed {
-		return msg
-	}
-	conv, _ := m.store.Channels().Thread(ctx, ch.ID, msgKey(last))
-	if conv == "" {
-		conv, _ = m.store.Channels().Thread(ctx, ch.ID, "msg:"+chatID+":"+last)
-	}
-	c, err := m.store.Chat().GetConversation(ctx, conv)
-	if conv == "" || err != nil {
-		return msg
-	}
-	if err := m.store.Channels().SetThread(ctx, ch.ID, chatID+"#"+c.AgentID+"#"+m.keep(ctx, ch.ID, chatID), conv); err != nil {
-		return msg
-	}
-	return "Đã bật hội thoại, tiếp tục từ câu trả lời gần nhất của mình: từ giờ không cần tag, mình nhớ những gì đã nói. Gửi /close-conversation để kết thúc."
+	var out string
+	m.withThread(ch.ID, chatID, func() {
+		var last, closed string
+		_, _ = m.store.Settings().Get(ctx, lastKey(ch.ID, chatID), &last)
+		_, _ = m.store.Settings().Get(ctx, closedKey(ch.ID, chatID), &closed)
+		msg := m.setKeep(ctx, ch.ID, chatID, true)
+		out = msg
+		if last == "" || last == closed {
+			return
+		}
+		conv, _ := m.store.Channels().Thread(ctx, ch.ID, msgKey(last))
+		if conv == "" {
+			conv, _ = m.store.Channels().Thread(ctx, ch.ID, "msg:"+chatID+":"+last)
+		}
+		c, err := m.store.Chat().GetConversation(ctx, conv)
+		if conv == "" || err != nil {
+			return
+		}
+		if err := m.store.Channels().SetThread(ctx, ch.ID, chatID+"#"+c.AgentID+"#"+m.keep(ctx, ch.ID, chatID), conv); err != nil {
+			return
+		}
+		out = "Đã bật hội thoại, tiếp tục từ câu trả lời gần nhất của mình: từ giờ không cần tag, mình nhớ những gì đã nói. Gửi /close-conversation để kết thúc."
+	})
+	return out
 }
 
 // stopKeep ends it; the next /create-conversation starts afresh.
@@ -413,6 +420,18 @@ func (m *Manager) Notify(ctx context.Context, channelID, chatID, text string) er
 	return err
 }
 
+// borrowed: the bot belongs to another project than the chat (an automation
+// lent another project's bot to announce): it only announces, a reply to it
+// does not go on in that chat.
+func (m *Manager) borrowed(ctx context.Context, channelID, convID string) bool {
+	ch, err := m.store.Channels().Get(ctx, channelID)
+	if err != nil {
+		return true
+	}
+	c, err := m.store.Chat().GetConversation(ctx, convID)
+	return err != nil || c.ProjectID != ch.ProjectID
+}
+
 func noteKey(chatID, msgID string) string { return "note:" + chatID + ":" + msgID } // an automation's notice → its chat
 
 // NotifyConversation posts an automation's answer; a reply to it goes on in
@@ -425,7 +444,7 @@ func (m *Manager) NotifyConversation(ctx context.Context, channelID, chatID, tex
 		return errors.New("bot này đang tắt hoặc chưa kết nối")
 	}
 	ids, err := ad.Send(ctx, chatID, text)
-	if convID == "" {
+	if convID == "" || m.borrowed(ctx, channelID, convID) {
 		return err
 	}
 	for _, id := range ids {

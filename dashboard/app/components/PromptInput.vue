@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// Prompt box shared by Chat and Việc: "/" opens the project's skills, "@"
+// Prompt box shared by Chat and Việc: "/" opens the project's skills, "#" its workflows, "@"
 // the agents to tag (Chat, ADR-044), files
 // can be attached (button, drag & drop, paste) and are uploaded right away.
 export interface Attachment { id: string, name: string, kind: 'image' | 'pdf' | 'text', mime: string, size: number }
-interface Skill { name: string, description: string, source: 'project' | 'user' | 'plugin' }
+interface Skill { name: string, description: string, source: 'project' | 'user' | 'plugin' | 'workflow' }
 
 const props = withDefaults(defineProps<{
   projectId: string
@@ -20,19 +20,25 @@ const toast = useToast()
 const { t } = useLang()
 
 // ---- skills ----
-const { data: skillData } = await useLiveFetch<{ skills: Skill[] }>(() => `/api/projects/${props.projectId}/skills`)
-const skills = computed(() => skillData.value?.skills ?? [])
+// in the background: the box shows at once, the skill list fills in
+const { data: skillData } = useLiveFetch<{ skills: Skill[] }>(() => `/api/projects/${props.projectId}/skills`, { lazy: true })
+// the project's workflows on, run by "#key" (ADR-109; "/key" still runs one)
+const { data: wfData } = useLiveFetch<{ workflows: ProjectWorkflow[] }>(() => `/api/projects/${props.projectId}/workflows`, { lazy: true })
+const workflows = computed<Skill[]>(() => (wfData.value?.workflows ?? []).filter(w => w.enabled && !w.error && w.callable !== 'sub')
+  .map(w => ({ name: w.key, description: w.description || w.name, source: 'workflow' as const })))
+const skills = computed<Skill[]>(() => skillData.value?.skills ?? [])
 const menuIndex = ref(0)
 const menuClosed = ref(false)
-// open while typing the first word after "/"
-const query = computed(() => {
-  const m = /^\/([^\s]*)$/.exec(text.value)
-  return m ? m[1]!.toLowerCase() : null
+// open while typing the first word after "/" (skills) or "#" (workflows)
+const call = computed(() => {
+  const m = /^([/#])([^\s]*)$/.exec(text.value)
+  return m ? { sign: m[1] as '/' | '#', q: m[2]!.toLowerCase() } : null
 })
+const query = computed(() => call.value ? `${call.value.sign}${call.value.q}` : null)
 const matches = computed(() => {
-  if (query.value === null) return []
-  const q = query.value
-  return skills.value
+  if (!call.value) return []
+  const q = call.value.q
+  return (call.value.sign === '#' ? workflows.value : skills.value)
     .filter(s => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q))
     .sort((a, b) => Number(!a.name.toLowerCase().startsWith(q)) - Number(!b.name.toLowerCase().startsWith(q)))
     .slice(0, 8)
@@ -50,15 +56,18 @@ const mentionMatches = computed(() => {
   if (q === null) return []
   return props.mentions.filter(a => a.name.toLowerCase().includes(q)).slice(0, 8)
 })
-const menuKind = computed<'mention' | 'skill'>(() => mentionMatches.value.length ? 'mention' : 'skill')
+const menuKind = computed<'mention' | 'skill' | 'workflow'>(() => mentionMatches.value.length ? 'mention' : call.value?.sign === '#' ? 'workflow' : 'skill')
 const menuCount = computed(() => menuKind.value === 'mention' ? mentionMatches.value.length : matches.value.length)
 const menuOpen = computed(() => !menuClosed.value && menuCount.value > 0)
 watch([query, mentionQuery], () => { menuIndex.value = 0; menuClosed.value = false })
 const activeSkill = computed(() => {
-  const m = /^\/(\S+)\s/.exec(text.value)
-  return m ? skills.value.find(s => s.name === m[1]) : undefined
+  const m = /^([/#])(\S+)\s/.exec(text.value)
+  if (!m) return undefined
+  // "/key" of a workflow still runs it (a workflow wins over a skill of its name)
+  return workflows.value.find(s => s.name === m[2]) ?? (m[1] === '/' ? skills.value.find(s => s.name === m[2]) : undefined)
 })
-const sourceLabel = computed(() => ({ project: t('prompt.sourceProject'), user: t('prompt.sourceUser'), plugin: t('prompt.sourcePlugin') }))
+const sourceLabel = computed(() => ({ project: t('prompt.sourceProject'), user: t('prompt.sourceUser'), plugin: t('prompt.sourcePlugin'), workflow: t('wf.slashBadge') }))
+const skillIcon = (s: Skill) => s.source === 'workflow' ? 'i-lucide-workflow' : 'i-lucide-sparkles'
 
 // The menu is teleported to <body> with fixed position so no scrolling or
 // overflow-hidden parent can clip it; it opens upward unless there is no room.
@@ -92,7 +101,7 @@ watch(menuCount, () => { if (menuOpen.value) nextTick(place) })
 
 const box = ref<{ textareaRef?: HTMLTextAreaElement } | null>(null)
 function pick(s: Skill) {
-  text.value = `/${s.name} `
+  text.value = `${s.source === 'workflow' ? '#' : '/'}${s.name} `
   nextTick(() => box.value?.textareaRef?.focus())
 }
 function pickMention(name: string) {
@@ -194,6 +203,13 @@ function remove(a: Attachment) {
 const size = (n: number) => n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`
 const icon = { image: 'i-lucide-image', pdf: 'i-lucide-file-text', text: 'i-lucide-file-code' }
 
+function startSkill() { text.value = '/'; box.value?.textareaRef?.focus() }
+function startWorkflow() { text.value = '#'; box.value?.textareaRef?.focus() }
+const extras = computed(() => [
+  { label: t('prompt.attach'), icon: 'i-lucide-paperclip', onSelect: () => input.value?.click() },
+  { label: t('prompt.pickSkill'), icon: 'i-lucide-slash', disabled: !skills.value.length, onSelect: startSkill },
+  ...(workflows.value.length ? [{ label: t('prompt.pickWorkflow'), icon: 'i-lucide-workflow', onSelect: startWorkflow }] : []),
+])
 defineExpose({ busy: computed(() => uploading.value > 0), focus: () => box.value?.textareaRef?.focus() })
 </script>
 
@@ -224,16 +240,16 @@ defineExpose({ busy: computed(() => uploading.value > 0), focus: () => box.value
         </button>
       </template>
       <template v-else>
-      <p class="px-2 py-1 text-xs text-(--ui-text-muted)">{{ t('prompt.skillHint') }}</p>
+      <p class="px-2 py-1 text-xs text-(--ui-text-muted)">{{ menuKind === 'workflow' ? t('prompt.workflowHint') : t('prompt.skillHint') }}</p>
       <button
         v-for="(s, i) in matches" :key="s.name" type="button" role="option" :aria-selected="i === menuIndex"
         class="flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left"
         :class="i === menuIndex ? 'bg-(--ui-bg-elevated)' : 'hover:bg-(--ui-bg-elevated)'"
         @mousedown.prevent="pick(s)" @mouseenter="menuIndex = i"
       >
-        <UIcon name="i-lucide-sparkles" class="mt-0.5 size-4 shrink-0 text-primary" />
+        <UIcon :name="skillIcon(s)" class="mt-0.5 size-4 shrink-0 text-primary" />
         <span class="min-w-0 flex-1">
-          <span class="font-mono text-sm">/{{ s.name }}</span>
+          <span class="font-mono text-sm">{{ s.source === 'workflow' ? '#' : '/' }}{{ s.name }}</span>
           <span class="line-clamp-1 text-xs text-(--ui-text-muted)">{{ s.description }}</span>
         </span>
         <UBadge color="neutral" variant="subtle" size="sm" :label="sourceLabel[s.source]" />
@@ -266,13 +282,18 @@ defineExpose({ busy: computed(() => uploading.value > 0), focus: () => box.value
 
     <!-- a phone: a size smaller (icons, labels), tighter, all the same height -->
     <div class="@container flex items-center gap-2 px-2 pb-2 max-sm:gap-0.5 max-sm:[&_.iconify]:!size-4 max-sm:[&_button]:!text-xs max-sm:[&_button]:!py-1">
-      <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-paperclip" :aria-label="t('prompt.attach')" @click="input?.click()" />
-      <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-slash" :aria-label="t('prompt.pickSkill')" :disabled="!skills.length" @click="text = '/'; box?.textareaRef?.focus()" />
-      <UBadge v-if="activeSkill" color="primary" variant="subtle" size="sm" icon="i-lucide-sparkles" :label="activeSkill.name" />
+      <!-- a phone: attach, skills and workflows behind one ⋯, the row keeps room for the actions -->
+      <UDropdownMenu :items="extras" :content="{ side: 'top', align: 'start' }" class="sm:hidden">
+        <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-ellipsis" class="sm:hidden" :aria-label="t('common.actions')" />
+      </UDropdownMenu>
+      <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-paperclip" class="max-sm:hidden" :aria-label="t('prompt.attach')" @click="input?.click()" />
+      <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-slash" class="max-sm:hidden" :aria-label="t('prompt.pickSkill')" :title="t('prompt.pickSkill')" :disabled="!skills.length" @click="startSkill" />
+      <UButton v-if="workflows.length" size="sm" color="neutral" variant="ghost" icon="i-lucide-workflow" class="max-sm:hidden" :aria-label="t('prompt.pickWorkflow')" :title="t('prompt.pickWorkflow')" @click="startWorkflow" />
+      <UBadge v-if="activeSkill" color="primary" variant="subtle" size="sm" :icon="skillIcon(activeSkill)" :label="activeSkill.name" />
       <!-- only when the box itself is wide: narrow panels (the corner chat) keep one tidy row -->
       <span class="hidden min-w-0 truncate text-xs text-(--ui-text-dimmed) @2xl:inline" :title="t('prompt.dragHint')">{{ t('prompt.dragHint') }}</span>
       <!-- the actions shrink (their labels cut) before the row overflows -->
-      <div class="ms-auto flex min-w-0 items-center justify-end gap-2">
+      <div class="ms-auto flex min-w-0 items-center justify-end gap-2 max-sm:gap-0.5">
         <slot name="actions" />
       </div>
     </div>

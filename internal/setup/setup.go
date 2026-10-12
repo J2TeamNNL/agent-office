@@ -1,7 +1,7 @@
 // Package setup is the AI setup assistant for a project: it sends the scan
-// summary and the template library to a model, gets back a description, the
-// best-fitting org model and tailored agent changes, and turns the accepted
-// changes into a validated org model.
+// summary and the starter packs to a model, gets back a description, the
+// best-fitting pack and tailored agent changes, and turns the accepted
+// changes into the project's agents and workflows.
 package setup
 
 import (
@@ -9,70 +9,98 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
+	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/llm"
-	"github.com/tung1998/agent-office/internal/orgmodel"
+	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/provider"
+	"github.com/tung1998/agent-office/internal/scan"
 	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/usage"
 )
 
 // ErrNoProvider means no AI connection is available: the UI sends the user to set one up.
 var ErrNoProvider = errors.New("chưa có kết nối AI hoạt động")
 
-// AgentChange is one tailored edit on top of the chosen template.
+// AgentChange is one tailored edit on top of the chosen pack.
 type AgentChange struct {
-	Action       string   `json:"action"` // update | add | remove
-	Key          string   `json:"key"`
-	Name         string   `json:"name,omitempty"`
-	Tier         string   `json:"tier,omitempty"`
-	Role         string   `json:"role,omitempty"`
-	Description  string   `json:"description,omitempty"`
-	ReportsTo    []string `json:"reports_to,omitempty"`
-	ModelTier    string   `json:"model_tier,omitempty"`
-	Instructions string   `json:"instructions,omitempty"` // add: full prompt; update: project context appended
-	ReadOnly     *bool    `json:"read_only,omitempty"`
-	Source       string   `json:"source,omitempty"` // existing agent file it came from
-	Reason       string   `json:"reason"`
+	Action       string `json:"action"` // update | add | remove
+	Key          string `json:"key"`
+	Name         string `json:"name,omitempty"`
+	Role         string `json:"role,omitempty"`
+	Description  string `json:"description,omitempty"`
+	ModelTier    string `json:"model_tier,omitempty"`
+	Instructions string `json:"instructions,omitempty"` // add: full prompt; update: project context appended
+	// ReadOnly is kept so older proposals still decode; Level/Caps take
+	// priority when set (see internal/perm for the level/capability model).
+	ReadOnly *bool `json:"read_only,omitempty"`
+	// Level is the agent's permission package (internal/perm.Read..Operate).
+	Level *string `json:"level,omitempty"`
+	// Caps are the agent's own picks of capabilities (internal/perm.Caps);
+	// unknown ids are dropped and reported in Problems.
+	Caps *[]string `json:"caps,omitempty"`
+	// Commands narrow the project's command catalog for this agent; ones
+	// outside the project's catalog are reported in Problems, not dropped
+	// (Resolve already ignores them at run time).
+	Commands *[]string `json:"commands,omitempty"`
+	Source   string    `json:"source,omitempty"` // existing agent file it came from
+	Reason   string    `json:"reason"`
 }
 
 // Proposal is the model's recommendation.
 type Proposal struct {
 	Description string        `json:"description"`
-	TemplateKey string        `json:"template_key"`
+	PackKey     string        `json:"pack_key"`
 	Reason      string        `json:"reason"`
 	Confidence  float64       `json:"confidence"`
 	Changes     []AgentChange `json:"agent_changes"`
-	Notes       []string      `json:"notes"`
+	// Skills and MCP are picked from the Toolbox (unknown names dropped);
+	// QuickChecks are the project's own checks by file ending (ADR-135).
+	Skills      []Pick   `json:"skills"`
+	MCP         []Pick   `json:"mcp"`
+	QuickChecks string   `json:"quick_checks"`
+	Notes       []string `json:"notes"`
 }
 
-// Result is a proposal plus the org model it produces and how it was made.
+// Result is a proposal plus the pack it produces and how it was made.
 type Result struct {
-	Proposal Proposal          `json:"proposal"`
-	Template orgmodel.Template `json:"template"`
-	Problems []string          `json:"problems"`
-	Provider string            `json:"provider"`
-	Model    string            `json:"model"`
-	Usage    llm.Result        `json:"usage"`
+	Proposal Proposal  `json:"proposal"`
+	Pack     team.Pack `json:"pack"`
+	// Problems block Apply/Accept (e.g. team.Validate failures, no agents left).
+	Problems []string `json:"problems"`
+	// Warnings don't block: an unknown level/cap was dropped, or a command
+	// isn't in the project's catalog (Resolve already ignores it at run time).
+	Warnings []string   `json:"warnings"`
+	Provider string     `json:"provider"`
+	Model    string     `json:"model"`
+	Usage    llm.Result `json:"usage"`
+	// SuggestedWorkflows are shipped workflows the scan's signals call for,
+	// beyond the pack's own (see SuggestWorkflows).
+	SuggestedWorkflows []string `json:"suggested_workflows"`
 }
 
 // Assistant runs the setup flow.
 type Assistant struct {
 	store     storage.Store
 	providers *provider.Service
-	org       *orgmodel.Service
+	team      *team.Service
+	// Toolbox lists the skills/MCP the setup may pick (nil: none).
+	Toolbox func() Toolbox
 }
 
 // New builds an Assistant.
-func New(store storage.Store, providers *provider.Service, org *orgmodel.Service) *Assistant {
-	return &Assistant{store: store, providers: providers, org: org}
+func New(store storage.Store, providers *provider.Service, tm *team.Service) *Assistant {
+	return &Assistant{store: store, providers: providers, team: tm}
 }
 
 // Propose asks the default AI connection (strong tier) for a setup.
-// projectText is the scan summary (empty for a machine-wide helper); goal is
-// optional free text from the user.
-func (a *Assistant) Propose(ctx context.Context, projectID, projectName, projectText, goal string) (Result, error) {
+// projectText is the scan summary (empty for a machine-wide helper); sum is
+// the same scan, used to suggest workflows by signal (nil for a
+// machine-wide helper); goal is optional free text from the user.
+func (a *Assistant) Propose(ctx context.Context, projectID, projectName, projectText string, sum *scan.Summary, goal string) (Result, error) {
 	p, model, err := a.providers.ResolveModel(ctx, storage.Agent{ModelTier: storage.TierStrong})
 	if errors.Is(err, storage.ErrNotFound) || (err == nil && (!p.Enabled || p.Status == "error")) {
 		return Result{}, ErrNoProvider
@@ -83,13 +111,18 @@ func (a *Assistant) Propose(ctx context.Context, projectID, projectName, project
 	if _, err := a.providers.Client(p); err != nil {
 		return Result{}, fmt.Errorf("%w: %v", ErrNoProvider, err)
 	}
-	templates, err := a.library(ctx)
+	packs, err := library()
 	if err != nil {
 		return Result{}, err
 	}
+	policy := perm.LoadPolicy(ctx, a.store, projectID)
+	var box Toolbox
+	if a.Toolbox != nil {
+		box = a.Toolbox()
+	}
 	out, err := a.providers.Call(ctx, p, llm.Request{
-		Model: model, System: systemPrompt, MaxTokens: 6000,
-		Prompt: userPrompt(projectName, projectText, goal, templates),
+		Model: model, System: systemPrompt + languageNote + chat.LoadLanguage(ctx, a.store).Rule(), MaxTokens: 6000,
+		Prompt: userPrompt(projectName, projectText, goal, packs, policy.Catalog, box),
 	}, usage.Meta{Kind: "setup_propose", ProjectID: projectID})
 	if err != nil {
 		return Result{}, fmt.Errorf("gọi AI lỗi: %w", err)
@@ -103,12 +136,15 @@ func (a *Assistant) Propose(ctx context.Context, projectID, projectName, project
 		res.Model = model
 	}
 	res.Usage.Text = ""
-	t, problems, err := a.Build(ctx, prop.TemplateKey, prop.Changes)
+	p2, problems, warnings, err := Build(prop.PackKey, prop.Changes, policy.Catalog)
 	if err != nil {
 		return res, err
 	}
 	if problems == nil {
 		problems = []string{}
+	}
+	if warnings == nil {
+		warnings = []string{}
 	}
 	if res.Proposal.Changes == nil {
 		res.Proposal.Changes = []AgentChange{}
@@ -116,40 +152,149 @@ func (a *Assistant) Propose(ctx context.Context, projectID, projectName, project
 	if res.Proposal.Notes == nil {
 		res.Proposal.Notes = []string{}
 	}
-	res.Template, res.Problems = t, problems
+	var w []string
+	res.Proposal.Skills, w = cleanPicks("skill", prop.Skills, box.Skills)
+	warnings = append(warnings, w...)
+	res.Proposal.MCP, w = cleanPicks("MCP", prop.MCP, box.MCP)
+	warnings = append(warnings, w...)
+	res.Proposal.QuickChecks, w = cleanQuickChecks(prop.QuickChecks)
+	warnings = append(warnings, w...)
+	res.Pack, res.Problems, res.Warnings = p2, problems, warnings
+	res.SuggestedWorkflows = SuggestWorkflows(sum, p2.Workflows)
+	if res.SuggestedWorkflows == nil {
+		res.SuggestedWorkflows = []string{}
+	}
 	return res, nil
 }
 
-// Build applies changes to a library template and validates the result.
-// Structural problems are returned (not as an error) so the user can untick
-// the offending change.
-func (a *Assistant) Build(ctx context.Context, templateKey string, changes []AgentChange) (orgmodel.Template, []string, error) {
-	m, err := a.store.OrgModels().GetTemplateByKey(ctx, templateKey)
-	if errors.Is(err, storage.ErrNotFound) {
-		return orgmodel.Template{}, nil, fmt.Errorf("mô hình %q không có trong thư viện", templateKey)
+// SuggestWorkflows looks at the scan for signals (tests, CI) and suggests
+// shipped workflows not already in the pack. The user may untick any of
+// them; nothing here is installed on its own.
+func SuggestWorkflows(sum *scan.Summary, packWorkflows []string) []string {
+	if sum == nil {
+		return nil
 	}
-	if err != nil {
-		return orgmodel.Template{}, nil, err
-	}
-	t, err := a.org.Load(ctx, m.ID)
-	if err != nil {
-		return t, nil, err
-	}
-	t = Apply(t, changes)
-	var problems []string
-	if err := orgmodel.Validate(t); err != nil {
-		var ve *orgmodel.ValidationError
-		if !errors.As(err, &ve) {
-			return t, nil, err
+	has := func(list []string, v string) bool {
+		for _, x := range list {
+			if x == v {
+				return true
+			}
 		}
-		problems = ve.Problems
+		return false
 	}
-	return t, problems, nil
+	var out []string
+	add := func(key string) {
+		if !has(packWorkflows, key) && !has(out, key) {
+			out = append(out, key)
+		}
+	}
+	if len(sum.Tests) > 0 {
+		add("fix-tests")
+	}
+	for _, i := range sum.Infra {
+		if i == "GitHub Actions" || i == "bitbucket-pipelines.yml" || i == ".gitlab-ci.yml" || i == "Jenkinsfile" {
+			add("review-pr")
+			break
+		}
+	}
+	return out
 }
 
-// Apply edits a template copy. Unknown keys in update/remove are ignored.
-func Apply(t orgmodel.Template, changes []AgentChange) orgmodel.Template {
-	agents := append([]orgmodel.AgentSpec(nil), t.Agents...)
+// Build applies changes to a starter pack and validates the result.
+// Problems block Apply/Accept (the user must untick the offending change);
+// Warnings don't (an unknown level/cap was dropped, or a command isn't in
+// catalog). catalog is the project's command catalog (internal/perm
+// Policy.Catalog); a nil/empty one skips the out-of-catalog Commands check.
+// extraWorkflows are keys the user kept from SuggestWorkflows; unknown keys
+// are kept as-is and skipped at install time.
+func Build(packKey string, changes []AgentChange, catalog []string, extraWorkflows ...string) (team.Pack, []string, []string, error) {
+	t, err := team.PackByKey(packKey)
+	if err != nil {
+		return t, nil, nil, err
+	}
+	for _, k := range extraWorkflows {
+		if k = strings.TrimSpace(k); k != "" && !slices.Contains(t.Workflows, k) {
+			t.Workflows = append(t.Workflows, k)
+		}
+	}
+	t, warnings := Apply(t, changes, catalog)
+	var problems []string
+	if len(t.Agents) == 0 {
+		problems = append(problems, "cần ít nhất một agent")
+	}
+	if err := team.Validate(t.Agents); err != nil {
+		var ve *team.ValidationError
+		if !errors.As(err, &ve) {
+			return t, nil, nil, err
+		}
+		problems = append(problems, ve.Problems...)
+	}
+	return t, problems, warnings, nil
+}
+
+// validCaps keeps only the known capability ids, reporting the rest as warnings.
+func validCaps(ids []string) (ok []string, warnings []string) {
+	for _, id := range ids {
+		found := false
+		for _, c := range perm.Caps {
+			if c.ID == id {
+				found = true
+				break
+			}
+		}
+		if found {
+			ok = append(ok, id)
+		} else {
+			warnings = append(warnings, fmt.Sprintf("quyền %q không có", id))
+		}
+	}
+	return ok, warnings
+}
+
+// applyPermissions sets Level/Caps/Commands from a change onto an agent's
+// permissions, falling back to the legacy ReadOnly flag. isNew agents with no
+// permission field at all keep the safe Read-level default. Problems here are
+// never blocking: bad input is dropped and reported as a warning.
+func applyPermissions(perms *storage.Permissions, c AgentChange, catalog []string, isNew bool) []string {
+	var warnings []string
+	levelInvalid := c.Level != nil && !perm.Valid(*c.Level)
+	if levelInvalid {
+		warnings = append(warnings, fmt.Sprintf("mức quyền %q không hợp lệ", *c.Level))
+	}
+	switch {
+	case c.Level != nil && !levelInvalid:
+		perms.Level = *c.Level
+	case c.ReadOnly != nil:
+		perms.ReadOnly = *c.ReadOnly
+	case isNew:
+		// Agent mới: level sai hoặc không có gì thì vẫn phải an toàn (chỉ đọc).
+		perms.ReadOnly = true
+	}
+	if c.Caps != nil {
+		ok, probs := validCaps(*c.Caps)
+		perms.Caps = &ok
+		warnings = append(warnings, probs...)
+	}
+	if c.Commands != nil {
+		cmds := append([]string(nil), *c.Commands...)
+		perms.Commands = &cmds
+		if len(catalog) > 0 {
+			for _, cmd := range cmds {
+				if !slices.Contains(catalog, cmd) {
+					warnings = append(warnings, fmt.Sprintf("lệnh %q không có trong catalog project", cmd))
+				}
+			}
+		}
+	}
+	return warnings
+}
+
+// Apply edits a pack copy. Unknown keys in update/remove are ignored.
+// catalog is the project's command catalog, used only to warn about
+// Commands picks outside it (Resolve ignores them at run time regardless).
+func Apply(t team.Pack, changes []AgentChange, catalog []string) (team.Pack, []string) {
+	agents := append([]team.AgentSpec(nil), t.Agents...)
+	var warnings []string
 	idx := func(key string) int {
 		for i, a := range agents {
 			if a.Key == key {
@@ -173,36 +318,22 @@ func Apply(t orgmodel.Template, changes []AgentChange) orgmodel.Template {
 			if storage.ValidTier(c.ModelTier) {
 				a.ModelTier = c.ModelTier
 			}
-			if len(c.ReportsTo) > 0 && a.Tier != storage.TierLead {
-				a.ReportsTo = c.ReportsTo
-			}
 			if strings.TrimSpace(c.Instructions) != "" {
 				a.Instructions = strings.TrimSpace(a.Instructions + "\n\nBối cảnh project:\n" + strings.TrimSpace(c.Instructions))
 			}
-			if c.ReadOnly != nil {
-				a.Permissions.ReadOnly = *c.ReadOnly
-			}
+			warnings = append(warnings, applyPermissions(&a.Permissions, c, catalog, false)...)
 		case "add":
 			if key == "" || idx(key) >= 0 {
 				continue
 			}
-			spec := orgmodel.AgentSpec{
-				Key: key, Name: orDefault(c.Name, key), Tier: orDefault(c.Tier, storage.TierWorker), Role: c.Role,
-				Description: c.Description, ReportsTo: c.ReportsTo, ModelTier: c.ModelTier, Instructions: strings.TrimSpace(c.Instructions),
-				Permissions: storage.Permissions{ReadOnly: true},
+			spec := team.AgentSpec{
+				Key: key, Name: orDefault(c.Name, key), Role: c.Role,
+				Description: c.Description, ModelTier: c.ModelTier, Instructions: strings.TrimSpace(c.Instructions),
 			}
 			if !storage.ValidTier(spec.ModelTier) {
 				spec.ModelTier = storage.TierFast
 			}
-			if c.ReadOnly != nil {
-				spec.Permissions.ReadOnly = *c.ReadOnly
-			}
-			if !spec.Permissions.ReadOnly {
-				spec.Permissions.RequiresApproval = true // writes always need a human
-			}
-			if spec.Tier == storage.TierLead {
-				spec.ReportsTo = nil
-			}
+			warnings = append(warnings, applyPermissions(&spec.Permissions, c, catalog, true)...)
 			agents = append(agents, spec)
 		case "remove":
 			i := idx(key)
@@ -210,64 +341,67 @@ func Apply(t orgmodel.Template, changes []AgentChange) orgmodel.Template {
 				continue
 			}
 			agents = append(agents[:i], agents[i+1:]...)
-			for j := range agents {
-				agents[j].ReportsTo = without(agents[j].ReportsTo, key)
+			if t.Default == key && len(agents) > 0 {
+				t.Default = agents[0].Key
 			}
-			t.Governance.Veto = without(t.Governance.Veto, key)
 		}
 	}
 	t.Agents = agents
-	return t
+	return t, warnings
 }
 
-// Accept applies the accepted changes and installs the result as the project's model.
-func (a *Assistant) Accept(ctx context.Context, repoID, templateKey string, changes []AgentChange) (storage.OrgModel, error) {
-	t, problems, err := a.Build(ctx, templateKey, changes)
+// Accept applies the accepted changes and gives the project the pack's
+// agents and workflows. A project with no agents yet gets the pack in
+// place (as before); a project that already has agents only gets the
+// pack's keys it's missing, so a rescan's setup never overwrites or
+// removes an agent an admin has hand-edited. Warnings (see Build) don't
+// block acceptance.
+func (a *Assistant) Accept(ctx context.Context, repoID, packKey string, changes []AgentChange, extraWorkflows ...string) (team.Pack, error) {
+	policy := perm.LoadPolicy(ctx, a.store, repoID)
+	p, problems, _, err := Build(packKey, changes, policy.Catalog, extraWorkflows...)
 	if err != nil {
-		return storage.OrgModel{}, err
+		return p, err
 	}
 	if len(problems) > 0 {
-		return storage.OrgModel{}, &orgmodel.ValidationError{Problems: problems}
+		return p, &team.ValidationError{Problems: problems}
 	}
-	src, err := a.store.OrgModels().GetTemplateByKey(ctx, templateKey)
+	snap, err := a.team.Load(ctx, repoID)
 	if err != nil {
-		return storage.OrgModel{}, err
+		return p, err
 	}
-	return a.org.ApplyTemplate(ctx, repoID, t, src.ID)
+	if len(snap.Agents) > 0 {
+		if err := a.team.Merge(ctx, repoID, team.Snapshot{Default: p.Default, Agents: p.Agents}, "pack:"+p.Key); err != nil {
+			return p, err
+		}
+		return p, a.team.InstallWorkflows(ctx, repoID, p.Workflows)
+	}
+	return p, a.team.ApplyPack(ctx, repoID, p, true)
 }
 
 type libraryEntry struct {
-	Key         string          `json:"key"`
-	Name        string          `json:"name"`
-	Kind        string          `json:"kind"`
-	Description string          `json:"description"`
-	Governance  json.RawMessage `json:"governance"`
-	Agents      []libraryAgent  `json:"agents"`
+	Key         string         `json:"key"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Workflows   []string       `json:"workflows,omitempty"`
+	Agents      []libraryAgent `json:"agents"`
 }
 
 type libraryAgent struct {
-	Key       string   `json:"key"`
-	Name      string   `json:"name"`
-	Tier      string   `json:"tier"`
-	Role      string   `json:"role"`
-	ReportsTo []string `json:"reports_to,omitempty"`
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	Role string `json:"role"`
 }
 
-func (a *Assistant) library(ctx context.Context) ([]libraryEntry, error) {
-	list, err := a.store.OrgModels().ListTemplates(ctx)
+func library() ([]libraryEntry, error) {
+	list, err := team.Packs()
 	if err != nil {
 		return nil, err
 	}
 	var out []libraryEntry
-	for _, m := range list {
-		agents, err := a.store.Agents().List(ctx, m.ID)
-		if err != nil {
-			return nil, err
-		}
-		gov, _ := json.Marshal(m.Governance)
-		e := libraryEntry{Key: m.Key, Name: m.Name, Kind: m.Kind, Description: m.Description, Governance: gov}
-		for _, ag := range agents {
-			e.Agents = append(e.Agents, libraryAgent{Key: ag.Key, Name: ag.Name, Tier: ag.Tier, Role: ag.Role, ReportsTo: ag.ReportsTo})
+	for _, p := range list {
+		e := libraryEntry{Key: p.Key, Name: p.Name, Description: p.Description, Workflows: p.Workflows}
+		for _, ag := range p.Agents {
+			e.Agents = append(e.Agents, libraryAgent{Key: ag.Key, Name: ag.Name, Role: ag.Role})
 		}
 		out = append(out, e)
 	}
@@ -299,14 +433,4 @@ func orDefault(v, d string) string {
 		return d
 	}
 	return strings.TrimSpace(v)
-}
-
-func without(list []string, v string) []string {
-	out := list[:0:0]
-	for _, x := range list {
-		if x != v {
-			out = append(out, x)
-		}
-	}
-	return out
 }

@@ -88,7 +88,7 @@ func (w Workspace) ListDir(rel string) (string, error) {
 	sort.Strings(files)
 	out := append(dirs, files...)
 	if len(out) > 300 {
-		out = append(out[:300], fmt.Sprintf("… và %d mục khác", len(out)-300))
+		out = append(out[:300], fmt.Sprintf("… and %d more entries", len(out)-300))
 	}
 	return strings.Join(out, "\n"), nil
 }
@@ -132,7 +132,7 @@ func (w Workspace) ReadFile(rel string, start, end int) (string, error) {
 			return "", fmt.Errorf("%s là file nhị phân", rel)
 		}
 		if shown >= maxLines || b.Len() > maxBytes {
-			fmt.Fprintf(&b, "… (đã cắt, đọc tiếp với start=%d)\n", n)
+			fmt.Fprintf(&b, "… (cut, read on with start=%d)\n", n)
 			break
 		}
 		fmt.Fprintf(&b, "%d\t%s\n", n, line)
@@ -150,6 +150,9 @@ func (w Workspace) Search(pattern, glob string) (string, error) {
 	root, err := w.resolve(".")
 	if err != nil {
 		return "", err
+	}
+	if out, ok := searchRipgrep(root, pattern, glob); ok {
+		return out, nil
 	}
 	var b strings.Builder
 	hits, files := 0, 0
@@ -209,10 +212,10 @@ func (w Workspace) Search(pattern, glob string) (string, error) {
 		return nil
 	})
 	if hits == 0 {
-		return "Không tìm thấy kết quả.", nil
+		return "No matches.", nil
 	}
 	if hits >= 200 {
-		b.WriteString("… (dừng ở 200 kết quả, hãy thu hẹp tìm kiếm)\n")
+		b.WriteString("… (stopped at 200 matches; narrow the search)\n")
 	}
 	return b.String(), nil
 }
@@ -263,7 +266,7 @@ func (w Workspace) WriteFile(rel, content string) (string, error) {
 	if err := os.WriteFile(full, []byte(content), mode); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Đã ghi %s (%d dòng)", rel, strings.Count(content, "\n")+1), nil
+	return fmt.Sprintf("Wrote %s (%d lines)", rel, strings.Count(content, "\n")+1), nil
 }
 
 // EditFile replaces the one occurrence of old with new in a file.
@@ -288,5 +291,5 @@ func (w Workspace) EditFile(rel, old, new string) (string, error) {
 	if err := os.WriteFile(full, []byte(strings.Replace(string(b), old, new, 1)), st.Mode().Perm()); err != nil {
 		return "", err
 	}
-	return "Đã sửa " + rel, nil
+	return "Edited " + rel, nil
 }

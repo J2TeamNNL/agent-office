@@ -22,7 +22,15 @@ func (r *Runner) runScriptJob(ctx context.Context, a storage.Automation, j stora
 	}
 	env := []string{"OFFICE_PAYLOAD=" + j.Payload, "OFFICE_TRIGGER=" + j.Trigger, "OFFICE_JOB_ID=" + j.ID, "OFFICE_AUTOMATION=" + a.Name}
 	out, code, timedOut, runErr := RunScript(ctx, dir, a.Script, env, j.Payload)
-	_ = r.store.Jobs().SetOutput(ctx, j.ID, out, code)
+	note := ""
+	if runErr == nil && !timedOut { // its @@quest lines go to the project's Burn (ADR-132)
+		note = r.giveQuests(ctx, a, j, out)
+	}
+	stored := out
+	if note != "" {
+		stored = strings.TrimRight(out, "\n") + "\n\n" + note
+	}
+	_ = r.store.Jobs().SetOutput(ctx, j.ID, stored, code)
 	status, errCode, msg := "done", "", ""
 	switch {
 	case runErr != nil:
@@ -38,32 +46,20 @@ func (r *Runner) runScriptJob(ctx context.Context, a storage.Automation, j stora
 	if status == "failed" {
 		failed = errors.New(msg)
 	}
-	answer(withoutSignals(out), failed, true) // what it printed is the answer
+	answer(strings.TrimSpace(withoutSignals(out)+"\n\n"+note), failed, true) // what it printed is the answer
 
-	if a, err := r.store.Automations().Get(ctx, a.ID); err == nil {
-		t := r.now().UTC()
-		a.LastRunAt = &t
-		if runErr != nil || timedOut {
-			a.Failures++
-			limit := a.Limits.DisableAfterFailures
-			if limit <= 0 {
-				limit = 5
-			}
-			if a.Failures >= limit {
-				a.Enabled, a.DisabledCode, a.DisabledReason = false, "failures", firstNonEmpty(msg, "script lỗi")
-			}
-		} else {
-			a.Failures = 0
-		}
-		_ = r.store.Automations().Update(ctx, a)
+	result, reason := "ok", ""
+	if runErr != nil || timedOut {
+		result, reason = "fail", firstNonEmpty(msg, "script lỗi")
 	}
+	_ = r.store.Automations().RecordRun(ctx, a.ID, r.now().UTC(), result, reason, a.Limits.DisableAfterFailures, "")
 }
 
-// withoutSignals is a script's output without its @@agent lines.
+// withoutSignals is a script's output without its @@agent and @@quest lines.
 func withoutSignals(out string) string {
 	var keep []string
 	for _, l := range strings.Split(out, "\n") {
-		if !strings.HasPrefix(strings.TrimSpace(l), "@@agent:") {
+		if _, quest := questLine(l); !quest && !strings.HasPrefix(strings.TrimSpace(l), "@@agent:") {
 			keep = append(keep, l)
 		}
 	}

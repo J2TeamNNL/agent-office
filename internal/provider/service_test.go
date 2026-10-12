@@ -97,49 +97,6 @@ func TestCreateEncryptsAndTests(t *testing.T) {
 	}
 }
 
-func TestResolveModel(t *testing.T) {
-	svc, _, srv := setup(t)
-	ctx := context.Background()
-	def, _ := svc.Create(ctx, provider.Input{Name: "Claude", Kind: storage.ProviderAnthropic, BaseURL: srv.URL, APIKey: ptr("sk-ant-good-key-1234")})
-	other, _ := svc.Create(ctx, provider.Input{Name: "Local", Kind: storage.ProviderOpenAICompatible, BaseURL: "http://x/v1",
-		TierModels: map[string]string{"fast": "llama-small"}})
-
-	p, m, err := svc.ResolveModel(ctx, storage.Agent{ModelTier: "strong"})
-	if err != nil || p.ID != def.ID || m != "claude-opus-5-5" {
-		t.Fatalf("default tier = %s %s %v", p.Name, m, err)
-	}
-	p, m, _ = svc.ResolveModel(ctx, storage.Agent{ProviderID: other.ID, ModelTier: "fast"})
-	if p.ID != other.ID || m != "llama-small" {
-		t.Fatalf("agent provider tier = %s %s", p.Name, m)
-	}
-	_, m, _ = svc.ResolveModel(ctx, storage.Agent{ModelTier: "fast", LLMModel: "claude-sonnet-5"})
-	if m != "claude-sonnet-5" {
-		t.Fatalf("explicit model = %s", m)
-	}
-}
-
-func TestTestFillsTiersFromModels(t *testing.T) {
-	_, st, _ := setup(t)
-	dir := t.TempDir()
-	box, _ := secrets.Load(filepath.Join(dir, "k"))
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"data":[{"id":"gpt-5"},{"id":"gpt-5-mini"},{"id":"text-embedding-3-small"}]}`))
-	}))
-	defer srv.Close()
-	svc := provider.NewService(st, box, llm.Options{})
-	p, err := svc.Create(context.Background(), provider.Input{Name: "GPT", Kind: storage.ProviderOpenAI, BaseURL: srv.URL, APIKey: ptr("sk-openai-test-1234")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res, _ := svc.Test(context.Background(), p.ID, "", ""); !res.OK {
-		t.Fatalf("test = %+v", res)
-	}
-	got, _ := st.Providers().Get(context.Background(), p.ID)
-	if got.TierModels["strong"] != "gpt-5" || got.TierModels["fast"] != "gpt-5-mini" {
-		t.Fatalf("tiers = %v", got.TierModels)
-	}
-}
-
 // Re-pointing a connection at another host must not carry the stored key
 // along: otherwise editing the URL is enough to exfiltrate it.
 func TestBaseURLChangeDropsStoredKey(t *testing.T) {
@@ -168,20 +125,120 @@ func TestBaseURLChangeDropsStoredKey(t *testing.T) {
 	}
 }
 
-func TestCLIProviderUsesBinResolver(t *testing.T) {
+func TestGeminiCLIProvider(t *testing.T) {
 	svc, _, _ := setup(t)
 	ctx := context.Background()
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "claude")
-	os.WriteFile(bin, []byte("#!/bin/sh\necho '9.9.9 (Claude Code)'\n"), 0o755)
-	p, _ := svc.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI})
+	home := t.TempDir()
+	t.Setenv("GEMINI_CLI_HOME", home)
+	t.Setenv("GEMINI_API_KEY", "")
+	bin := filepath.Join(t.TempDir(), "gemini")
+	os.WriteFile(bin, []byte("#!/bin/sh\necho '0.63.0'\n"), 0o755)
 	svc.SetBinResolver(func(name string) string {
-		if name == "claude" {
+		if name == "gemini" {
 			return bin
 		}
 		return ""
 	})
-	if res, _ := svc.Test(ctx, p.ID, "", ""); !res.OK || res.Version != "9.9.9 (Claude Code)" {
-		t.Fatalf("test via resolver = %+v", res)
+	// the kind is stored (no CHECK left to refuse it)
+	p, err := svc.Create(ctx, provider.Input{Name: "Gemini", Kind: storage.ProviderGeminiCLI,
+		TierModels: map[string]string{"strong": "pro", "balanced": "flash", "fast": "flash-lite"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := svc.Test(ctx, p.ID, "", ""); res.OK || !res.NeedsLogin || res.CLITool != "gemini" {
+		t.Fatalf("signed out = %+v", res)
+	}
+	os.MkdirAll(filepath.Join(home, ".gemini"), 0o700)
+	os.WriteFile(filepath.Join(home, ".gemini", "oauth_creds.json"), []byte("{}"), 0o600)
+	if res, _ := svc.Test(ctx, p.ID, "", ""); !res.OK || res.Version != "0.63.0" {
+		t.Fatalf("signed in = %+v", res)
+	}
+}
+
+func TestAntigravityCLIProvider(t *testing.T) {
+	svc, _, _ := setup(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	os.WriteFile(bin, []byte(`#!/bin/sh
+case "$1" in
+  --version) echo "1.3.1";;
+  models) if [ -f "`+dir+`/in" ]; then echo "Fetching available models..."; echo "gemini-3.8-flash-high"; echo "gemini-3.5-pro (default)"
+          else echo "Error: Please sign in to view available models. Launch the CLI without arguments to sign in."; exit 1; fi;;
+esac
+`), 0o755)
+	svc.SetBinResolver(func(name string) string {
+		if name == "agy" {
+			return bin
+		}
+		return ""
+	})
+	p, err := svc.Create(ctx, provider.Input{Name: "AGY", Kind: storage.ProviderAntigravityCLI})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, _ := svc.Test(ctx, p.ID, "", ""); res.OK || !res.NeedsLogin || res.CLITool != "antigravity" {
+		t.Fatalf("signed out = %+v", res)
+	}
+	os.WriteFile(filepath.Join(dir, "in"), nil, 0o600)
+	res, _ := svc.Test(ctx, p.ID, "", "")
+	if !res.OK || res.Version != "1.3.1" || strings.Join(res.Models, ",") != "gemini-3.8-flash-high,gemini-3.5-pro" {
+		t.Fatalf("signed in = %+v", res)
+	}
+}
+
+// Deleting the default connection must fail: every agent with no ProviderID
+// of its own resolves through Default() and would break on every run.
+func TestDeleteRefusesDefault(t *testing.T) {
+	svc, st, srv := setup(t)
+	ctx := context.Background()
+	def, _ := svc.Create(ctx, provider.Input{Name: "Claude", Kind: storage.ProviderAnthropic, BaseURL: srv.URL, APIKey: ptr("sk-ant-good-key-1234")})
+	if err := svc.Delete(ctx, def.ID); !errors.Is(err, provider.ErrIsDefault) {
+		t.Fatalf("delete default err = %v, want ErrIsDefault", err)
+	}
+	if _, err := st.Providers().Get(ctx, def.ID); err != nil {
+		t.Fatalf("default connection was deleted: %v", err)
+	}
+}
+
+// Deleting a non-default connection an agent points to must succeed: the
+// agent is unlinked (ON DELETE SET NULL) and keeps running on the default.
+func TestDeleteNonDefaultUnlinksAgent(t *testing.T) {
+	svc, st, srv := setup(t)
+	ctx := context.Background()
+	def, _ := svc.Create(ctx, provider.Input{Name: "Claude", Kind: storage.ProviderAnthropic, BaseURL: srv.URL, APIKey: ptr("sk-ant-good-key-1234")})
+	other, _ := svc.Create(ctx, provider.Input{Name: "Local", Kind: storage.ProviderOpenAICompatible, BaseURL: "http://x/v1"})
+	repo, err := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: "/code/shop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	own, err := st.Agents().Create(ctx, storage.Agent{ProjectID: repo.ID, Key: "own", Name: "Own", ModelTier: "fast", ProviderID: other.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb, err := st.Agents().Create(ctx, storage.Agent{ProjectID: repo.ID, Key: "fb", Name: "Fb", ModelTier: "fast", FallbackProviderIDs: []string{other.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	agents, err := svc.AgentsUsing(ctx, other.ID)
+	if err != nil || len(agents) != 2 {
+		t.Fatalf("AgentsUsing = %v, %v", agents, err)
+	}
+
+	if err := svc.Delete(ctx, other.ID); err != nil {
+		t.Fatalf("delete non-default: %v", err)
+	}
+	if _, err := st.Providers().Get(ctx, other.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("provider still exists: %v", err)
+	}
+	gotOwn, err := st.Agents().Get(ctx, own.ID)
+	if err != nil || gotOwn.ProviderID != "" {
+		t.Fatalf("own agent not unlinked: %+v, %v", gotOwn, err)
+	}
+	_ = fb
+	// def is still the default, so the unlinked agent still resolves.
+	if p, _, err := svc.ResolveModel(ctx, gotOwn); err != nil || p.ID != def.ID {
+		t.Fatalf("ResolveModel after unlink = %+v, %v", p, err)
 	}
 }

@@ -26,28 +26,60 @@ async function load() {
     repo.value = false
   }
 }
+// fetch and push answer at once when git is quick; a slower one goes on in
+// the background and its end comes as a "git" event (ADR-127)
+interface GitEnd { project: string, kind: 'fetch' | 'push', repo: boolean, status?: GitStatus, action?: ProposedAction, error?: string }
+let quietFetch = false
+let stuck: ReturnType<typeof setTimeout> | undefined
+function waitEnd(kind: 'fetch' | 'push') {
+  busy.value = kind
+  clearTimeout(stuck)
+  stuck = setTimeout(() => { // the event was missed (stream reconnecting): look again
+    if (busy.value === kind) busy.value = ''
+    void load()
+  }, 90000)
+}
+onLiveEvent<GitEnd>('git', (d) => {
+  if (d.project !== props.projectId) return
+  if (d.status) set({ repo: d.repo, status: d.status })
+  if (busy.value === d.kind) {
+    busy.value = ''
+    clearTimeout(stuck)
+  }
+  if (d.error) {
+    if (d.kind === 'push' || !quietFetch) toast.add({ title: d.error, color: 'error' })
+  } else if (d.kind === 'push') {
+    toast.add({ title: t('git.pushed'), description: d.action?.detail, color: 'success' })
+  }
+})
+
 // fetch: ask the remote what changed (read-only for the working tree)
 async function fetchRemote(quiet = false) {
   busy.value = 'fetch'
+  quietFetch = quiet
   try {
-    set(await $fetch(`/api/projects/${props.projectId}/git/fetch`, { method: 'POST', body: {} }))
+    const res = await $fetch<{ repo: boolean, status?: GitStatus, running?: string }>(`/api/projects/${props.projectId}/git/fetch`, { method: 'POST', body: {} })
+    set(res)
+    if (res.running) return waitEnd('fetch')
   } catch (e) {
     if (!quiet) toast.add({ title: apiError(e), color: 'error' })
-  } finally {
-    busy.value = ''
   }
+  busy.value = ''
 }
 async function push() {
   busy.value = 'push'
   try {
-    const res = await $fetch<{ action: ProposedAction }>(`/api/projects/${props.projectId}/git/push`, { method: 'POST', body: {} })
+    const res = await $fetch<{ action: ProposedAction, running?: string }>(`/api/projects/${props.projectId}/git/push`, { method: 'POST', body: {} })
+    if (res.running) {
+      toast.add({ title: t('git.pushRunning'), color: 'info' })
+      return waitEnd('push')
+    }
     toast.add({ title: t('git.pushed'), description: res.action.detail, color: 'success' })
     await load()
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
-  } finally {
-    busy.value = ''
   }
+  busy.value = ''
 }
 
 const commit = reactive({ open: false, message: '', picked: [] as string[], busy: false })
@@ -83,6 +115,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   clearInterval(timer)
+  clearTimeout(stuck)
   window.removeEventListener('focus', load)
 })
 watch(() => props.projectId, load)
@@ -93,20 +126,22 @@ const viewChanges = () => navigateTo({ query: { tab: 'files', view: 'changes' } 
 const menu = computed(() => [[
   { label: t('git.viewChanges'), icon: 'i-lucide-file-diff', disabled: !changes.value, onSelect: viewChanges },
   { label: t('git.commit'), icon: 'i-lucide-git-commit-horizontal', disabled: !changes.value, onSelect: openCommit },
-  { label: st.value?.upstream ? t('git.push', { n: st.value.ahead }) : t('git.pushNew'), icon: 'i-lucide-upload', disabled: !!st.value?.upstream && !st.value.ahead, onSelect: push }
+  { label: st.value?.upstream ? t('git.push', { n: st.value.ahead }) : t('git.pushNew'), icon: 'i-lucide-upload', disabled: !!busy.value || (!!st.value?.upstream && !st.value.ahead), onSelect: push }
 ], [
-  { label: t('git.fetch'), icon: 'i-lucide-refresh-cw', onSelect: () => fetchRemote() }
+  { label: t('git.fetch'), icon: 'i-lucide-refresh-cw', disabled: !!busy.value, onSelect: () => fetchRemote() }
 ]])
 </script>
 
 <template>
   <div v-if="repo && st" class="flex min-w-0 items-center gap-2">
   <component :is="isAdmin ? Dropdown : 'div'" :items="menu" :content="{ align: 'start' }">
-    <button type="button" class="flex min-w-0 items-center gap-1.5 hover:text-(--ui-text)" :disabled="!isAdmin" :title="st.upstream || t('git.noUpstream')">
+    <button type="button" class="flex min-w-0 items-center gap-1.5 overflow-hidden hover:text-(--ui-text)" :disabled="!isAdmin" :title="st.upstream || t('git.noUpstream')">
       <UIcon :name="busy ? 'i-lucide-loader-circle' : 'i-lucide-git-branch'" class="size-3 shrink-0" :class="busy && 'animate-spin'" />
-      <span class="truncate font-mono">{{ st.branch || 'HEAD' }}</span>
+      <span class="min-w-8 truncate font-mono">{{ st.branch || 'HEAD' }}</span>
       <template v-if="!st.upstream">
-        <span class="shrink-0">· {{ t('git.noUpstream') }}</span>
+        <!-- on a phone an icon says it (the title has the words): the branch keeps the room -->
+        <UIcon name="i-lucide-cloud-off" class="size-3 shrink-0 sm:hidden" />
+        <span class="min-w-0 truncate max-sm:hidden">· {{ t('git.noUpstream') }}</span>
       </template>
       <template v-else-if="!st.ahead && !st.behind">
         <UIcon name="i-lucide-check" class="size-3 shrink-0 text-(--ui-success)" />
@@ -116,7 +151,8 @@ const menu = computed(() => [[
         <span v-if="st.ahead" class="shrink-0 tabular-nums" :title="t('git.aheadTitle', { n: st.ahead })">↑{{ st.ahead }}</span>
         <span v-if="st.behind" class="shrink-0 tabular-nums text-(--ui-warning)" :title="t('git.behindTitle', { n: st.behind })">↓{{ st.behind }}</span>
       </template>
-      <span v-if="changes" class="shrink-0">· {{ t('git.changes', { n: changes }) }}</span>
+      <!-- on a phone the link below says it: the two side by side overflow the header -->
+      <span v-if="changes" class="shrink-0" :class="isAdmin && 'max-sm:hidden'">· {{ t('git.changes', { n: changes }) }}</span>
       <UIcon v-if="isAdmin" name="i-lucide-chevron-down" class="size-3 shrink-0" />
     </button>
   </component>
@@ -124,7 +160,8 @@ const menu = computed(() => [[
     v-if="changes && isAdmin" type="button" class="shrink-0 text-primary underline-offset-2 hover:underline"
     @click="viewChanges"
   >
-    {{ t('git.viewChanges') }}
+    <span class="sm:hidden">{{ t('git.changes', { n: changes }) }}</span>
+    <span class="max-sm:hidden">{{ t('git.viewChanges') }}</span>
   </button>
   </div>
 

@@ -60,10 +60,18 @@ func (s *server) putPolicy(w http.ResponseWriter, r *http.Request) {
 		perm.Policy
 		Version string `json:"version"` // the policy as it was read (409 when changed since)
 	}
+	// a body without quick_check (an older client) keeps what is set
+	cur := perm.LoadPolicy(r.Context(), s.cfg.Store, r.PathValue("id"))
+	body.QuickCheck, body.QuickChecks = cur.QuickCheck, cur.QuickChecks
 	if !decode(w, r, &body) {
 		return
 	}
 	in := body.Policy
+	in.QuickChecks = strings.TrimSpace(in.QuickChecks)
+	if _, err := perm.ParseQuickChecks(in.QuickChecks); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	projectID := r.PathValue("id")
 	if _, err := s.cfg.Store.Repos().Get(r.Context(), projectID); err != nil {
 		s.writeDomainError(w, r, err)
@@ -102,6 +110,9 @@ func (s *server) putPolicy(w http.ResponseWriter, r *http.Request) {
 			c, err := perm.CleanPattern(x)
 			if err != nil {
 				return nil, fmt.Errorf("lệnh %q không hợp lệ: chạy không qua shell nên không dùng | ; & > $, và * chỉ ở cuối", x)
+			}
+			if perm.CoversRisky(c) {
+				return nil, fmt.Errorf("lệnh %q: %w", x, perm.ErrNotAlways)
 			}
 			if !slices.Contains(out, c) {
 				out = append(out, c)

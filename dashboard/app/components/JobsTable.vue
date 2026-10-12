@@ -4,7 +4,7 @@
 const props = defineProps<{ filter?: { project?: string, origin_id?: string, origin_ids?: string[], kind?: string }, showFilters?: boolean, projects?: { id: string, name: string }[] }>()
 const toast = useToast()
 const { isAdmin } = useAuth()
-const { t, dateLocale } = useLang()
+const { t, when } = useLang()
 
 const kind = ref(props.filter?.kind ?? '')
 const origin = ref<'all' | Source>('all') // where it came from: web, a bot, an automation
@@ -37,16 +37,20 @@ function query(before = '') {
   set('limit', '20') // a page: the rest comes with "Xem thêm"
   return q.toString()
 }
+let loadToken = 0
 async function load(more = false) {
+  const token = ++loadToken
   loading.value = true
   try {
     const res = await $fetch<{ jobs: Job[], next_before: string }>(`/api/jobs?${query(more ? nextBefore.value : '')}`)
+    if (token !== loadToken) return // a newer load() started since: drop this stale response
     jobs.value = more ? [...jobs.value, ...res.jobs] : res.jobs
     nextBefore.value = res.next_before
   } catch (e) {
+    if (token !== loadToken) return
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
-    loading.value = false
+    if (token === loadToken) loading.value = false
   }
 }
 watch([kind, origin, searchQ, status, project, since, () => props.filter?.origin_id], () => load(), { immediate: true })
@@ -78,7 +82,6 @@ const withAll = (items: { label: string, value: string }[]) => items.map(i => ({
 
 const usd = (v: number) => v >= 1 ? `$${v.toFixed(2)}` : v > 0 ? `$${v.toFixed(3)}` : '—'
 const secs = (ms: number) => !ms ? '—' : ms >= 60000 ? `${(ms / 60000).toFixed(1)}m` : `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}s`
-const when = (d: string) => new Date(d).toLocaleString(dateLocale.value, { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })
 // where a job came from, as the source filter names it
 const sourceOf = (j: Job): Source => j.trigger === 'discord' || j.trigger === 'telegram' ? j.trigger : j.origin === 'automation' ? 'auto' : 'web'
 const source = (j: Job) => j.origin === 'automation'
@@ -127,23 +130,23 @@ useLive(['jobs'], () => load())
     <UCard :ui="{ body: 'p-0 sm:p-0' }">
       <p v-if="!jobs.length && !loading" class="p-4 text-sm text-(--ui-text-muted)">{{ t('job.empty') }}</p>
       <div class="overflow-x-auto">
-        <table v-if="jobs.length" class="w-full text-sm">
+        <table v-if="jobs.length" class="w-full table-fixed text-sm">
           <thead class="text-left text-xs text-(--ui-text-muted)">
             <tr class="border-b border-(--ui-border)">
-              <th class="px-4 py-2 font-medium">{{ t('job.colStatus') }}</th>
+              <th class="w-14 px-4 py-2 font-medium">{{ t('job.colStatus') }}</th>
               <th class="px-2 py-2 font-medium">{{ t('job.colTitle') }}</th>
-              <th class="px-2 py-2 font-medium">{{ t('job.colSource') }}</th>
-              <th class="px-2 py-2 font-medium">{{ t('job.colAgent') }}</th>
-              <th class="px-2 py-2 text-right font-medium">{{ t('job.colCost') }}</th>
-              <th class="px-2 py-2 text-right font-medium">{{ t('job.colTime') }}</th>
-              <th class="px-2 py-2 font-medium">{{ t('job.colCreated') }}</th>
-              <th class="px-4 py-2" />
+              <th class="w-32 px-2 py-2 font-medium max-sm:hidden">{{ t('job.colSource') }}</th>
+              <th class="w-28 px-2 py-2 font-medium max-sm:hidden">{{ t('job.colAgent') }}</th>
+              <th class="w-20 px-2 py-2 text-right font-medium">{{ t('job.colCost') }}</th>
+              <th class="w-16 px-2 py-2 text-right font-medium max-sm:hidden">{{ t('job.colTime') }}</th>
+              <th class="w-28 px-2 py-2 font-medium max-sm:hidden">{{ t('job.colCreated') }}</th>
+              <th class="w-20 px-4 py-2" />
             </tr>
           </thead>
           <tbody>
             <tr v-for="j in jobs" :key="j.id" class="border-b border-(--ui-border) last:border-0 hover:bg-(--ui-bg-elevated)/40">
               <td class="px-4 py-2"><JobStatusBadge :status="j.status" /></td>
-              <td class="max-w-72 px-2 py-2">
+              <td class="px-2 py-2">
                 <span class="flex items-center gap-1.5">
                   <UIcon :name="j.kind === 'task' ? 'i-lucide-list-todo' : j.kind === 'script' ? 'i-lucide-square-terminal' : 'i-lucide-messages-square'" class="size-3.5 shrink-0 text-(--ui-text-muted)" />
                   <span class="truncate" :title="j.title">{{ j.title || '—' }}</span>
@@ -151,16 +154,16 @@ useLive(['jobs'], () => load())
                 <span v-if="j.error" class="block truncate text-xs text-(--ui-error)" :title="j.error">{{ j.error }}</span>
                 <span v-if="!filter?.project && j.project_name" class="block truncate text-xs text-(--ui-text-muted)">{{ j.project_name }}</span>
               </td>
-              <td class="max-w-48 px-2 py-2 text-xs text-(--ui-text-muted)">
+              <td class="px-2 py-2 text-xs text-(--ui-text-muted) max-sm:hidden">
                 <span class="flex items-center gap-1.5">
                   <UIcon :name="sourceIcon[sourceOf(j)]" class="size-3.5 shrink-0" :title="t(`source.${sourceOf(j)}`)" />
                   <span class="truncate">{{ source(j) }}</span>
                 </span>
               </td>
-              <td class="max-w-36 truncate px-2 py-2 text-xs">{{ j.agent_name || '—' }}</td>
-              <td class="px-2 py-2 text-right text-xs tabular-nums">{{ usd(j.cost_usd) }}</td>
-              <td class="px-2 py-2 text-right text-xs tabular-nums">{{ secs(j.duration_ms) }}</td>
-              <td class="whitespace-nowrap px-2 py-2 text-xs text-(--ui-text-muted)">{{ when(j.created_at) }}</td>
+              <td class="truncate px-2 py-2 text-xs max-sm:hidden">{{ j.agent_name || '—' }}</td>
+              <td class="whitespace-nowrap px-2 py-2 text-right text-xs tabular-nums">{{ usd(j.cost_usd) }}</td>
+              <td class="whitespace-nowrap px-2 py-2 text-right text-xs tabular-nums max-sm:hidden">{{ secs(j.duration_ms) }}</td>
+              <td class="whitespace-nowrap px-2 py-2 text-xs text-(--ui-text-muted) max-sm:hidden">{{ when(j.created_at) }}</td>
               <td class="whitespace-nowrap px-4 py-2 text-right">
                 <UButton v-if="j.conversation_id || j.task_id || j.kind === 'script'" size="xs" color="neutral" variant="ghost" icon="i-lucide-external-link" :title="t('job.open')" :aria-label="t('job.open')" @click="openJob(j)" />
                 <UButton v-if="isAdmin && (j.status === 'pending' || j.status === 'running')" size="xs" color="neutral" variant="ghost" icon="i-lucide-square" :title="t('job.cancel')" :aria-label="t('job.cancel')" @click="act(j, 'cancel')" />

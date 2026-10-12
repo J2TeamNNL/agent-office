@@ -259,7 +259,7 @@ make ui-install &amp;&amp; make ui-build  # → dashboard/.output
     <li><b>Thư mục</b>: chọn một thư mục có sẵn bằng cây thư mục.</li>
     <li><b>Clone</b>: dán link git (https, ssh hoặc dạng scp). Mặc định office clone vào cùng cấp với thư mục chứa office.</li>
     <li><b>Không thư mục</b>: trợ lý cho lập kế hoạch, viết bài hay việc chung của cả máy.</li>
-    <li>Chọn mô hình tổ chức ngay, hoặc để sau qua menu <b>⋯</b> của project.</li>
+    <li>Chọn mô hình tổ chức ngay, hoặc để sau ở tab <b>Thông tin</b> của project (<b>Thiết lập bằng AI</b>).</li>
   </ol>
   <p>Trong một project có các tab: <b>Chat</b>, <b>Tự động</b>, <b>Vận hành</b>, <b>Agents</b>, <b>Quyền</b>; admin thấy thêm <b>Files</b>, <b>Skills</b>, <b>MCP</b>, <b>Burn</b>, <b>Nhật ký</b>, <b>Thông tin</b>. Thanh tiêu đề hiện nhánh git kèm nút fetch, commit và push.</p>
 </section>
@@ -268,7 +268,7 @@ make ui-install &amp;&amp; make ui-build  # → dashboard/.output
 <section id="setup">
   <h2><span class="num">6</span>Thiết lập bằng AI</h2>
   <p class="intro">Để một agent đọc repo và đề xuất đội phù hợp.</p>
-  <figure><img src="images/vi/18-setup-ai.png" alt="Thiết lập bằng AI" loading="lazy"><figcaption>Project → ⋯ → Thiết lập bằng AI.</figcaption></figure>
+  <figure><img src="images/vi/18-setup-ai.png" alt="Thiết lập bằng AI" loading="lazy"><figcaption>Project → Thông tin → Thiết lập bằng AI.</figcaption></figure>
   <ol class="steps">
     <li><b>Quét</b> (miễn phí): manifest, framework, file hạ tầng, các file agent sẵn có như <code>CLAUDE.md</code> hay <code>.claude/agents</code>.</li>
     <li><b>Đề xuất</b>: AI gợi ý mô hình và tinh chỉnh từng agent, có lý do cho mỗi lựa chọn và ước tính chi phí.</li>
@@ -332,7 +332,7 @@ make ui-install &amp;&amp; make ui-build  # → dashboard/.output
     <li><b>Chép link</b> tới bất kỳ tin nhắn nào. Dán link chat vào chat khác thì agent đọc được.</li>
     <li>Agent tìm được chat cũ (<code>search_history</code>) khi bạn nói "như lần trước".</li>
   </ul>
-  <figure><img src="images/vi/05-chat-answer.png" alt="Câu trả lời trong chat" loading="lazy"><figcaption>Trưởng nhóm điều tra build lỗi, đọc log tiến trình và giao việc sửa.</figcaption></figure>
+  <figure><img src="images/vi/05-chat-answer.png" alt="Câu trả lời trong chat" loading="lazy"><figcaption>Câu hỏi gửi từ Discord (dòng người gửi phía trên); trưởng nhóm điều tra build lỗi, đọc log tiến trình và giao việc sửa.</figcaption></figure>
   <div class="row">
     <figure><img src="images/vi/34-dark-chat.png" alt="Giao diện tối" loading="lazy"><figcaption>Giao diện tối (Tài khoản → Giao diện).</figcaption></figure>
     <figure class="phone"><img src="images/vi/36-mobile-chat.png" alt="Trên điện thoại" loading="lazy"><figcaption>Trên điện thoại.</figcaption></figure>
@@ -427,7 +427,8 @@ make ui-install &amp;&amp; make ui-build  # → dashboard/.output
   <ol class="steps">
     <li>Tạo bot trên Discord (Developer Portal) hoặc Telegram (@BotFather) rồi dán token.</li>
     <li>Thêm <b>Admin</b> và <b>Người dùng</b> bằng ID chat. Chỉ họ nói chuyện được với bot.</li>
-    <li>Nhắn cho bot: "@bot sửa test đang lỗi". Thread Discord giữ mỗi việc riêng một luồng. Bot báo khi đang làm, gửi ảnh và file, và gửi thẻ duyệt có nút bấm.</li>
+    <li>Nhắn cho bot: "@bot sửa test đang lỗi", hoặc nhắn riêng (DM) không cần tag. Thread Discord giữ mỗi việc riêng một luồng. Bot báo khi đang làm, gửi ảnh và file, và gửi thẻ duyệt có nút bấm.</li>
+    <li>Trong chat của office, tin từ bot có một dòng người gửi phía trên: tên hiển thị, @username, tin riêng hay trên server/nhóm, link về tin gốc. ID đã gắn với tài khoản (mục <a href="#users">Tài khoản</a>) thì hiện tên tài khoản.</li>
     <li>Thêm lệnh: mỗi lệnh là một tự động hóa riêng (script hoặc chat).</li>
   </ol>
 </section>
@@ -436,14 +437,20 @@ make ui-install &amp;&amp; make ui-build  # → dashboard/.output
 <section id="burn">
   <h2><span class="num">15</span>Burn</h2>
   <p class="intro">Một agent tự làm việc liên tục trong project cho tới giờ bạn đặt.</p>
-  <figure><img src="images/vi/13-burn.png" alt="Burn" loading="lazy"><figcaption>Tab Burn: cài đặt, hẹn giờ và danh sách việc tìm được.</figcaption></figure>
+  <div class="row">
+    <figure><img src="images/vi/13-burn.png" alt="Burn" loading="lazy"><figcaption>Tab Burn: công tắc bật/tắt, lần tự bật kế tiếp và danh sách việc tìm được.</figcaption></figure>
+    <figure><img src="images/vi/13b-burn-settings.png" alt="Cài đặt Burn" loading="lazy"><figcaption>Cài đặt Burn: lịch chạy, việc cần làm, ai làm, kiểm tra &amp; báo cáo.</figcaption></figure>
+  </div>
   <ul>
     <li>Tìm ba loại việc: <b>việc dang dở</b> (TODO/FIXME, test lỗi, đề xuất còn treo), <b>chỗ nâng cấp được</b>, và <b>lỗi nhỏ</b>.</li>
     <li>Mỗi việc chạy trong worktree riêng. Kết quả vào <b>nhánh riêng</b> (commit local) hoặc <b>diff chờ duyệt</b>.</li>
-    <li>Cài đặt: agent chính, mức model, số subagent tối đa (0–5), trọng tâm ("ưu tiên checkout, bỏ qua docs"), giờ tắt (mặc định là lúc hạn mức tuần của kết nối AI được làm mới, không có thì sau 8 giờ).</li>
-    <li>Tắt thì việc đang làm tạm dừng, bật lại thì làm tiếp. Chat của phiên Burn hiện trong Chat với biểu tượng 🔥, nhắn vào đó để chỉnh hướng.</li>
+    <li><b>Bật là bật</b>: công tắc trên đầu tab, không hỏi lại. Mỗi lần bật, Burn chạy theo <b>Lịch chạy</b> đã lưu: tới khi hạn mức tuần của kết nối AI được làm mới (mặc định, không đọc được thì 8 giờ), sau N giờ, tới một giờ cố định (VD 7:00 sáng), hoặc tới khi tắt tay.</li>
+    <li><b>Tự bật theo lịch</b>: chọn ngày trong tuần và giờ (VD T2–T6 lúc 22:00). Tới giờ thì Burn tự bật nếu đang tắt (trễ tối đa 1 giờ nếu office vừa khởi động); tắt tay thì đợi lần sau. Tab Burn hiện lần tự bật kế tiếp.</li>
+    <li>Cài đặt gom một chỗ, chia khối: <b>Lịch chạy</b>; <b>Việc cần làm</b> (mẫu, thứ tự, trọng tâm "ưu tiên checkout, bỏ qua docs"); <b>Ai làm</b> (agent chính, mức model, số việc cùng lúc 1–5); <b>Kiểm tra &amp; báo cáo</b> (lệnh kiểm chứng, review, bot nhận tổng kết khi dừng); <b>Nâng cao</b>.</li>
+    <li><b>Dựng dự án từ ý tưởng</b>: Projects → Thêm → <b>Từ ý tưởng</b> (ý tưởng, stack tuỳ chọn, thư mục). Office tạo repo rỗng và Burn mẫu <b>Dựng dự án</b> (chưa chạy). Bấm bật: việc đầu là khởi tạo (SPEC.md, features.json có lệnh acceptance cho từng tính năng, AGENTS.md, PROGRESS.md, khung code có build/test). Sau đó Burn làm từng tính năng một, theo thứ tự; mỗi lần kiểm chứng chạy lại acceptance của mọi tính năng đã xong. Nên đặt "Lệnh kiểm chứng" theo AGENTS.md và "Chờ review sau N việc".</li>
+    <li><b>Tắt</b> thì Burn làm nốt việc đang dở rồi tự tắt, không nhận việc mới; trong lúc đó chọn <b>Tiếp tục</b> hoặc <b>Dừng hẳn</b> (việc đang làm tạm dừng, bật lại thì làm tiếp). Chat của phiên Burn hiện trong Chat với biểu tượng 🔥, nhắn vào đó để chỉnh hướng.</li>
   </ul>
-  <div class="callout warn"><strong>Chỉ dành cho admin</strong>Burn chạy với toàn quyền máy, không hỏi duyệt từng bước, và tốn nhiều hạn mức AI. Hộp xác nhận khi bật nói rõ điều này.</div>
+  <div class="callout warn"><strong>Chỉ dành cho admin</strong>Burn chạy với toàn quyền máy, không hỏi duyệt từng bước, và tốn nhiều hạn mức AI (ⓘ cạnh công tắc nói rõ điều này).</div>
 </section>
 
 <!-- 16 -->
@@ -521,12 +528,13 @@ make ui-install &amp;&amp; make ui-build  # → dashboard/.output
 <section id="users">
   <h2><span class="num">23</span>Tài khoản</h2>
   <div class="row">
-    <figure><img src="images/vi/28-users.png" alt="Danh sách tài khoản" loading="lazy"><figcaption>Quản trị → Tài khoản: tạo, đặt lại mật khẩu, vô hiệu hóa (thu hồi phiên đăng nhập).</figcaption></figure>
+    <figure><img src="images/vi/28-users.png" alt="Danh sách tài khoản" loading="lazy"><figcaption>Quản trị → Tài khoản: tạo, đặt lại mật khẩu, gắn Discord/Telegram, vô hiệu hóa (thu hồi phiên đăng nhập).</figcaption></figure>
     <figure><img src="images/vi/33-account.png" alt="Tài khoản của bạn" loading="lazy"><figcaption>Tài khoản của bạn: tên, mật khẩu, ngôn ngữ, giao diện, token cá nhân.</figcaption></figure>
   </div>
   <ul>
     <li><b>Admin</b>: làm được mọi thứ. <b>Member</b>: chat và dùng project, chỉ xóa được chat của mình.</li>
     <li><b>Token cá nhân</b> cho công cụ khác gọi cổng MCP của office với quyền theo vai trò của bạn. Hết hạn sau 30/90/365 ngày, hoặc không hết hạn.</li>
+    <li><b>Gắn Discord / Telegram</b> (menu <b>⋯</b> của tài khoản): nhập User ID dạng số. Tin gửi bot từ ID đó hiện tên tài khoản, kèm "(bạn)" nếu là bạn. Mỗi ID một tài khoản; chỉ để nhận diện, không thêm quyền với bot.</li>
   </ul>
 </section>
 

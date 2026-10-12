@@ -22,7 +22,8 @@ type officeExecutor struct {
 func (x officeExecutor) RunChat(ctx context.Context, projectID, agentID, conversationID, prompt, editMode string) (string, string, error) {
 	ctx = chat.WithModelTier(ctx, trigger.ModelTierOf(ctx)) // the automation's model choice
 	ctx = chat.WithSkill(chat.WithInstructions(ctx, trigger.InstructionsOf(ctx)), trigger.SkillOf(ctx))
-	if trigger.FullAccessOf(ctx) { // a bot's admin with an admin agent, or an automation's override (ADR-074, ADR-081)
+	ctx = chat.WithSender(ctx, trigger.SenderOf(ctx)) // a bot's message: who wrote it
+	if trigger.FullAccessOf(ctx) {                    // a bot's admin with an admin agent, or an automation's override (ADR-074, ADR-081)
 		ctx = chat.WithFullAccess(ctx)
 	}
 	if c := trigger.CeilingOf(ctx); c != "" { // a bot's Người dùng: no higher than proposing (ADR-081)
@@ -116,6 +117,29 @@ func (x officeExecutor) RunChat(ctx context.Context, projectID, agentID, convers
 			return conversationID, "", ctx.Err()
 		}
 	}
+}
+
+// Judge answers, in a hidden chat of its own read only, whether an
+// automation's goal is reached (ADR-132); ctx carries its job.
+func (x officeExecutor) Judge(ctx context.Context, projectID, agentID, prompt string) (string, error) {
+	conv, err := x.chat.StartConversationPurpose(ctx, projectID, agentID, chat.GoalJudgePurpose)
+	if err != nil {
+		return "", err
+	}
+	if err := x.chat.SetMode(ctx, conv.ID, perm.Read); err != nil {
+		return "", err
+	}
+	_, reply, err := x.RunChat(ctx, projectID, agentID, conv.ID, prompt, "")
+	return reply, err
+}
+
+// WorkDir is the worktree a chat's agent edits in ("" = none: the project folder).
+func (x officeExecutor) WorkDir(_ context.Context, projectID, conversationID string) string {
+	t := x.chat.Worktrees()
+	if t == nil || conversationID == "" || !t.Exists(projectID, chat.ChatTree(conversationID)) {
+		return ""
+	}
+	return t.Path(projectID, chat.ChatTree(conversationID))
 }
 
 // assistantRunner starts what the office assistant proposed and a person

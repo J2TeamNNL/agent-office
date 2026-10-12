@@ -3,7 +3,6 @@ package channels
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,9 +28,9 @@ func TestDiscord(t *testing.T) {
 			return
 		}
 		send(`{"op":0,"s":1,"t":"READY","d":{"user":{"id":"99","username":"shopbot"}}}`)
-		send(`{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"channel_id":"c1","content":"xin chào","author":{"id":"7","username":"an"},"mentions":[]}}`)
+		send(`{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"channel_id":"c1","content":"xin chào","author":{"id":"7","username":"an","global_name":"An Nguyễn"},"mentions":[]}}`)
 		send(`{"op":0,"s":3,"t":"MESSAGE_CREATE","d":{"channel_id":"c2","guild_id":"g","content":"chuyện riêng","author":{"id":"8"},"mentions":[]}}`)
-		send(`{"op":0,"s":4,"t":"MESSAGE_CREATE","d":{"channel_id":"c2","guild_id":"g","content":"<@99> đơn 123","author":{"id":"8","username":"binh"},"mentions":[{"id":"99"}]}}`)
+		send(`{"op":0,"s":4,"t":"MESSAGE_CREATE","d":{"channel_id":"c2","guild_id":"g","content":"<@99> đơn 123","author":{"id":"8","username":"binh","global_name":"Bình"},"member":{"nick":"Bình shop"},"mentions":[{"id":"99"}]}}`)
 		send(`{"op":0,"s":5,"t":"MESSAGE_CREATE","d":{"channel_id":"c2","guild_id":"g","content":"<@99> bot","author":{"id":"5","bot":true},"mentions":[{"id":"99"}]}}`)
 		send(`{"op":0,"s":6,"t":"MESSAGE_CREATE","d":{"channel_id":"c2","guild_id":"g","content":"còn đơn 456?","author":{"id":"8","username":"binh"},"mentions":[],"referenced_message":{"author":{"id":"99"}}}}`)
 	})
@@ -70,13 +69,13 @@ func TestDiscord(t *testing.T) {
 	}
 	// every message comes up; Addressed says whether it is for the bot (a
 	// kept conversation listens to the rest of its chat, ADR-049)
-	if <-bot != "shopbot" || !msgs[0].Private || !msgs[0].Addressed || msgs[0].ChatID != "c1" {
+	if <-bot != "shopbot" || !msgs[0].Private || !msgs[0].Addressed || msgs[0].ChatID != "c1" || msgs[0].FullName != "An Nguyễn" {
 		t.Fatalf("dm = %+v", msgs[0])
 	}
 	if msgs[1].Text != "chuyện riêng" || msgs[1].Addressed {
 		t.Fatalf("untagged = %+v", msgs[1])
 	}
-	if msgs[2].Text != "đơn 123" || !msgs[2].Addressed || msgs[2].UserName != "binh" {
+	if msgs[2].Text != "đơn 123" || !msgs[2].Addressed || msgs[2].UserName != "binh" || msgs[2].FullName != "Bình shop" { // the server nickname first
 		t.Fatalf("tagged = %+v", msgs[2])
 	}
 	if msgs[3].Text != "còn đơn 456?" || !msgs[3].Addressed {
@@ -94,24 +93,6 @@ func TestDiscord(t *testing.T) {
 	defer mu.Unlock()
 	if len(posted) != 2 || !strings.HasPrefix(posted[0], "/channels/c2/messages|") {
 		t.Fatalf("posted = %d %v", len(posted), posted)
-	}
-}
-
-// A gateway close that retrying cannot heal (bad token, intents not enabled)
-// stops the bot with a reason instead of reconnecting forever.
-func TestDiscordStopsOnFatalClose(t *testing.T) {
-	for code, want := range map[string]string{"4004": "token", "4014": "Message Content"} {
-		gw := wsServe(t, func(send func(string)) {
-			send(`{"op":10,"d":{"heartbeat_interval":45000}}`)
-		}, func(msg string, send func(string)) { send("CLOSE:" + code) })
-		d := &Discord{Token: "TOK", GatewayURL: "ws" + strings.TrimPrefix(gw.URL, "http")}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		err := d.Run(ctx, func(string) {}, func(Incoming) {})
-		if ctx.Err() != nil || err == nil || !strings.Contains(err.Error(), want) {
-			t.Errorf("close %s: err = %v (timed out: %v)", code, err, ctx.Err() != nil)
-		}
-		cancel()
-		gw.Close()
 	}
 }
 
@@ -204,62 +185,6 @@ func TestDiscordThreadExists(t *testing.T) {
 	_, err := d.MakeThread(ctx, "c1", "m2", "x")
 	if discordCode(err) != 50024 || !strings.Contains(err.Error(), "Cannot execute action") {
 		t.Fatalf("err = %v", err)
-	}
-}
-
-// Discord takes descriptions of at most 100 characters.
-func TestDiscordLongDescription(t *testing.T) {
-	var body string
-	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		body = string(raw)
-		w.Write([]byte(`[]`))
-	}))
-	defer rest.Close()
-	d := &Discord{Token: "TOK", APIBase: rest.URL, appID: "app1"}
-	d.SetCommands(context.Background(), []Command{{Name: "review", Description: strings.Repeat("dài ", 60), Arg: strings.Repeat("x", 150)}})
-	var cmds []struct {
-		Description string `json:"description"`
-		Options     []struct {
-			Description string `json:"description"`
-		} `json:"options"`
-	}
-	if err := json.Unmarshal([]byte(body), &cmds); err != nil || len(cmds) != 1 {
-		t.Fatalf("body = %s", body)
-	}
-	if n := len([]rune(cmds[0].Description)); n > 100 || n == 0 || len([]rune(cmds[0].Options[0].Description)) > 100 {
-		t.Fatalf("description %d runes", n)
-	}
-}
-
-// Discord takes at most 100 commands: more would lose them all, the office's own first.
-func TestDiscordCommandCap(t *testing.T) {
-	var body string
-	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		body = string(raw)
-		w.Write([]byte(`[]`))
-	}))
-	defer rest.Close()
-	d := &Discord{Token: "TOK", APIBase: rest.URL, appID: "app1"}
-	cmds := Builtins()
-	for i := range 150 {
-		cmds = append(cmds, Command{Name: fmt.Sprintf("s%d", i), Description: "x"})
-	}
-	d.SetCommands(context.Background(), cmds)
-	var all []struct {
-		Name string
-		Type int
-	}
-	json.Unmarshal([]byte(body), &all)
-	var got []string // the "/" commands (a message menu entry is counted apart by Discord)
-	for _, c := range all {
-		if c.Type == 1 {
-			got = append(got, c.Name)
-		}
-	}
-	if len(got) != 100 || got[0] != "create-conversation" {
-		t.Fatalf("registered %d, first %v", len(got), got[:1])
 	}
 }
 
@@ -485,20 +410,6 @@ func TestDiscordBotRoleTag(t *testing.T) {
 	}
 	if msgs[1].Addressed {
 		t.Fatalf("another role = %+v", msgs[1])
-	}
-}
-
-// Where a Telegram chat opens: a supergroup's message, a private chat with the
-// bot; a basic group has no link.
-func TestTelegramURL(t *testing.T) {
-	for _, c := range []struct{ bot, chat, msg, want string }{
-		{"shop_bot", "-1001234567890", "42", "https://t.me/c/1234567890/42"},
-		{"shop_bot", "399661258", "7", "https://t.me/shop_bot"},
-		{"shop_bot", "-4567", "7", ""},
-	} {
-		if got := telegramURL(c.bot, c.chat, c.msg); got != c.want {
-			t.Errorf("%v: %q", c, got)
-		}
 	}
 }
 

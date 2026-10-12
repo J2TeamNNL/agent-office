@@ -64,7 +64,7 @@ func TestWorktreeChatEditsThenMerge(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
-	srv := fakeAnthropic(t, "worktree riêng", []map[string]any{
+	srv := fakeAnthropic(t, "your own git worktree", []map[string]any{
 		{"name": "edit_file", "input": map[string]any{"path": "hello.txt", "old": "hello", "new": "xin chào"}},
 		{"name": "write_file", "input": map[string]any{"path": "extra.txt", "content": "sai\n"}},
 	})
@@ -131,7 +131,7 @@ func TestWorktreeChatEditsThenMerge(t *testing.T) {
 }
 
 func TestDirectModeEditsProject(t *testing.T) {
-	srv := fakeAnthropic(t, "trong thư mục project của người dùng", []map[string]any{{"name": "edit_file", "input": map[string]any{"path": "hello.txt", "old": "hello", "new": "chào"}}})
+	srv := fakeAnthropic(t, "in the person's project folder", []map[string]any{{"name": "edit_file", "input": map[string]any{"path": "hello.txt", "old": "hello", "new": "chào"}}})
 	defer srv.Close()
 	f := setup(t, func(provs *provider.Service) storage.Provider {
 		key := "sk-ant-test-key-0000"
@@ -169,7 +169,7 @@ func TestTwoAgentsEditInTheirOwnTrees(t *testing.T) {
 	os.WriteFile(bin, []byte(`#!/bin/sh
 cat >/dev/null
 who=lead
-case "$*" in *"Bạn là Dev"*) who=dev;; esac
+case "$*" in *"You are Dev"*) who=dev;; esac
 printf '%s\n' "$who" > "$who.txt"
 echo '{"type":"system","subtype":"init","session_id":"sess-'$who'"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"'$who' sửa xong","session_id":"sess-'$who'","usage":{"input_tokens":1,"output_tokens":1}}'
@@ -183,13 +183,12 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"'$who' s�
 	gitRun(t, f.dir, "commit", "-q", "-m", "init")
 	f.engine.SetWorktrees(worktree.New(filepath.Join(t.TempDir(), "worktrees")))
 	ctx := actor.With(context.Background(), "human:a@b.c")
-	m, _ := f.st.OrgModels().GetForRepo(ctx, f.project.ID)
 	for _, a := range mustAgents(t, f) { // both may edit, and a person approves every diff
 		a.Permissions = storage.Permissions{Level: perm.Edit, Caps: &[]string{perm.CapPropose}}
 		f.st.Agents().Update(ctx, a)
 	}
 	caps := []string{perm.CapPropose}
-	dev, err := f.st.Agents().Create(ctx, storage.Agent{OrgModelID: m.ID, Key: "dev", Name: "Dev", Tier: storage.TierWorker, ModelTier: "fast",
+	dev, err := f.st.Agents().Create(ctx, storage.Agent{ProjectID: f.project.ID, Key: "dev", Name: "Dev", ModelTier: "fast",
 		Permissions: storage.Permissions{Level: perm.Edit, Caps: &caps}})
 	if err != nil {
 		t.Fatal(err)
@@ -289,7 +288,7 @@ func TestMergeAfterProjectMoved(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
-	srv := fakeAnthropic(t, "worktree riêng", []map[string]any{
+	srv := fakeAnthropic(t, "your own git worktree", []map[string]any{
 		{"name": "edit_file", "input": map[string]any{"path": "hello.txt", "old": "hello", "new": "xin chào"}},
 		{"name": "edit_file", "input": map[string]any{"path": "hello.txt", "old": "thế giới", "new": "bạn"}},
 		{"name": "write_file", "input": map[string]any{"path": "note.txt", "content": "ghi chú\n"}},

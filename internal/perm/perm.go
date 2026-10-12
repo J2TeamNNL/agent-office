@@ -103,6 +103,12 @@ type Policy struct {
 	// WorktreeLinks are more ignored folders to link into worktrees, besides
 	// node_modules/.venv (relative to the project).
 	WorktreeLinks []string `json:"worktree_links"`
+	// QuickCheck: after an agent edits a file, office checks it at once
+	// (gofmt/vet, JSON, YAML) and tells the agent what to fix (ADR-133).
+	QuickCheck bool `json:"quick_check"`
+	// QuickChecks: the project's own quick checks by file ending, one a line
+	// (".ts .vue: npx eslint {file}"), after the built-in ones (ADR-135).
+	QuickChecks string `json:"quick_checks"`
 
 	// Worked out when loaded, not stored:
 	Catalog []string `json:"-"` // every command of the project's packs
@@ -120,7 +126,7 @@ const (
 // DefaultPolicy keeps agents at "propose" and protects secrets.
 func DefaultPolicy() Policy {
 	return Policy{MaxLevel: Operate, Packs: []Pack{},
-		DenyPaths: []string{".env", ".env.*", "**/.env", "**/*.pem", "**/*.key"}, WorktreeLinks: []string{}}
+		DenyPaths: []string{".env", "**/.env.*", "**/.env", "**/*.pem", "**/*.key"}, WorktreeLinks: []string{}, QuickCheck: true}
 }
 
 func policyKey(projectID string) string { return "policy:" + projectID }
@@ -137,6 +143,11 @@ func LoadPolicy(ctx context.Context, st storage.Store, projectID string) Policy 
 	}
 	if p.WorktreeLinks == nil {
 		p.WorktreeLinks = []string{}
+	}
+	for i, pat := range p.DenyPaths {
+		if pat == ".env.*" {
+			p.DenyPaths[i] = "**/.env.*"
+		}
 	}
 	root := ""
 	if r, err := st.Repos().Get(ctx, projectID); err == nil {
@@ -175,11 +186,17 @@ func (p Policy) Denied(files []string) []string {
 }
 
 // matchPath supports shell globs, "**/" for any folder depth, and a trailing
-// "/" for a whole folder.
+// "/" for a whole folder. Compared case-insensitively: a deny-listed file may
+// have been deleted in the diff being checked, so it can't be resolved and
+// stat'd to compare by inode like extra dirs are — and for a deny-list, a
+// false-positive match is far cheaper than a missed one on a case-insensitive
+// filesystem (e.g. "secret.PEM" vs "*.pem" on macOS APFS).
 func matchPath(pat, file string) bool {
 	if pat == "" {
 		return false
 	}
+	pat = strings.ToLower(pat)
+	file = strings.ToLower(file)
 	if strings.HasSuffix(pat, "/") {
 		return strings.HasPrefix(file, pat) || strings.Contains(file, "/"+pat)
 	}

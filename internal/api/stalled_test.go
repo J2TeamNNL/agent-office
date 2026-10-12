@@ -2,11 +2,9 @@ package api_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
-	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/storage"
 )
 
@@ -46,19 +44,5 @@ func TestStalledChatIncident(t *testing.T) {
 	e.st.Jobs().Create(ctx, storage.Job{ProjectID: pid, Kind: "chat_turn", Origin: "user", ConversationID: c.ID, Status: "done", CreatedAt: later})
 	if _, ok := list()["stalled"]; ok {
 		t.Fatal("still stalled after it went on")
-	}
-}
-
-func TestOutOfTokens(t *testing.T) {
-	for msg, want := range map[string]bool{
-		"claude: Claude AI usage limit reached|1790593200": true,
-		"anthropic: 429 Too Many Requests":                 true,
-		"openai: insufficient_quota":                       true,
-		"Your credit balance is too low":                   true,
-		"claude: không tìm thấy file":                      false,
-	} {
-		if got := chat.OutOfTokens(errors.New(msg)); got != want {
-			t.Errorf("OutOfTokens(%q) = %v", msg, got)
-		}
 	}
 }

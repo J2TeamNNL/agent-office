@@ -13,23 +13,23 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/team"
 )
 
 // Service reads agent information from the store.
 type Service struct {
 	store storage.Store
-	org   *orgmodel.Service
+	team  *team.Service
 	loc   *time.Location
 }
 
 // New builds a Service; days are cut in loc.
-func New(store storage.Store, org *orgmodel.Service, loc *time.Location) *Service {
+func New(store storage.Store, tm *team.Service, loc *time.Location) *Service {
 	if loc == nil {
 		loc = time.Local
 	}
-	return &Service{store: store, org: org, loc: loc}
+	return &Service{store: store, team: tm, loc: loc}
 }
 
 // ---- stats ----
@@ -91,8 +91,11 @@ func (s *Service) Stats(ctx context.Context, a storage.Agent, projectID string, 
 	now := time.Now().In(s.loc)
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, s.loc).AddDate(0, 0, -(days - 1))
 	out := Stats{Days: days, PerDay: []DayRow{}, ByModel: []ModelRow{}, TopErrors: []ErrorRow{}}
+	dayIdx := make(map[string]int, days)
 	for d := 0; d < days; d++ {
-		out.PerDay = append(out.PerDay, DayRow{Day: start.AddDate(0, 0, d).Format(time.DateOnly)})
+		day := start.AddDate(0, 0, d).Format(time.DateOnly)
+		out.PerDay = append(out.PerDay, DayRow{Day: day})
+		dayIdx[day] = d
 	}
 	runs, err := s.store.Runs().Since(ctx, start)
 	if err != nil {
@@ -110,7 +113,11 @@ func (s *Service) Stats(ctx context.Context, a storage.Agent, projectID string, 
 			t := r.CreatedAt
 			out.LastRunAt = &t
 		}
-		day := &out.PerDay[min(max(int(r.CreatedAt.In(s.loc).Sub(start).Hours()/24), 0), days-1)]
+		idx, ok := dayIdx[r.CreatedAt.In(s.loc).Format(time.DateOnly)]
+		if !ok {
+			idx = min(max(int(r.CreatedAt.In(s.loc).Sub(start).Hours()/24), 0), days-1)
+		}
+		day := &out.PerDay[idx]
 		if r.Status == "ok" {
 			out.OK++
 			day.OK++
@@ -206,12 +213,12 @@ func percentile(sorted []int64, p float64) int64 {
 // patches are the diffs of the agent's answers and task steps since t.
 func (s *Service) patches(ctx context.Context, a storage.Agent, projectID string, since time.Time) ([]storage.Patch, error) {
 	var out []storage.Patch
-	convs, err := s.store.Chat().ListConversationsFrom(ctx, projectID, "all", 200) // with the bots' chats
+	convs, err := s.store.Chat().ListAgentConversations(ctx, projectID, a.ID, since, 2000)
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range convs {
-		if c.AgentID != a.ID || c.UpdatedAt.Before(since) {
+		if c.AgentID != a.ID { // own chats only, not ones it merely joined
 			continue
 		}
 		ps, err := s.store.Chat().ListPatches(ctx, c.ID)
@@ -224,14 +231,11 @@ func (s *Service) patches(ctx context.Context, a storage.Agent, projectID string
 			}
 		}
 	}
-	tasks, err := s.store.Tasks().List(ctx, projectID, 100)
+	tasks, err := s.store.Tasks().ListByAgentSince(ctx, projectID, a.ID, since)
 	if err != nil {
 		return nil, err
 	}
 	for _, t := range tasks {
-		if t.CreatedAt.Before(since) {
-			continue
-		}
 		steps, err := s.store.Tasks().ListSteps(ctx, t.ID)
 		if err != nil {
 			return nil, err
@@ -279,21 +283,11 @@ type Item struct {
 func (s *Service) Activity(ctx context.Context, a storage.Agent, projectID string, limit int) ([]Item, error) {
 	limit = min(max(limit, 1), 100)
 	out := []Item{}
-	convs, err := s.store.Chat().ListConversationsFrom(ctx, projectID, "all", 200) // with the bots' chats
+	convs, err := s.store.Chat().ListAgentConversations(ctx, projectID, a.ID, time.Time{}, limit)
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range convs {
-		// a place it took part in: its own chat, or one it was pulled into (a member)
-		in := c.AgentID == a.ID
-		if !in {
-			if ms, err := s.store.Chat().Members(ctx, c.ID); err == nil {
-				in = slices.ContainsFunc(ms, func(m storage.ChatMember) bool { return m.AgentID == a.ID })
-			}
-		}
-		if !in {
-			continue
-		}
 		it := Item{Kind: "chat", At: c.UpdatedAt, Title: c.Title, ConversationID: c.ID, Source: chatSource(c)}
 		if said, err := s.answers(ctx, a, c.ID); err == nil {
 			it.Answers = len(said)
@@ -328,14 +322,14 @@ type Entry struct {
 }
 
 // History lists the changes to agent a, newest first. Each snapshot holds
-// the model just before a change; the state after it is the next newer
-// snapshot, or the model as it is now.
+// the project's agents just before a change; the state after it is the next
+// newer snapshot, or the agents as they are now.
 func (s *Service) History(ctx context.Context, a storage.Agent) ([]Entry, error) {
-	revs, err := s.store.Revisions().List(ctx, a.OrgModelID, orgmodel.KeepRevisions)
+	revs, err := s.store.Revisions().List(ctx, a.ProjectID, team.KeepRevisions)
 	if err != nil {
 		return nil, err
 	}
-	current, err := s.store.Agents().List(ctx, a.OrgModelID)
+	current, err := s.store.Agents().List(ctx, a.ProjectID)
 	if err != nil {
 		return nil, err
 	}
@@ -343,11 +337,11 @@ func (s *Service) History(ctx context.Context, a storage.Agent) ([]Entry, error)
 	for _, x := range current {
 		afterKeys[x.Key] = true
 	}
-	after, ok := orgmodel.AgentSpecOf(a), true
+	after, ok := team.SpecOf(a), true
 	key := a.Key
 	out := []Entry{}
 	for _, rev := range revs {
-		t, err := orgmodel.RevisionTemplate(rev)
+		t, err := team.RevisionSnapshot(rev)
 		if err != nil {
 			continue
 		}
@@ -377,16 +371,16 @@ func (s *Service) History(ctx context.Context, a storage.Agent) ([]Entry, error)
 // specByKey finds an agent in a snapshot. When the change renamed its key
 // ("agent.update:<new key>" while the snapshot has the old one), it is the
 // one agent of the snapshot whose key is gone afterwards (afterKeys).
-func specByKey(t orgmodel.Template, key, action string, afterKeys map[string]bool) (orgmodel.AgentSpec, bool) {
+func specByKey(t team.Snapshot, key, action string, afterKeys map[string]bool) (team.AgentSpec, bool) {
 	for _, x := range t.Agents {
 		if x.Key == key {
 			return x, true
 		}
 	}
 	if action != "agent.update:"+key {
-		return orgmodel.AgentSpec{}, false
+		return team.AgentSpec{}, false
 	}
-	var gone []orgmodel.AgentSpec
+	var gone []team.AgentSpec
 	for _, x := range t.Agents {
 		if !afterKeys[x.Key] {
 			gone = append(gone, x)
@@ -395,29 +389,27 @@ func specByKey(t orgmodel.Template, key, action string, afterKeys map[string]boo
 	if len(gone) == 1 {
 		return gone[0], true
 	}
-	return orgmodel.AgentSpec{}, false
+	return team.AgentSpec{}, false
 }
 
 var fields = []struct {
 	name string
-	get  func(orgmodel.AgentSpec) any
+	get  func(team.AgentSpec) any
 }{
-	{"name", func(x orgmodel.AgentSpec) any { return x.Name }},
-	{"key", func(x orgmodel.AgentSpec) any { return x.Key }},
-	{"tier", func(x orgmodel.AgentSpec) any { return x.Tier }},
-	{"role", func(x orgmodel.AgentSpec) any { return x.Role }},
-	{"description", func(x orgmodel.AgentSpec) any { return x.Description }},
-	{"reports_to", func(x orgmodel.AgentSpec) any { return nonNil(x.ReportsTo) }},
-	{"provider_id", func(x orgmodel.AgentSpec) any { return x.ProviderID }},
-	{"fallback_provider_ids", func(x orgmodel.AgentSpec) any { return nonNil(x.Fallbacks) }},
-	{"model_tier", func(x orgmodel.AgentSpec) any { return x.ModelTier }},
-	{"llm_model", func(x orgmodel.AgentSpec) any { return x.LLMModel }},
-	{"effort", func(x orgmodel.AgentSpec) any { return x.Effort }},
-	{"instructions", func(x orgmodel.AgentSpec) any { return x.Instructions }},
-	{"permissions", func(x orgmodel.AgentSpec) any { return permView(x.Permissions) }},
+	{"name", func(x team.AgentSpec) any { return x.Name }},
+	{"key", func(x team.AgentSpec) any { return x.Key }},
+	{"role", func(x team.AgentSpec) any { return x.Role }},
+	{"description", func(x team.AgentSpec) any { return x.Description }},
+	{"provider_id", func(x team.AgentSpec) any { return x.ProviderID }},
+	{"fallback_provider_ids", func(x team.AgentSpec) any { return nonNil(x.Fallbacks) }},
+	{"model_tier", func(x team.AgentSpec) any { return x.ModelTier }},
+	{"llm_model", func(x team.AgentSpec) any { return x.LLMModel }},
+	{"effort", func(x team.AgentSpec) any { return x.Effort }},
+	{"instructions", func(x team.AgentSpec) any { return x.Instructions }},
+	{"permissions", func(x team.AgentSpec) any { return permView(x.Permissions) }},
 }
 
-func diff(before, after orgmodel.AgentSpec) []Change {
+func diff(before, after team.AgentSpec) []Change {
 	out := []Change{}
 	for _, f := range fields {
 		b, a := f.get(before), f.get(after)
@@ -466,11 +458,12 @@ var ErrNoBefore = errors.New("lần này tạo agent nên không có bản trư�
 // Restore puts agent a back to how it was just before the change stored in
 // revisionID (its id and key stay). Saving snapshots first, so it can be undone.
 func (s *Service) Restore(ctx context.Context, a storage.Agent, revisionID string) (storage.Agent, error) {
+	old := a
 	rev, err := s.store.Revisions().Get(ctx, revisionID)
 	if err != nil {
 		return a, err
 	}
-	if rev.OrgModelID != a.OrgModelID {
+	if rev.ProjectID != a.ProjectID {
 		return a, storage.ErrNotFound
 	}
 	hist, err := s.History(ctx, a)
@@ -493,11 +486,11 @@ func (s *Service) Restore(ctx context.Context, a storage.Agent, revisionID strin
 	if !known {
 		return a, ErrNoBefore
 	}
-	t, err := orgmodel.RevisionTemplate(rev)
+	t, err := team.RevisionSnapshot(rev)
 	if err != nil {
 		return a, err
 	}
-	var spec orgmodel.AgentSpec
+	var spec team.AgentSpec
 	found := false
 	for _, x := range t.Agents {
 		if x.Key == key {
@@ -507,13 +500,13 @@ func (s *Service) Restore(ctx context.Context, a storage.Agent, revisionID strin
 	if !found {
 		return a, ErrNoBefore
 	}
-	a.Name, a.Tier, a.Role, a.Description, a.ReportsTo = spec.Name, spec.Tier, spec.Role, spec.Description, spec.ReportsTo
+	a.Name, a.Role, a.Description = spec.Name, spec.Role, spec.Description
 	a.ModelTier, a.LLMModel, a.Instructions, a.Permissions = spec.ModelTier, spec.LLMModel, spec.Instructions, spec.Permissions
 	if storage.ValidEffort(spec.Effort) {
 		a.Effort = spec.Effort
 	}
 	// ADR-074 security: restoring a snapshot never turns full access back on
-	// — only internal/api/org.go's applyAgent (admin only) may.
+	// — only the admin's agent edit (internal/api/org.go applyAgent) may.
 	a.Permissions.FullAccess, a.Permissions.FullAccessBy, a.Permissions.ExtraDirs = false, "", nil
 	if spec.ProviderID == "" {
 		a.ProviderID = ""
@@ -521,12 +514,14 @@ func (s *Service) Restore(ctx context.Context, a storage.Agent, revisionID strin
 		a.ProviderID = spec.ProviderID
 	}
 	a.FallbackProviderIDs = nil // a deleted connection in the list is skipped when it runs
-	for _, id := range spec.Fallbacks {
-		if _, err := s.store.Providers().Get(ctx, id); err == nil {
-			a.FallbackProviderIDs = append(a.FallbackProviderIDs, id)
+	for _, entry := range spec.Fallbacks {
+		if id, _ := storage.SplitFallback(entry); id != "" {
+			if _, err := s.store.Providers().Get(ctx, id); err == nil {
+				a.FallbackProviderIDs = append(a.FallbackProviderIDs, entry)
+			}
 		}
 	}
-	return s.org.SaveAgent(ctx, a)
+	return s.team.SaveAgent(ctx, a, old)
 }
 
 // chatSource is where a chat started: a bot (discord, telegram), an automation, or the web.
@@ -549,7 +544,7 @@ func (s *Service) answers(ctx context.Context, a storage.Agent, conversationID s
 	}
 	var out []storage.Message
 	for _, m := range msgs {
-		if m.Role == "assistant" && m.Author == a.Name {
+		if m.Role == "assistant" && m.AgentID == a.ID {
 			out = append(out, m)
 		}
 	}

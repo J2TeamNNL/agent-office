@@ -48,7 +48,7 @@ async function save() {
     await $fetch(`/api/agents/${a.id}`, {
       method: 'PATCH',
       body: {
-        key: a.key, name: a.name, tier: a.tier, role: a.role, description: a.description, reports_to: a.reports_to ?? [],
+        key: a.key, name: a.name, role: a.role, description: a.description,
         provider_id: form.provider_id, fallback_provider_ids: form.fallback_provider_ids.filter(id => id !== chosen.value?.id), model_tier: form.model_tier, llm_model: form.llm_model.trim(), instructions: a.instructions, permissions: a.permissions
       }
     })
@@ -90,7 +90,7 @@ async function save() {
             <option v-for="m in chosen?.models ?? []" :key="m" :value="m" />
           </datalist>
         </UFormField>
-        <FallbackPicker v-model="form.fallback_provider_ids" :providers="providers" :main-id="chosen?.id" />
+        <FallbackPicker v-model="form.fallback_provider_ids" :providers="providers" :main-id="chosen?.id" :tier="form.model_tier" />
 
       </div>
     </template>

@@ -42,11 +42,7 @@ func agentIDByName(ctx context.Context, st storage.Store, projectID, name string
 	if projectID == "" || name == "" {
 		return ""
 	}
-	model, err := st.OrgModels().GetForRepo(ctx, projectID)
-	if err != nil {
-		return ""
-	}
-	agents, err := st.Agents().List(ctx, model.ID)
+	agents, err := st.Agents().List(ctx, projectID)
 	if err != nil {
 		return ""
 	}
@@ -67,7 +63,7 @@ func gatewayIdentify(st storage.Store, mcp *mcpserver.Server) func(r *http.Reque
 			return mcpgateway.Caller{}, false
 		}
 		kind := r.Header.Get(chat.ClientHeader)
-		if kind != "codex" {
+		if kind != "codex" && kind != "gemini" && kind != "antigravity" {
 			kind = "claude"
 		}
 		return gatewayCaller(r.Context(), st, sc, kind), true

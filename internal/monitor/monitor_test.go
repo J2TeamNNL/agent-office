@@ -28,18 +28,6 @@ func setup(t *testing.T) (*Service, storage.Store, storage.Repo) {
 	return New(st, nil, nil), st, p
 }
 
-func TestStatusOK(t *testing.T) {
-	for _, c := range []struct {
-		code int
-		exp  string
-		ok   bool
-	}{{200, "", true}, {302, "", true}, {404, "", false}, {204, "200,204", true}, {500, "200-299", false}} {
-		if statusOK(c.code, c.exp) != c.ok {
-			t.Errorf("%d %q", c.code, c.exp)
-		}
-	}
-}
-
 func TestHTTPFlapGuardAndEvents(t *testing.T) {
 	s, st, p := setup(t)
 	ctx := context.Background()

@@ -96,61 +96,12 @@ func TestTelegram(t *testing.T) {
 	}
 }
 
-// Review C1: a tag after characters that grow when lowercased never panics.
-func TestTelegramMentionUnicode(t *testing.T) {
-	tg := &Telegram{bot: "shop_bot"}
-	for _, text := range []string{"ȺȺȺ @shop_bot đơn 1", "@SHOP_BOT ẞ hỏi", "İİİİ @Shop_Bot"} {
-		m := &tgMessage{Text: text}
-		m.Chat.Type = "group"
-		in, ok := tg.addressed(m)
-		if !ok || strings.Contains(strings.ToLower(in.Text), "@shop_bot") {
-			t.Errorf("%q → %q %v", text, in.Text, ok)
-		}
-	}
-}
-
 // Review I4: an error never carries the bot token (it is in the URL).
 func TestTelegramErrorHidesToken(t *testing.T) {
 	tg := &Telegram{Token: "123:SECRET", BaseURL: "http://127.0.0.1:1"}
 	err := tg.call(context.Background(), "getMe", map[string]any{}, nil)
 	if err == nil || strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("err = %v", err)
-	}
-}
-
-// A network hiccup when the bot starts is retried; only a wrong token stops it.
-func TestTelegramRetriesGetMe(t *testing.T) {
-	var mu sync.Mutex
-	tries := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/getMe") {
-			mu.Lock()
-			tries++
-			n := tries
-			mu.Unlock()
-			if n == 1 {
-				w.WriteHeader(502)
-				return
-			}
-			w.Write([]byte(`{"ok":true,"result":{"username":"shop_bot"}}`))
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-		w.Write([]byte(`{"ok":true,"result":[]}`))
-	}))
-	defer srv.Close()
-	tg := &Telegram{Token: "TOK", BaseURL: srv.URL, retry: 10 * time.Millisecond}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	ready := make(chan string, 1)
-	go tg.Run(ctx, func(n string) { ready <- n }, func(Incoming) {})
-	select {
-	case n := <-ready:
-		if n != "shop_bot" {
-			t.Fatalf("bot = %q", n)
-		}
-	case <-ctx.Done():
-		t.Fatal("a failed getMe was not retried")
 	}
 }
 

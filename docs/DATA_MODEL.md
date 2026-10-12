@@ -284,6 +284,7 @@ Index `(day, agent_id)`, `(incident_id)`. View `cost_daily` group theo `day, age
 | role | text | `admin` \| `member` |
 | password_hash | text | argon2id encoded |
 | disabled | bool | |
+| discord_id, telegram_id | text | user ID trên nền tảng bot ('' = chưa gắn); một ID một tài khoản. Tin gửi bot từ ID đó hiện tên tài khoản (`messages.sender`) |
 | created_at, updated_at, last_login_at | ts | |
 
 ### `sessions`
@@ -300,12 +301,13 @@ Index `(day, agent_id)`, `(incident_id)`. View `cost_daily` group theo `day, age
 |---|---|---|
 | id | text PK | `prv_<ulid>` |
 | name | text unique | |
-| kind | text | `anthropic` \| `openai` \| `openai_compatible` \| `claude_cli` \| `codex_cli` |
+| kind | text | `anthropic` \| `openai` \| `openai_compatible` \| `claude_cli` \| `codex_cli` \| `gemini_cli` \| `antigravity_cli` (không còn CHECK, Go kiểm tra) |
 | base_url | text | URL API, hoặc đường dẫn binary với CLI |
 | api_key_enc | text | AES-256-GCM, không bao giờ trả qua API |
 | api_key_env | text | đọc key từ biến môi trường này |
 | api_key_hint | text | 4 ký tự cuối |
 | tier_models | json | `{strong, balanced, fast}` |
+| limit_caps | json | `{five_hour, seven_day}` → % dừng nhận lượt mới (ADR-136) |
 | models | json | danh sách model lần kiểm tra cuối |
 | is_default, enabled | bool | |
 | status, status_detail, checked_at | text, text, ts | `unknown` \| `ok` \| `error` |
@@ -317,36 +319,32 @@ Index `(day, agent_id)`, `(incident_id)`. View `cost_daily` group theo `day, age
 | name, description | text | tự nhận từ package.json, composer.json, go.mod |
 | path | text unique | đường dẫn tuyệt đối trên máy chạy office |
 | git_remote | text | đã bỏ thông tin đăng nhập trong URL |
-
-### `org_models`
-| Cột | Kiểu | Ghi chú |
-|---|---|---|
-| id | text PK | `org_<ulid>` |
-| repo_id | text FK null | null = mẫu trong thư viện; cascade khi xóa repo |
-| source_template_id | text FK null | mẫu gốc khi áp vào repo |
-| key | text | unique trong thư viện |
-| name, description | text | |
-| kind | text | `solo` \| `team` \| `council` \| `custom` |
-| governance | json | `{mode: single|hierarchy|council, quorum, veto[], notes}` |
-| builtin | bool | mẫu có sẵn, chỉ khôi phục không xóa |
-
-Unique: `key` khi `repo_id IS NULL`; `repo_id` khi khác null (một mô hình mỗi repo).
+| default_agent_id | text | agent trả lời khi không ai được gọi tên ('' = agent đầu tiên đang bật) — ADR-099 |
 
 ### `agents`
 | Cột | Kiểu | Ghi chú |
 |---|---|---|
 | id | text PK | `agt_<ulid>` |
-| org_model_id | text FK | cascade |
-| key | text | unique trong mô hình |
+| project_id | text FK | `repos.id`, cascade (ADR-099; trước là `org_model_id`) |
+| key | text | unique trong project |
 | name, role, description | text | |
-| tier | text | `lead` \| `manager` \| `worker` |
-| reports_to | json | key của cấp trên trong cùng mô hình |
 | provider_id | text FK null | null = kết nối mặc định; set null khi xóa kết nối |
+| fallback_provider_ids | json | kết nối thử tiếp theo thứ tự |
 | model_tier | text | `strong` \| `balanced` \| `fast` |
-| llm_model | text | model cụ thể, ghi đè hạng |
+| llm_model, effort | text | model cụ thể (ghi đè hạng), mức suy nghĩ |
 | instructions | text | system prompt riêng |
-| permissions | json | `{read_only, requires_approval, tools[]}` |
+| permissions | json | gói quyền, caps, lệnh, `full_access` (ADR-074) |
+| avatar | json | |
+| enabled | bool | false = tạm dừng |
 | sort | int | |
+
+### `revisions`
+Ảnh chụp agent của một project trước mỗi thay đổi (giữ 50): `project_id`, `action`, `actor`, `agent_count`, `snapshot` (`{default, agents[]}`).
+
+### `workflows` / `workflow_runs` (ADR-098)
+`workflows`: bản quy trình của project: `project_id`, `key` (unique trong project), `name`, `description`, `source` (cả file), `source_key`/`source_hash` (mẫu thư viện đã chép), `bindings` (vai → agent_id), `enabled`.
+
+`workflow_runs`: một lần chạy: `project_id`, `conversation_id` (chat riêng của lần chạy, ADR-101), `caller_conversation_id` (chat đã gọi; '' = lần chạy cũ), `parent_run_id`, `depth` (quy trình con, ADR-102), `outputs` (đầu ra theo key, ADR-103), `workflow_id`, `workflow_key`, `coordinator_id`, `input`, `status` (`running` \| `done` \| `failed` \| `stopped`), `turns`, `cost_usd`, `roles` (json: vai, agent, phiên, round, trạng thái, chi phí), `gates`, `log`, `result`, `error`, `started_at`, `finished_at`.
 
 ### `audit_log`
 
@@ -363,9 +361,13 @@ Append-only. Không có API update/delete.
 
 ### `burn_sessions` / `burn_items` (ADR-087)
 
-Mỗi project có một phiên Burn (`project_id` UNIQUE): `conversation_id` (chat `purpose = burn`), `agent_id`, `model_tier`, `max_subagents`, `result_mode` (`branch` | `patch`), `focus`, `ends_at` (null = không hẹn), `state` (`running` | `stopped` | `waiting_limit`), `waiting_until`, `started_by`.
+Mỗi project có một phiên Burn (`project_id` UNIQUE): `conversation_id` (chat `purpose = burn`), `agent_id`, `model_tier`, `max_parallel` (số việc làm cùng lúc, ADR-117), `run_branch` (nhánh `burn/<ngày-giờ>` của lần chạy, worktree `burn-run-<ngày-giờ>` nằm trên nó, ADR-123; cột `result_mode` cũ không còn đọc), `focus`, `ends_at` (null = không hẹn), `state` (`running` | `stopped` | `waiting_limit` | `draining`: làm nốt việc dở rồi tắt, ADR-118), `waiting_until`, `started_by`, `scanned` (vùng các lượt quét đã xem, ADR-116), `code_map` (bản đồ code lượt quét giữ cho lượt sau và worker, chỉ ghi qua `SetCodeMap`, ADR-130), `verify` (lệnh kiểm chứng, mỗi dòng một lệnh; rỗng: tự đoán), `lessons` (sổ bài học, chỉ ghi qua `SetLessons`, ADR-131), `review_cap`, `stop_after` (chờ review khi đủ N việc chưa merge, tắt sau N việc xong; 0: không giới hạn, ADR-135), `notify_channel_id` + `notify_chat_id` (bot và chat nhận tổng kết khi dừng, ADR-120), `run_plan` (JSON: chạy tới đâu mỗi lần bật, lịch tự bật; ADR-149).
 
-Việc của phiên: `title`, `kind` (`unfinished` | `upgrade` | `bug`), `detail`, `status` (`found` | `queued` | `doing` | `paused` | `done` | `failed` | `skipped`), `priority`, `branch`, `worktree`, `summary`, `subagents`, `cost_usd`.
+Việc của phiên: `title`, `kind` (`unfinished` | `upgrade` | `bug` | `idea`; `quest`: người dùng giao, ADR-129; rỗng: một lượt quét, ADR-130), `detail`, `status` (`found` | `queued` | `doing` | `paused` | `done` | `failed` | `skipped`), `priority`, `branch`, `worktree`, `summary`, `subagents`, `cost_usd`, `work_conversation_id` (chat làm việc ẩn, `purpose = burn_work`, ADR-116), `run_branch` (lần chạy của việc; rỗng: quest chưa làm, ADR-129), `files` (file việc đã đổi, lấy lúc gộp, ADR-131).
+
+### `chat_queued` (ADR-119)
+
+Tin nhắn viết trong lúc chat đang trả lời: `conversation_id` (xóa theo chat), `author`, `text`, `attachments` (JSON tham chiếu file), `context` (trang đang mở), `options` (JSON `mode`, `edit_mode`, `agent_id`, `effort` áp khi gửi), `created_at`. Chat rảnh thì office gửi cả hàng thành một tin rồi xóa.
 
 ## Khác biệt SQLite / Postgres
 

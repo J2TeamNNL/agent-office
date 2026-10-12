@@ -9,21 +9,24 @@ Dự án thật (`dashboard/app/pages/`) là projects-based, không phải sơ �
 | Route | Màn hình | Nội dung chính | Hành động |
 |---|---|---|---|
 | `/` | Tổng quan | 3 tab qua `?tab=`: **Việc** (mặc định — cần xử lý mọi project trừ Trợ lý office, việc gần đây, badge đếm trên sidebar), **Thống kê** (chi phí/lượt chạy theo ngày · project · model, 7/30/90 ngày — ADR-060), **Máy** (admin: trạng thái máy, kết nối AI, bước thiết lập ban đầu) | |
-| `/projects` | Danh sách project | Project đang quản lý (ADR-017: có thư mục, clone git, hoặc không thư mục — toàn máy) | Thêm project (chọn mẫu mô hình tổ chức) |
-| `/projects/:id?tab=…` | Project | Thanh tiêu đề gọn (menu `⋯` sửa tên/mô tả, thiết lập AI, đổi mô hình), 1 dòng thông tin (đường dẫn · git · mô tả rút gọn). Tab: **Chat**, **Tự động hoá** (lịch/webhook/bot), **Vận hành** (Tiến trình · Container · Giám sát), **Mô hình** (sơ đồ agent), **Quyền** (lệnh, file cấm sửa); chỉ admin thấy thêm: **Files**, **Skill**, **MCP**, **Burn**, **Nhật ký sửa**; và **Thông tin** (budget, git, mô tả) | tuỳ tab |
-| `/projects/:id/setup` | Thiết lập AI | Quét project, đọc agent có sẵn, đề xuất mô hình tổ chức + tinh chỉnh agent (ADR-018) | Tạo / Chỉnh / Hủy |
+| `/projects` | Danh sách project | Project đang quản lý (ADR-017: có thư mục, clone git, hoặc không thư mục — toàn máy) | Thêm project (chọn gói khởi tạo — ADR-099) |
+| `/projects/:id?tab=…` | Project | Thanh tiêu đề gọn (menu `⋯` sửa tên/mô tả, thiết lập AI), 1 dòng thông tin (đường dẫn · git · mô tả rút gọn). Tab: **Chat**, **Tự động hoá** (lịch/webhook/bot), **Vận hành** (Tiến trình · Container · Giám sát), **Agent** (danh sách agent, agent mặc định, tạm dừng, lịch sử, xuất, áp gói — ADR-099), **Quy trình** (cài từ thư viện, gán vai, bật/tắt, sửa — ADR-098; mục Lần chạy — ADR-101), **Quyền** (lệnh, file cấm sửa); chỉ admin thấy thêm: **Files**, **Skill**, **MCP**, **Burn**, **Nhật ký sửa**; và **Thông tin** (budget, git, mô tả) | tuỳ tab |
+| `/projects/:id/setup` | Thiết lập AI | Quét project, đọc agent có sẵn, đề xuất gói khởi tạo + tinh chỉnh agent (ADR-018) | Tạo / Chỉnh / Hủy |
 | `/projects/:id/agents/:agentId` | Agent | Số liệu (lượt chạy, chi phí, tỉ lệ lỗi theo ngày/model), việc + chat gần đây, lịch sử sửa cấu hình (khôi phục được) | Sửa cấu hình, từng thẻ tự lưu |
 | `/projects/:id/automations/new`, `/automations/:aid`, `/automations/:aid/edit` | Tự động hoá | Tạo/sửa 1 automation (lịch, webhook, điều kiện, script hoặc chat); xem 1 cái: trạng thái, bật/tắt, Việc đã chạy | Chạy thử, sửa, xoá, copy URL webhook |
 | `/projects/:id/bots/new`, `/bots/:bid`, `/bots/:bid/edit` | Bot (Discord/Telegram) | Kết nối bot (ADR-049), trạng thái, thiết lập chung của các lệnh và kiểu trả lời (ADR-097), danh sách lệnh (mỗi lệnh là 1 automation riêng; Nâng cao → thiết lập riêng), Việc đã chạy | Kết nối/ngắt, thêm/sửa lệnh |
 | `/projects/:id/skills/edit?name=&scope=` | Soạn skill | Soạn skill của project hoặc riêng máy (`?scope=user`) bằng chat có theo dõi (ADR-062) | Lưu |
-| `/library` (admin) | Thư viện | Skills / MCP servers: **Đã cài** (mọi nơi trên máy, nhóm theo nơi cài), **Thư viện**, MCP **Phổ biến**, **Tìm MCP** | Xem, cài vào nơi khác, lưu vào thư viện, gỡ, tạo và sửa |
-| `/templates`, `/templates/new`, `/templates/:id` | Mẫu mô hình tổ chức | Danh sách mẫu (3 mẫu có sẵn + mẫu tự lưu từ project), tạo mới, sửa 1 mẫu | Tạo / Sửa / Xoá / Export |
+| `/skills`, `/mcp` (admin) | Skills, MCP servers | Hai mục riêng trên sidebar (`/library` cũ tự chuyển): **Đã cài** (mọi nơi trên máy, nhóm theo nơi cài), **Thư viện**, MCP **Phổ biến**, **Tìm MCP** | Xem, cài vào nơi khác, lưu vào thư viện, gỡ, tạo và sửa |
+| `/workflows` (admin) | Thư viện quy trình | Quy trình dùng chung (có sẵn, đã sửa, tự tạo), lỗi nếu file sai (ADR-098) | Tạo / Sửa / Khôi phục / Xoá |
+| `/projects/:id/workflows/runs/:runId` | Lần chạy quy trình | Chat đã gọi, đầu vào, đầu ra, vai/cổng/chi phí, nội dung (chat riêng của lần chạy, chỉ xem) — ADR-101 | Dừng, duyệt cổng |
+| `/projects/:id/burn/reviews` | Hồ sơ review của Burn (admin) | Danh sách hồ sơ; mỗi hồ sơ: tên, từng bước (vấn đề, cách làm, kết quả) bật/tắt kèm agent và quy trình review riêng — ADR-113 | Tạo, lưu, xóa |
+| `/workflows/edit?key=`, `/projects/:id/workflows/edit?w=` | Soạn quy trình | Canvas kéo thả (bước, agent, quy trình con; form điền phần thiếu, Đầu vào/Đầu ra — ADR-108), văn bản, và chat (`purpose=workflow`, nút ở góc mở khung bên phải như chat hỗ trợ, không chặn thao tác trên canvas; tab văn bản trên desktop thì chat mở sẵn, chia đôi màn hình); ba cách cùng sửa một file | Lưu |
 | `/jobs` | Job | Mọi lượt chạy (chat, Việc, automation) của mọi project: trạng thái, lọc theo project, lỗi 24h, chi phí 24h | |
 | `/providers` | Kết nối AI | Danh sách kết nối (Anthropic, OpenAI, API tương thích, CLI…), gửi thử, thống kê theo kết nối | Thêm / Sửa / Xoá / Đặt mặc định |
 | `/watch` | Theo dõi | Nhiều khung chat của các project cạnh nhau, chia dọc/ngang, lưu trong trình duyệt (không đồng bộ máy khác) | Thêm/xoá khung |
 | `/assistant` | Trợ lý office | Chat với trợ lý office (project ảo, không gắn thư mục, dùng để quản lý chính office) | |
 | `/account` | Tài khoản | Đổi tên/mật khẩu, ngôn ngữ, giao diện sáng/tối, cài CLI | |
-| `/admin/users` (admin) | Người dùng | Danh sách tài khoản, tạo, đặt lại mật khẩu, bật/tắt (tắt thu hồi session) | |
+| `/admin/users` (admin) | Người dùng | Danh sách tài khoản, tạo, đặt lại mật khẩu, gắn Discord/Telegram ID (tin gửi bot từ ID đó hiện tên tài khoản; chỉ nhận diện, không cấp quyền), bật/tắt (tắt thu hồi session) | |
 | `/admin/audit` (admin) | Nhật ký thao tác | Lịch sử thay đổi cấu hình/quyền toàn máy | |
 | `/admin/transfer` (admin) | Chuyển máy | Export/import toàn bộ cấu hình (backup sang máy khác) | |
 | `/admin/update` (admin) | Cập nhật office | Build lại từ mã nguồn, xem log trực tiếp, tự quay về bản cũ nếu lỗi | Cập nhật, kiểm tra có bản mới |
@@ -31,14 +34,14 @@ Dự án thật (`dashboard/app/pages/`) là projects-based, không phải sơ �
 
 `/costs` và `/incidents` đã bỏ, gộp vào Tổng quan (`/`): biểu đồ chi phí + danh sách cần xử lý (ADR-060, ADR-051); hai đường dẫn cũ chuyển hướng về `/`. Không có trang `/setup` (chỉ `/projects/:id/setup`), `/agents/:id` (thay bằng `/projects/:id/agents/:agentId`), `/blackboard`, hay `/ask` — đó là thiết kế sơ khai ban đầu, chưa từng lên app thật.
 
-Sidebar 4 nhóm (xem `dashboard/app/layouts/default.vue`): **Project** (5 project mở nhiều nhất gần đây — đếm trong localStorage, mỗi project mở rộng ra các tab con; "Tất cả project" mở `/projects`); **Làm việc** (Trợ lý office, Theo dõi, Tổng quan có badge đếm, Job); **Cài đặt** (Kết nối AI, Mẫu mô hình tổ chức, Thư viện — chỉ admin); **Admin** (Người dùng, Nhật ký, Chuyển máy, Cập nhật).
+Sidebar 4 nhóm (xem `dashboard/app/layouts/default.vue`): **Project** (5 project mở nhiều nhất gần đây — đếm trong localStorage, mỗi project mở rộng ra các tab con; "Tất cả project" mở `/projects`); **Làm việc** (Trợ lý office, Theo dõi, Tổng quan có badge đếm, Job); **Cài đặt** (Kết nối AI, Skills, MCP servers, Quy trình — chỉ admin); **Admin** (Người dùng, Nhật ký, Chuyển máy, Cập nhật).
 
 ## Luồng người dùng
 
 **Lần đầu (thêm project).**
 1. Mở `/projects`, thêm project (thư mục có sẵn, clone git, hoặc không thư mục — toàn máy, ADR-017).
 2. Vào `/projects/:id/setup`. Chưa có kết nối AI sẵn sàng thì nối trước ở `/providers`.
-3. `POST /api/projects/:id/setup/scan` quét project, rồi `POST /api/projects/:id/setup/propose` đề xuất mô hình tổ chức + tinh chỉnh agent (gọi LLM, kèm `reason` và ước tính chi phí) — ADR-018.
+3. `POST /api/projects/:id/setup/scan` quét project, rồi `POST /api/projects/:id/setup/propose` đề xuất gói khởi tạo + tinh chỉnh agent (gọi LLM, kèm `reason` và ước tính chi phí) — ADR-018.
 4. Đổi mẫu/lựa chọn thì gọi lại `POST /api/projects/:id/setup/build` để xem preview mới. Bấm Tạo gọi `POST /api/projects/:id/setup/apply`.
 5. Chuyển vào `/projects/:id`, thấy Chat/Việc/Tự động hoá của project.
 
@@ -231,7 +234,7 @@ Dashboard mặc định chạy ở cổng **2704** (`make dev-ui`, `make ui-star
 | Method | Path | Mô tả |
 |---|---|---|
 | POST | `/api/projects/:id/setup/scan` | Quét tĩnh |
-| POST | `/api/projects/:id/setup/propose` | Đề xuất mô hình tổ chức (gọi LLM) |
+| POST | `/api/projects/:id/setup/propose` | Đề xuất gói khởi tạo (gọi LLM) |
 | POST | `/api/projects/:id/setup/build` | Dựng lại preview khi đổi lựa chọn |
 | POST | `/api/projects/:id/setup/apply` | Áp dụng |
 
@@ -248,10 +251,13 @@ Dashboard mặc định chạy ở cổng **2704** (`make dev-ui`, `make ui-star
 
 | Method | Path | Mô tả |
 |---|---|---|
-| GET/PUT | `/api/projects/:id/burn` | phiên + việc / lưu cài đặt |
-| POST | `/api/projects/:id/burn/start` | cài đặt kèm `ends_at?`, `no_end?`; mặc định tắt lúc reset hạn mức tuần, không có thì sau 8 giờ |
+| GET/PUT | `/api/projects/:id/burn` | phiên + việc / lưu cài đặt (kể cả `review_profile_id` — ADR-113) |
+| POST | `/api/projects/:id/burn/start` | bật theo `plan` đã lưu (ADR-149); `ends_at?`/`no_end?` gửi kèm thì theo đó |
 | POST | `/api/projects/:id/burn/stop` | tắt, việc đang làm thành tạm dừng |
+| POST | `/api/projects/:id/burn/quests` | thêm quest {title, detail}: vào Tìm thấy, làm trước việc quét được (ADR-129) |
 | POST | `/api/burn-items/:item/skip\|first\|drop-worktree` | thao tác trên một việc |
+| GET/POST | `/api/projects/:id/burn/review-profiles` | hồ sơ review (ADR-113) / tạo |
+| PUT/DELETE | `/api/burn-review-profiles/:profile` | sửa / xóa hồ sơ (Burn đang chạy theo thì 409) |
 
 ### Realtime (SSE, ADR-072, ADR-078)
 Một kết nối `GET /api/events` mỗi tab. Event đầu tiên là `hello {sid}`.

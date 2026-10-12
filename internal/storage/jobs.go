@@ -49,12 +49,17 @@ type Job struct {
 
 // JobFilter narrows a job listing; empty fields match everything.
 type JobFilter struct {
-	ProjectID string
-	Kind      string
-	Origin    string
-	OriginID  string
-	OriginIDs []string // any of these (a bot: its commands, and itself)
-	TaskID    string
+	ProjectID        string
+	ExcludeProjectID string // omit this project's jobs (the office assistant's own)
+	// HideOthersIn: an assistant-chat project whose jobs are hidden unless
+	// CreatedBy is Me (ADR-046: an assistant chat is its creator's alone).
+	HideOthersIn string
+	Me           string
+	Kind         string
+	Origin       string
+	OriginID     string
+	OriginIDs    []string // any of these (a bot: its commands, and itself)
+	TaskID       string
 	// ConversationID: a chat's jobs (its turns)
 	ConversationID string
 	Source         string // web | discord | telegram | auto (where it came from)
@@ -84,10 +89,25 @@ type JobRepo interface {
 	Get(ctx context.Context, id string) (Job, error)
 	// Update saves status, links, error, payload and queue times.
 	Update(ctx context.Context, j Job) error
+	// StartIfRunning stamps an automation job as this chat turn (conversation,
+	// agent, title, started_at) but only while it is still "running";
+	// ErrConflict when a cancel already moved it elsewhere (e.g. "cancelled")
+	// so the caller must not overwrite that.
+	StartIfRunning(ctx context.Context, id, conversationID, agentID, title string, startedAt time.Time) (Job, error)
 	// Finish ends a job; cost, tokens and duration come from its model calls.
 	Finish(ctx context.Context, id, status, errCode, errMsg string, at time.Time) (Job, error)
-	// Claim marks up to limit due pending jobs running, skipping busy origins.
-	Claim(ctx context.Context, now time.Time, limit int, busy []string) ([]Job, error)
+	// FinishIfRunning is Finish, but only applies when the job is still
+	// running; ErrConflict when it already ended (e.g. a cancel racing the
+	// job's own completion).
+	FinishIfRunning(ctx context.Context, id, status, errCode, errMsg string, at time.Time) (Job, error)
+	// FinishIfPending is Finish, but only applies when the job is still
+	// pending; ErrConflict when it already started (e.g. a cancel racing
+	// Claim/StartReady).
+	FinishIfPending(ctx context.Context, id, status, errCode, errMsg string, at time.Time) (Job, error)
+	// Claim marks up to limit due pending jobs running. remaining is, for an
+	// origin with jobs already running, how many more of it may run now
+	// (0 = none); an origin missing from it has nothing running yet.
+	Claim(ctx context.Context, now time.Time, limit int, remaining map[string]int) ([]Job, error)
 	List(ctx context.Context, f JobFilter) ([]Job, error)
 	// Active counts pending and running jobs of an origin.
 	Active(ctx context.Context, origin, originID string) (int, error)
@@ -107,6 +127,10 @@ type JobRepo interface {
 	CostSince(ctx context.Context, origin, originID string, since time.Time) (float64, error)
 	// SetOutput stores what a script printed and how it exited.
 	SetOutput(ctx context.Context, id, output string, exitCode int) error
+	// SetMessageID links a job to the chat message its answer became; touches
+	// only that column (unlike Update, it can't race a status change made in
+	// between its caller's Get and its write).
+	SetMessageID(ctx context.Context, id, messageID string) error
 	// FailRunning ends every running job (the office restarted under them).
 	FailRunning(ctx context.Context, errCode, errMsg string, at time.Time) (int64, error)
 }
@@ -166,6 +190,9 @@ type AutomationConfig struct {
 	CommandArg         string `json:"command_arg,omitempty"`
 	// Skill: the command calls this project skill ("/skill text" to the chat)
 	Skill string `json:"skill,omitempty"`
+	// Workflow: action "workflow" runs this workflow of the project, its
+	// prompt being the input ("#key input" to the chat, ADR-109)
+	Workflow string `json:"workflow,omitempty"`
 	// ReplyMode: what the bot shows of a run, answer | steps ("" = the bot's own)
 	ReplyMode string `json:"reply_mode,omitempty"`
 	// OwnSetup: a bot's command set up on its own; false = its bot's default
@@ -182,7 +209,22 @@ type AutomationConfig struct {
 	// EndsAt: a schedule stops (turns itself off) at this time, as a Burn
 	// does (nil = runs until turned off).
 	EndsAt *time.Time `json:"ends_at,omitempty"`
+	// Goal: action chat/workflow runs until it is reached (ADR-132; nil = one turn).
+	Goal *AutomationGoal `json:"goal,omitempty"`
 }
+
+// AutomationGoal is "run until a condition is true" (ADR-132): after each
+// turn, the check and/or the judge; not reached, the chat goes on with what
+// they said, at most MaxRounds turns in all.
+type AutomationGoal struct {
+	Text      string `json:"text,omitempty"`       // what reached looks like (the judge reads it)
+	Check     string `json:"check,omitempty"`      // a shell command in the project folder: exit 0 = reached
+	Judge     bool   `json:"judge,omitempty"`      // a separate chat with the agent, read only, says whether Text is met
+	MaxRounds int    `json:"max_rounds,omitempty"` // 0 = 5, at most 20
+}
+
+// On: the goal has something to check it with.
+func (g *AutomationGoal) On() bool { return g != nil && (g.Check != "" || g.Judge) }
 
 // AutomationLimits guard unattended runs.
 type AutomationLimits struct {
@@ -213,6 +255,9 @@ type AutomationScript struct {
 	Lang     string `json:"lang,omitempty"` // bash | node | python
 	Body     string `json:"body,omitempty"`
 	TimeoutS int    `json:"timeout_s,omitempty"`
+	// BurnStart: the run gave the Burn quests (@@quest lines) and the Burn is
+	// stopped: it starts (ADR-132).
+	BurnStart bool `json:"burn_start,omitempty"`
 }
 
 // AutomationEscalate hands a script's result to an agent when needed.
@@ -227,11 +272,48 @@ type AutomationEscalate struct {
 type AutomationRepo interface {
 	Create(ctx context.Context, a Automation) (Automation, error)
 	Get(ctx context.Context, id string) (Automation, error)
+	// Update writes the whole row, CAS'd on the updated_at a was read with:
+	// ErrConflict when the row changed since (another Update, or one of the
+	// narrow writes below) instead of silently overwriting it.
 	Update(ctx context.Context, a Automation) error
+	// UpdateSpec writes only the fields a saved proposal can change — name,
+	// source, action, agent_id, prompt, config (keeping its current
+	// conversation_id and secret_hash), script, escalate, next_run_at — so an
+	// edit applied from a stale read-modify-write (the automation builder's
+	// approve path) can't revert run-tracking fields (failures, enabled,
+	// disabled_code, disabled_reason, last_run_at) that RecordRun or Tick
+	// changed concurrently.
+	UpdateSpec(ctx context.Context, a Automation) error
 	Delete(ctx context.Context, id string) error
 	List(ctx context.Context, projectID string) ([]Automation, error)
 	// Due lists enabled schedules whose next run has come.
 	Due(ctx context.Context, now time.Time) ([]Automation, error)
+	// RecordRun applies the result of one run — last run time, the
+	// consecutive-failure counter, and the kept conversation id (if any) — in
+	// a single atomic statement, so two runs of the same automation finishing
+	// close together (Parallel()>1) can't read the same Failures and
+	// overwrite each other's increment. result is "ok" (reset Failures to 0),
+	// "fail" (increment Failures, disabling the automation once it reaches
+	// limit) or "skip" (a budget stop: Failures untouched either way).
+	RecordRun(ctx context.Context, id string, now time.Time, result, failReason string, limit int, keptConv string) error
+	// UpdateSecretHash rotates a webhook automation's secret hash only,
+	// so it doesn't overwrite a concurrent edit to the rest of the
+	// automation (name, config, limits, prompt, ...).
+	UpdateSecretHash(ctx context.Context, id, secretHash string) error
+	// Reenable turns an automation back on without touching its other
+	// fields (name, config, script, ...), so a concurrent edit in
+	// AutomationBuilder isn't overwritten by a stale read-modify-write.
+	Reenable(ctx context.Context, id string, nextRunAt *time.Time) error
+	// SetNextRun writes next_run_at only, so a schedule tick computing the
+	// next run doesn't clobber a concurrent admin edit to the rest of the row.
+	SetNextRun(ctx context.Context, id string, nextRunAt *time.Time) error
+	// Disable turns an automation off with a reason (a safety stop: a daily
+	// cost cap or a schedule's end time), touching only enabled, the disabled
+	// fields and next_run_at — so it can't be undone by a concurrent admin
+	// edit's full-row Update racing in behind it (the admin's Update is CAS'd
+	// on updated_at, so it loses that race instead of silently reviving the
+	// automation).
+	Disable(ctx context.Context, id, code, reason string, nextRunAt *time.Time) error
 }
 
 // JobGroup is the jobs of one piece of work: a chat's turns, a task, an

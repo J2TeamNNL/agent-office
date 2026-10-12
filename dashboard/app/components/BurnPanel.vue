@@ -4,34 +4,47 @@
 // own worktree, until stopped or its time is up. This page runs it; the chat
 // page shows its conversation.
 interface Burn {
-  id?: string, conversation_id?: string, agent_id: string, model_tier: 'strong' | 'balanced' | 'fast', max_subagents: number,
-  result_mode: 'branch' | 'patch', focus: string, order: 'roadmap' | 'bugs' | 'auto', ends_at: string | null, state: 'running' | 'stopped' | 'waiting_limit',
-  waiting_until?: string, started_by?: string, started_at?: string
+  id?: string, conversation_id?: string, agent_id: string, model_tier: 'strong' | 'balanced' | 'fast', max_parallel: number,
+  run_branch?: string, run_tree?: string, focus: string, order: 'roadmap' | 'bugs' | 'auto', template: BurnTemplate, hunt_prompt: string, ends_at: string | null, state: 'running' | 'stopped' | 'waiting_limit' | 'draining', notify_channel_id?: string, notify_chat_id?: string,
+  waiting_until?: string, started_by?: string, started_at?: string,
+  review_profile_id: string, verify: string, code_map: string, lessons: string, coverage: string, review_cap: number, stop_after: number,
+  features?: { id: string, title: string, passes: boolean }[]
+  plan: Plan, next_start?: string
 }
+// how a run goes once on, and when it turns on by itself (saved: turning it on asks nothing)
+interface Plan { end?: 'reset' | 'hours' | 'clock' | 'none', hours?: number, clock?: string, auto?: boolean, days?: number[], at?: string, tz?: string }
 interface Item {
-  id: string, title: string, kind: 'unfinished' | 'upgrade' | 'bug', detail: string, status: string, priority: number,
-  branch: string, worktree: string, summary: string, subagents: number, cost_usd: number, updated_at: string
+  id: string, title: string, kind: '' | 'unfinished' | 'upgrade' | 'bug' | 'idea' | 'quest', detail: string, status: string, priority: number,
+  branch: string, worktree: string, summary: string, subagents: number, cost_usd: number, updated_at: string,
+  reviewed: ReviewStage[], review_note: string, review_conversations: Partial<Record<ReviewStage, string>>,
+  work_conversation_id: string, run_branch: string
 }
+// what its workers look for (ADR-128): a template, or the person's own prompt
+const templates = ['general', 'ux', 'ideas', 'security', 'performance', 'test', 'docs', 'builder', 'custom'] as const
+type BurnTemplate = typeof templates[number]
 interface AgentLite { id: string, name: string, tier: string, enabled?: boolean }
 const props = defineProps<{ projectId: string }>()
-const { t, dateLocale } = useLang()
+const { t, when } = useLang()
 const toast = useToast()
 const copy = useCopy()
 
 const base = computed(() => `/api/projects/${props.projectId}/burn`)
-const { data, refresh, error: loadError } = useLiveFetch<{ burn: Burn, items: Item[], weekly_reset?: string }>(base)
+const { data, refresh, error: loadError } = useLiveFetch<{ burn: Burn, items: Item[], runs?: Record<string, string>, weekly_reset?: string }>(base)
 const { data: agentsData } = useLiveFetch<{ agents: AgentLite[] }>(() => `/api/projects/${props.projectId}/chat/agents`, { lazy: true })
 const burn = computed(() => data.value?.burn)
+const loading = computed(() => !data.value && !loadError.value)
 const items = computed(() => data.value?.items ?? [])
 const agents = computed(() => agentsData.value?.agents ?? [])
-const running = computed(() => burn.value?.state === 'running' || burn.value?.state === 'waiting_limit')
+const running = computed(() => burn.value?.state === 'running' || burn.value?.state === 'waiting_limit' || burn.value?.state === 'draining')
+const draining = computed(() => burn.value?.state === 'draining')
+// the switch: on while it works (draining: turned off, finishing what it has)
+const on = computed(() => burn.value?.state === 'running' || burn.value?.state === 'waiting_limit')
 
 // the time left, ticking
 const now = ref(Date.now())
 let clock: ReturnType<typeof setInterval> | undefined
 onMounted(() => { clock = setInterval(() => { now.value = Date.now() }, 1000) })
 onBeforeUnmount(() => clearInterval(clock))
-const when = (iso: string) => new Date(iso).toLocaleString(dateLocale.value, { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })
 function left(iso: string) {
   const s = Math.max(0, Math.floor((new Date(iso).getTime() - now.value) / 1000))
   const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60)
@@ -40,15 +53,43 @@ function left(iso: string) {
 
 // settings (a drawer): saved as they are
 const settingsOpen = ref(false)
-const form = reactive({ agent_id: '', model_tier: 'balanced' as Burn['model_tier'], max_subagents: 2, result_mode: 'branch' as Burn['result_mode'], order: 'roadmap' as Burn['order'], focus: '' })
+const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone
+const planOf = (p?: Plan) => ({ end: p?.end || 'reset', hours: p?.hours || 8, clock: p?.clock || '07:00', auto: !!p?.auto, days: [...(p?.days ?? [1, 2, 3, 4, 5])], at: p?.at || '22:00', tz: p?.tz || browserTz })
+const form = reactive({
+  agent_id: '', model_tier: 'balanced' as Burn['model_tier'], max_parallel: 1, order: 'roadmap' as Burn['order'], template: 'general' as BurnTemplate, hunt_prompt: '', focus: '',
+  review_profile_id: '', notify_channel_id: '', notify_chat_id: '', verify: '', review_cap: 0, stop_after: 0, plan: planOf()
+})
 const { stale, reset: resync } = useDraft(burn, form, (b) => {
-  Object.assign(form, { agent_id: b.agent_id, model_tier: b.model_tier, max_subagents: b.max_subagents, result_mode: b.result_mode, order: b.order ?? 'roadmap', focus: b.focus })
+  Object.assign(form, {
+    agent_id: b.agent_id, model_tier: b.model_tier, max_parallel: b.max_parallel, order: b.order ?? 'roadmap', template: b.template ?? 'general', hunt_prompt: b.hunt_prompt ?? '', focus: b.focus,
+    review_profile_id: b.review_profile_id ?? '', notify_channel_id: b.notify_channel_id ?? '', notify_chat_id: b.notify_chat_id ?? '', verify: b.verify ?? '', review_cap: b.review_cap ?? 0, stop_after: b.stop_after ?? 0,
+    plan: planOf(b.plan)
+  })
+})
+// the plan as saved: only what its choices use
+function planBody() {
+  const p = form.plan
+  return { end: p.end, hours: p.end === 'hours' ? p.hours : undefined, clock: p.end === 'clock' ? p.clock : undefined, auto: p.auto, days: p.auto ? p.days : undefined, at: p.auto ? p.at : undefined, tz: p.tz }
+}
+// Monday first; 0 is Sunday
+const weekDays = [1, 2, 3, 4, 5, 6, 0] as const
+function toggleDay(d: typeof weekDays[number]) {
+  form.plan.days = form.plan.days.includes(d) ? form.plan.days.filter(x => x !== d) : [...form.plan.days, d]
+}
+const endItems = computed(() => (['reset', 'hours', 'clock', 'none'] as const).map(v => ({
+  value: v, label: t(`burn.plan.end.${v}`),
+  description: v === 'reset' ? (data.value?.weekly_reset ? t('burn.plan.end.resetAt', { at: when(data.value.weekly_reset) }) : t('burn.plan.end.resetNone')) : t(`burn.plan.end.${v}Help`)
+})))
+// what turning it on does, said in a line (the plan as saved)
+const untilText = computed(() => {
+  const p = planOf(burn.value?.plan)
+  return p.end === 'hours' ? t('burn.plan.until.hours', { n: p.hours }) : p.end === 'clock' ? t('burn.plan.until.clock', { at: p.clock }) : t(`burn.plan.until.${p.end}`)
 })
 const saving = ref(false)
 async function saveSettings() {
   saving.value = true
   try {
-    await $fetch(base.value, { method: 'PUT', body: { ...form } })
+    await $fetch(base.value, { method: 'PUT', body: { ...form, plan: planBody() } })
     await refresh()
     resync()
     settingsOpen.value = false
@@ -62,47 +103,62 @@ async function saveSettings() {
 // the agent picked is paused: saving and starting are refused until it is changed or turned on
 const offAgent = computed(() => agents.value.find(a => a.id === form.agent_id && a.enabled === false))
 const agentItems = computed(() => agents.value.map(a => ({ value: a.id, label: a.enabled === false ? `${a.name} (${t('burn.agentOffTag')})` : a.name })))
+// review (ADR-113): the saved profile it follows, set up on its own page
+const reviewStages = reviewStageKeys
+const { data: profData } = useLiveFetch<{ profiles: BurnReviewProfile[] }>(() => `/api/projects/${props.projectId}/burn/review-profiles`, { lazy: true })
+const profiles = computed(() => profData.value?.profiles ?? [])
+const templateItems = computed(() => templates.map(v => ({ value: v, label: t(`burn.template.${v}`) })))
+// where its summary goes when it stops (ADR-120): a bot (the project's, or
+// one borrowed), its chat
+const notifyKind = ref<string>()
+const profileItems = computed(() => [{ value: '__none', label: t('burn.review.none') }, ...profiles.value.map(p => ({ value: p.id, label: p.name }))])
+const reviewProfile = computed({ get: () => form.review_profile_id || '__none', set: (v: string) => { form.review_profile_id = v === '__none' ? '' : v } })
+const profile = computed(() => profiles.value.find(p => p.id === form.review_profile_id))
+const reviewSummary = computed(() => profile.value ? `${profile.value.name} (${reviewStages.filter(v => profile.value!.stages[v]).map(v => t(`burn.review.${v}`)).join(', ')})` : '')
+// a piece's own chats, hidden, read here: its work (ADR-116), its reviews (ADR-114)
+type ChatTab = ReviewStage | 'work'
+const reviewingId = ref<string | null>(null)
+const reviewing = computed(() => items.value.find(i => i.id === reviewingId.value) ?? null)
+const reviewTab = ref<ChatTab>('work')
+const chatOf = (it: Item | null, v: ChatTab) => v === 'work' ? it?.work_conversation_id : it?.review_conversations?.[v]
+const chatTabs = (it: Item | null): ChatTab[] => (['work', ...reviewStages] as ChatTab[]).filter(v => chatOf(it, v))
+const reviewTabs = computed(() => chatTabs(reviewing.value).map(v => ({ value: v, label: t(v === 'work' ? 'burn.workChat' : `burn.review.${v}`) })))
+const hasReviews = (it: Item) => chatTabs(it).length > 0
+function openReviews(it: Item) {
+  reviewingId.value = it.id
+  reviewTab.value = chatTabs(it).at(-1) ?? 'work' // the latest
+}
+const profilesPage = computed(() => `/projects/${props.projectId}/burn/reviews`)
 const tierItems = computed(() => (['strong', 'balanced', 'fast'] as const).map(v => ({ value: v, label: t(`burn.tier.${v}`) })))
 
-// starting asks first: what it means, and when it stops
-const confirmOpen = ref(false)
-const endMode = ref<'reset' | 'hours' | 'at' | 'none'>('reset')
-const endHours = ref(4)
-const endAt = ref('')
-function openStart() {
-  endMode.value = data.value?.weekly_reset ? 'reset' : 'hours'
-  const d = new Date(Date.now() + 4 * 3600e3)
-  endAt.value = new Date(d.getTime() - d.getTimezoneOffset() * 60e3).toISOString().slice(0, 16)
-  confirmOpen.value = true
-}
-const endsAt = computed<string | null>(() => {
-  switch (endMode.value) {
-    case 'reset': return data.value?.weekly_reset ?? null
-    case 'hours': return new Date(Date.now() + Math.max(1, endHours.value) * 3600e3).toISOString()
-    case 'at': return endAt.value ? new Date(endAt.value).toISOString() : null
-    default: return null
-  }
-})
+// turning it on asks nothing: it runs by its saved plan
 const acting = ref('')
 async function start() {
   acting.value = 'start'
   try {
-    await $fetch(`${base.value}/start`, { method: 'POST', body: { ...form, ends_at: endsAt.value ?? undefined, no_end: endMode.value === 'none' } })
-    confirmOpen.value = false
-    await refresh()
+    const res = await $fetch<{ burn: Burn }>(`${base.value}/start`, { method: 'POST', body: {} })
+    // shown at once from the answer; the board catches up without holding the switch
+    if (data.value) data.value = { ...data.value, burn: res.burn }
     toast.add({ title: t('burn.started'), color: 'success' })
+    void refresh()
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
     acting.value = ''
   }
 }
-async function stop() {
-  acting.value = 'stop'
+function toggle(v: boolean) {
+  if (acting.value) return
+  if (v) void start()
+  else void stop('drain')
+}
+// stop: drain (finish what is in progress), resume, or stop now
+async function stop(how: 'drain' | 'resume' | 'stop') {
+  acting.value = how
   try {
-    await $fetch(`${base.value}/stop`, { method: 'POST' })
+    await $fetch(`${base.value}/${how}`, { method: 'POST' })
     await refresh()
-    toast.add({ title: t('burn.stopped'), color: 'success' })
+    toast.add({ title: t(how === 'drain' ? 'burn.draining' : how === 'resume' ? 'burn.resumed' : 'burn.stopped'), color: 'success' })
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
@@ -110,29 +166,92 @@ async function stop() {
   }
 }
 
-// the board
+// the board, one run at a time: the current run by default. What is not
+// finished (found, waiting, doing, paused) goes on in whichever run is on, so
+// it shows in every run; finished pieces stay with the run they were done in.
+const runs = computed(() => [...new Set([burn.value?.run_branch, ...items.value.map(i => i.run_branch)].filter((r): r is string => !!r))].sort().reverse())
+const runPick = ref<string | null>(null)
+const run = computed({
+  get: () => runPick.value ?? (burn.value?.run_branch || runs.value[0] || 'all'),
+  set: (v: string) => { runPick.value = v }
+})
+// the branch is named in the office machine's time: the start comes from it
+function runLabel(branch: string) {
+  const at = data.value?.runs?.[branch]
+  return at ? t('burn.run.label', { at: when(at) }) : branch
+}
+const finished = ['done', 'failed', 'skipped']
+const runItems = computed(() => [
+  ...runs.value.map(r => ({ value: r, label: runLabel(r) })),
+  ...(items.value.some(i => !i.run_branch && i.kind !== 'quest') ? [{ value: '__none', label: t('burn.run.none') }] : []),
+  { value: 'all', label: t('burn.run.all') }
+])
+const shown = computed(() => run.value === 'all'
+  ? items.value
+  : items.value.filter(i => run.value === '__none' ? !i.run_branch && i.kind !== 'quest' : i.run_branch === run.value || !finished.includes(i.status)))
+
+// a quest: work the person gives, done as given (not a scan)
+const questOpen = ref(false)
+const quest = reactive({ title: '', detail: '' })
+async function addQuest() {
+  acting.value = 'quest'
+  try {
+    await $fetch(`${base.value}/quests`, { method: 'POST', body: { ...quest } })
+    Object.assign(quest, { title: '', detail: '' })
+    questOpen.value = false
+    toast.add({ title: t('burn.quest.added'), color: 'success' })
+    await refresh()
+  } catch (e) {
+    toast.add({ title: apiError(e), color: 'error' })
+  } finally {
+    acting.value = ''
+  }
+}
+
+// a column shows its first colMax, the rest on asking
+const colMax = 10
+const expanded = ref(new Set<string>())
+function expand(key: string) { expanded.value = new Set([...expanded.value, key]) }
 const columns = computed(() => [
   { key: 'found', label: t('burn.col.found'), statuses: ['found'] },
-  { key: 'doing', label: t('burn.col.doing'), statuses: ['doing', 'queued'] },
+  { key: 'doing', label: t('burn.col.doing'), statuses: ['doing', 'review', 'queued'] },
   { key: 'paused', label: t('burn.col.paused'), statuses: ['paused'] },
   { key: 'done', label: t('burn.col.done'), statuses: ['done'] },
   { key: 'other', label: t('burn.col.other'), statuses: ['failed', 'skipped'] }
-].map(c => ({ ...c, items: items.value.filter(i => c.statuses.includes(i.status)) })))
-const kindColor = (k: Item['kind']) => ({ bug: 'error', unfinished: 'warning', upgrade: 'info' } as const)[k]
-const itemActing = ref('')
+].map((c) => {
+  // a scan (no kind) is the finding itself: it shows under found while it runs
+  const all = shown.value.filter(i => !i.kind && !finished.includes(i.status) ? c.key === 'found' : c.statuses.includes(i.status))
+  return { ...c, all, items: expanded.value.has(c.key) ? all : all.slice(0, colMax) }
+}))
+const kindColor = (k: Item['kind']) => ({ '': 'neutral', bug: 'error', unfinished: 'warning', upgrade: 'info', idea: 'primary', quest: 'success' } as const)[k]
+const itemActing = ref<Record<string, string>>({})
 async function itemAction(it: Item, action: 'skip' | 'first' | 'drop-worktree') {
-  if (action === 'drop-worktree' && !confirm(t('burn.dropConfirm', { branch: it.branch }))) return
-  itemActing.value = it.id + action
+  if (itemActing.value[it.id]) return
+  if (action === 'drop-worktree' && !confirm(t('burn.dropConfirm'))) return
+  itemActing.value = { ...itemActing.value, [it.id]: action }
   try {
     await $fetch(`/api/burn-items/${it.id}/${action}`, { method: 'POST' })
     await refresh()
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
-    itemActing.value = ''
+    const { [it.id]: _, ...rest } = itemActing.value
+    itemActing.value = rest
   }
 }
-const totalCost = computed(() => items.value.reduce((n, i) => n + i.cost_usd, 0))
+// the scans' coverage plan (ADR-141): items checked of all; scans go on until every one is
+const coverage = computed(() => {
+  const lines = (burn.value?.coverage ?? '').split('\n').map(l => l.trim().replace(/^[-*+ ]+/, ''))
+  return { done: lines.filter(l => /^\[[xX]\]/.test(l)).length, total: lines.filter(l => /^\[[ xX]\]/.test(l)).length }
+})
+const totalCost = computed(() => shown.value.reduce((n, i) => n + i.cost_usd, 0))
+
+// a builder Burn (ADR-139): idle before its first Start, no cue what it does;
+// started, its progress is a feature list (features.json), not the generic board
+const isBuilder = computed(() => burn.value?.template === 'builder')
+const showBuilderBanner = computed(() => isBuilder.value && burn.value?.state === 'stopped' && items.value.length === 0)
+const builderFeatures = computed(() => burn.value?.features ?? [])
+const builderDone = computed(() => builderFeatures.value.filter(f => f.passes).length)
 </script>
 
 <template>
@@ -140,119 +259,307 @@ const totalCost = computed(() => items.value.reduce((n, i) => n + i.cost_usd, 0)
     <UAlert v-if="loadError" color="error" variant="subtle" icon="i-lucide-triangle-alert" :title="t('common.loadError')" :actions="[{ label: t('common.refresh'), onClick: () => refresh() }]" />
     <UCard :ui="{ body: 'space-y-3 sm:p-4' }">
       <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <p class="flex items-center gap-2 font-semibold">
-          <UIcon name="i-lucide-flame" class="size-5" :class="running ? 'text-(--ui-warning)' : 'text-(--ui-text-muted)'" />{{ t('burn.title') }}
-        </p>
-        <UBadge v-if="burn" :label="t(`burn.state.${burn.state}`)" :color="burn.state === 'running' ? 'warning' : burn.state === 'waiting_limit' ? 'info' : 'neutral'" variant="subtle" />
-        <span v-if="running && burn?.ends_at" class="text-xs tabular-nums text-(--ui-text-muted)">{{ t('burn.endsIn', { left: left(burn.ends_at), at: when(burn.ends_at) }) }}</span>
-        <span v-else-if="running" class="text-xs text-(--ui-text-muted)">{{ t('burn.noEnd') }}</span>
-        <span v-if="burn?.state === 'waiting_limit' && burn.waiting_until" class="text-xs text-(--ui-text-muted)">{{ t('burn.waitingUntil', { at: when(burn.waiting_until) }) }}</span>
+        <span class="flex size-9 shrink-0 items-center justify-center rounded-lg" :class="running ? 'bg-(--ui-warning)/15 text-(--ui-warning)' : 'bg-(--ui-bg-elevated) text-(--ui-text-muted)'">
+          <UIcon name="i-lucide-flame" class="size-5" />
+        </span>
+        <div class="min-w-0">
+          <p class="flex items-center gap-2 font-semibold">
+            {{ t('burn.title') }}
+            <USkeleton v-if="loading" class="h-5 w-16" />
+            <UBadge v-else-if="burn" :label="t(`burn.state.${burn.state}`)" :color="burn.state === 'running' ? 'warning' : burn.state === 'waiting_limit' || burn.state === 'draining' ? 'info' : 'neutral'" variant="subtle" size="sm" />
+          </p>
+          <!-- what it does now, or what turning it on will do -->
+          <USkeleton v-if="loading" class="mt-1 h-3.5 w-48" />
+          <p v-else-if="burn" class="flex flex-wrap items-center gap-x-1.5 text-xs text-(--ui-text-muted)">
+            <template v-if="burn.state === 'waiting_limit' && burn.waiting_until">{{ t('burn.waitingUntil', { at: when(burn.waiting_until) }) }}</template>
+            <template v-else-if="draining">{{ t('burn.drainingHint') }}</template>
+            <template v-else-if="on && burn.ends_at"><span class="tabular-nums">{{ t('burn.endsIn', { left: left(burn.ends_at), at: when(burn.ends_at) }) }}</span></template>
+            <template v-else-if="on">{{ t('burn.noEnd') }}</template>
+            <template v-else>
+              {{ t('burn.plan.onRuns', { until: untilText }) }}
+              <span>·</span>
+              <span v-if="burn.next_start" class="flex items-center gap-1"><UIcon name="i-lucide-calendar-clock" class="size-3.5" />{{ t('burn.plan.nextStart', { at: when(burn.next_start) }) }}</span>
+              <span v-else>{{ t('burn.plan.manual') }}</span>
+            </template>
+          </p>
+        </div>
         <div class="ms-auto flex flex-wrap items-center gap-1.5">
           <UButton v-if="burn?.conversation_id" size="sm" color="neutral" variant="ghost" icon="i-lucide-messages-square" :label="t('burn.openChat')" :to="`/projects/${projectId}?tab=chat&c=${burn.conversation_id}`" />
-          <UButton size="sm" color="neutral" variant="outline" icon="i-lucide-settings-2" :label="t('burn.settings')" @click="settingsOpen = true" />
-          <UButton v-if="running" size="sm" color="neutral" icon="i-lucide-square" :label="t('burn.stop')" :loading="acting === 'stop'" @click="stop" />
-          <UButton v-else size="sm" color="warning" icon="i-lucide-flame" :label="t('burn.start')" @click="openStart" />
+          <UButton size="sm" color="neutral" variant="outline" icon="i-lucide-settings-2" :label="t('burn.settings')" :disabled="loading" @click="settingsOpen = true" />
+          <template v-if="draining">
+            <UButton size="sm" color="warning" variant="outline" icon="i-lucide-play" :label="t('burn.resume')" :loading="acting === 'resume'" @click="stop('resume')" />
+            <UButton size="sm" color="neutral" icon="i-lucide-square" :label="t('burn.stopNow')" :loading="acting === 'stop'" @click="stop('stop')" />
+          </template>
+          <!-- on is on: it runs by the saved plan, nothing more is asked -->
+          <div v-else class="flex items-center gap-2 rounded-lg border border-(--ui-border) py-1 ps-3 pe-2">
+            <span class="text-sm font-medium">{{ on ? t('burn.switchOn') : t('burn.switchOff') }}</span>
+            <UTooltip :text="t('burn.confirmDesc')" :content="{ side: 'bottom' }" :ui="{ content: 'max-w-sm h-auto whitespace-normal' }">
+              <UIcon name="i-lucide-info" class="size-3.5 text-(--ui-text-dimmed)" />
+            </UTooltip>
+            <USwitch :model-value="on" color="warning" size="lg" :loading="acting === 'start' || acting === 'drain'" :disabled="loading || !!offAgent || !!acting" :aria-label="t('burn.toggle')" @update:model-value="toggle" />
+          </div>
         </div>
       </div>
-      <p class="text-xs text-(--ui-text-muted)">
-        {{ t('burn.summary', { tier: t(`burn.tier.${form.model_tier}`), n: form.max_subagents, mode: t(`burn.mode.${form.result_mode}`) }) }} · {{ t(`burn.order.${form.order}`) }}
-        <template v-if="items.length"> · {{ t('burn.cost', { usd: totalCost.toFixed(2), n: items.filter(i => i.status === 'done').length }) }}</template>
+      <USkeleton v-if="loading" class="h-3.5 w-2/3" />
+      <p v-else class="text-xs text-(--ui-text-muted)">
+        {{ t('burn.summary', { tier: t(`burn.tier.${form.model_tier}`), n: form.max_parallel }) }} · {{ t(`burn.template.${form.template}`) }}<template v-if="form.template === 'general'"> · {{ t(`burn.order.${form.order}`) }}</template>
+        <!-- a profile named "review …" is not said twice -->
+        <template v-if="reviewSummary"> · {{ /^review\b/i.test(reviewSummary) ? reviewSummary : t('burn.review.summary', { profile: reviewSummary }) }}</template>
+        <template v-if="burn?.run_branch"> · <button type="button" class="font-mono hover:text-(--ui-text)" :title="burn.run_tree ? t('burn.copyRunTree') : undefined" @click="burn.run_tree && copy(`cd ${burn.run_tree}`)">{{ burn.run_branch }}</button></template>
+        <template v-if="shown.length"> · {{ t('burn.cost', { usd: totalCost.toFixed(2), n: shown.filter(i => i.status === 'done').length }) }}</template>
       </p>
       <UAlert v-if="offAgent" color="warning" variant="subtle" icon="i-lucide-power-off" :title="t('burn.agentOff', { name: offAgent.name })"
         :actions="[{ label: t('burn.agentOffChange'), color: 'warning', variant: 'outline', onClick: () => { settingsOpen = true } }, { label: t('burn.agentOffOpen'), color: 'neutral', variant: 'ghost', to: `/projects/${projectId}/agents/${offAgent.id}` }]" />
+      <UAlert v-if="showBuilderBanner" color="primary" variant="subtle" icon="i-lucide-sparkles" :title="t('burn.builder.startBanner')"
+        :actions="[{ label: t('burn.start'), color: 'primary', onClick: start }]" />
       <p v-if="form.focus" class="text-xs"><span class="text-(--ui-text-muted)">{{ t('burn.focus') }}:</span> {{ form.focus }}</p>
     </UCard>
 
+    <!-- a builder Burn's feature progress (ADR-139), above the generic board -->
+    <UCard v-if="isBuilder && (builderFeatures.length || running)" :ui="{ body: 'space-y-2 sm:p-4' }">
+      <p class="text-xs font-medium text-(--ui-text-muted)">
+        <template v-if="builderFeatures.length">{{ t('burn.builder.progress', { done: builderDone, total: builderFeatures.length }) }}</template>
+        <template v-else>{{ t('burn.builder.preparing') }}</template>
+      </p>
+      <ul v-if="builderFeatures.length" class="grid gap-1 sm:grid-cols-2">
+        <li v-for="f in builderFeatures" :key="f.id" class="flex items-center gap-1.5 text-xs">
+          <UIcon :name="f.passes ? 'i-lucide-circle-check' : 'i-lucide-circle'" class="size-3.5 shrink-0" :class="f.passes ? 'text-(--ui-success)' : 'text-(--ui-text-dimmed)'" />
+          <span class="truncate" :class="{ 'text-(--ui-text-muted)': !f.passes }">{{ f.title }}</span>
+        </li>
+      </ul>
+    </UCard>
+
     <!-- the pieces of work, by where they are -->
-    <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-      <div v-for="col in columns" :key="col.key" class="min-w-0 space-y-2 rounded-xl border border-(--ui-border) p-2">
-        <p class="flex items-center gap-2 px-1 text-xs font-medium text-(--ui-text-muted)">{{ col.label }}<UBadge :label="String(col.items.length)" color="neutral" variant="subtle" size="sm" /></p>
-        <p v-if="!col.items.length" class="px-1 py-2 text-xs text-(--ui-text-dimmed)">—</p>
+    <div class="flex flex-wrap items-center gap-2">
+      <USelect v-model="run" :items="runItems" size="sm" class="w-56 max-w-full" />
+      <UButton size="sm" color="neutral" variant="outline" icon="i-lucide-plus" :label="t('burn.quest.add')" class="ms-auto" @click="questOpen = true" />
+    </div>
+    <!-- side by side on every screen: scrolled across below xl -->
+    <div class="flex snap-x snap-mandatory items-start gap-3 overflow-x-auto pb-2 xl:grid xl:grid-cols-5 xl:overflow-visible xl:pb-0">
+      <div v-for="col in columns" :key="col.key" class="w-[80%] min-w-0 shrink-0 snap-start space-y-2 rounded-xl border border-(--ui-border) p-2 sm:w-[45%] xl:w-auto">
+        <p class="flex items-center gap-2 px-1 text-xs font-medium text-(--ui-text-muted)">
+          {{ col.label }}<UBadge :label="String(col.all.length)" color="neutral" variant="subtle" size="sm" />
+          <span v-if="col.key === 'found' && coverage.total" class="ms-auto tabular-nums text-(--ui-text-dimmed)" :title="t('burn.col.coverage', { n: coverage.done, max: coverage.total })">{{ coverage.done }}/{{ coverage.total }}</span>
+        </p>
+        <LoadingRows v-if="loading" :n="2" :icon="false" />
+        <p v-else-if="!col.items.length" class="px-1 py-2 text-xs text-(--ui-text-dimmed)">—</p>
         <div v-for="it in col.items" :key="it.id" class="space-y-1.5 rounded-lg bg-(--ui-bg-elevated)/60 p-2.5 text-sm">
           <div class="flex items-start gap-2">
             <UIcon v-if="it.status === 'doing'" name="i-lucide-loader-circle" class="mt-0.5 size-4 shrink-0 animate-spin text-(--ui-warning)" />
+            <UIcon v-else-if="it.status === 'review'" name="i-lucide-scan-eye" class="mt-0.5 size-4 shrink-0 text-(--ui-info)" :title="t('burn.review.waiting')" />
             <span class="min-w-0 flex-1 font-medium">{{ it.title }}</span>
-            <UBadge :label="t(`burn.kind.${it.kind}`)" :color="kindColor(it.kind)" variant="subtle" size="sm" />
+            <UBadge v-if="it.kind" :label="t(`burn.kind.${it.kind}`)" :color="kindColor(it.kind)" variant="subtle" size="sm" />
+            <UBadge v-else :label="t('burn.kind.hunting')" color="neutral" variant="subtle" size="sm" />
           </div>
           <p v-if="it.summary" class="line-clamp-4 whitespace-pre-line text-xs text-(--ui-text-muted)">{{ it.summary }}</p>
           <p v-else-if="it.detail" class="line-clamp-3 text-xs text-(--ui-text-muted)">{{ it.detail }}</p>
-          <button v-if="it.branch && it.status !== 'found'" type="button" class="flex max-w-full items-center gap-1 truncate font-mono text-xs text-(--ui-text-toned) hover:text-(--ui-text)" :title="t('burn.copyBranch')" @click="copy(`git switch ${it.branch}`)">
-            <UIcon name="i-lucide-git-branch" class="size-3.5 shrink-0" /><span class="truncate">{{ it.branch }}</span>
-          </button>
+          <p v-if="it.review_note" class="flex gap-1 text-xs text-(--ui-text-muted)" :title="it.review_note">
+            <UIcon name="i-lucide-scan-eye" class="mt-0.5 size-3.5 shrink-0" /><span class="line-clamp-2">{{ it.review_note }}</span>
+          </p>
           <div class="flex flex-wrap items-center gap-x-2 text-xs text-(--ui-text-dimmed)">
             <span v-if="it.cost_usd">${{ it.cost_usd.toFixed(2) }}</span>
             <span v-if="it.subagents">{{ t('burn.subagents', { n: it.subagents }) }}</span>
+            <span v-if="it.status === 'review'" class="text-(--ui-info)">{{ t('burn.review.waiting') }}</span>
+            <span v-else-if="it.reviewed?.length">{{ t('burn.review.passed', { stages: it.reviewed.map(v => t(`burn.review.${v}`)).join(', ') }) }}</span>
             <span>{{ when(it.updated_at) }}</span>
           </div>
           <div class="flex flex-wrap gap-1">
-            <UButton v-if="['found', 'skipped', 'failed'].includes(it.status)" size="xs" color="neutral" variant="outline" icon="i-lucide-arrow-up-to-line" :label="t('burn.first')" :loading="itemActing === it.id + 'first'" @click="itemAction(it, 'first')" />
-            <UButton v-if="['found', 'queued', 'paused'].includes(it.status)" size="xs" color="neutral" variant="ghost" :label="t('burn.skip')" :loading="itemActing === it.id + 'skip'" @click="itemAction(it, 'skip')" />
-            <UButton v-if="it.worktree && ['done', 'failed', 'skipped'].includes(it.status)" size="xs" color="neutral" variant="ghost" icon="i-lucide-trash-2" :label="t('burn.dropWorktree')" :loading="itemActing === it.id + 'drop-worktree'" @click="itemAction(it, 'drop-worktree')" />
+            <UButton v-if="hasReviews(it)" size="xs" color="neutral" variant="ghost" icon="i-lucide-scan-eye" :label="t('burn.review.view')" @click="openReviews(it)" />
+            <UButton v-if="['found', 'skipped', 'failed'].includes(it.status)" size="xs" color="neutral" variant="outline" icon="i-lucide-arrow-up-to-line" :label="t('burn.first')" :loading="itemActing[it.id] === 'first'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'first'" @click="itemAction(it, 'first')" />
+            <UButton v-if="['found', 'queued', 'paused', 'review'].includes(it.status)" size="xs" color="neutral" variant="ghost" :label="t('burn.skip')" :loading="itemActing[it.id] === 'skip'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'skip'" @click="itemAction(it, 'skip')" />
+            <UButton v-if="it.worktree && ['done', 'failed', 'skipped'].includes(it.status)" size="xs" color="neutral" variant="ghost" icon="i-lucide-trash-2" :label="t('burn.dropWorktree')" :loading="itemActing[it.id] === 'drop-worktree'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'drop-worktree'" @click="itemAction(it, 'drop-worktree')" />
           </div>
         </div>
+        <UButton v-if="col.all.length > col.items.length" size="xs" color="neutral" variant="ghost" block :label="t('burn.showMore', { n: col.all.length - col.items.length })" @click="expand(col.key)" />
       </div>
     </div>
 
-    <!-- settings -->
-    <USlideover v-model:open="settingsOpen" :title="t('burn.settings')">
+    <!-- settings: one place, in blocks; the plan first (turning it on asks nothing) -->
+    <USlideover v-model:open="settingsOpen" :title="t('burn.settingsTitle')" :ui="{ content: 'sm:max-w-xl' }">
       <template #body>
-        <div class="space-y-4">
+        <div class="space-y-5">
           <StaleNotice :show="stale" @reload="resync()" />
-          <UFormField :label="t('burn.agent')">
-            <USelect v-model="form.agent_id" :items="agentItems" class="w-full" />
-          </UFormField>
-          <UAlert v-if="offAgent" color="warning" variant="subtle" icon="i-lucide-power-off" :title="t('burn.agentOff', { name: offAgent.name })"
-            :actions="[{ label: t('burn.agentOffOpen'), color: 'warning', variant: 'outline', to: `/projects/${projectId}/agents/${offAgent.id}` }]" />
 
-          <UFormField :label="t('burn.tierLabel')" :help="t('burn.tierHelp')">
-            <USelect v-model="form.model_tier" :items="tierItems" class="w-full" />
-          </UFormField>
-          <UFormField :label="t('burn.subagentsLabel')" :help="t('burn.subagentsHelp')">
-            <UInputNumber v-model="form.max_subagents" :min="0" :max="5" class="w-full" />
-          </UFormField>
-          <UFormField :label="t('burn.orderLabel')">
-            <URadioGroup v-model="form.order" :items="(['roadmap', 'bugs', 'auto'] as const).map(o => ({ value: o, label: t(`burn.order.${o}`), description: t(`burn.order.${o}Help`) }))" />
-          </UFormField>
-          <UFormField :label="t('burn.modeLabel')">
-            <URadioGroup v-model="form.result_mode" :items="[{ value: 'branch', label: t('burn.mode.branch'), description: t('burn.mode.branchHelp') }, { value: 'patch', label: t('burn.mode.patch'), description: t('burn.mode.patchHelp') }]" />
-          </UFormField>
-          <UFormField :label="t('burn.focus')" :help="t('burn.focusHelp')">
-            <UTextarea v-model="form.focus" :rows="3" autoresize class="w-full" :placeholder="t('burn.focusPlaceholder')" />
-          </UFormField>
+          <!-- when it runs -->
+          <section class="space-y-3">
+            <div>
+              <p class="flex items-center gap-2 text-sm font-semibold"><UIcon name="i-lucide-calendar-clock" class="size-4 text-(--ui-warning)" />{{ t('burn.sec.plan') }}</p>
+              <p class="text-xs text-(--ui-text-muted)">{{ t('burn.sec.planDesc') }}</p>
+            </div>
+            <UFormField :label="t('burn.plan.endLabel')">
+              <URadioGroup v-model="form.plan.end" :items="endItems" variant="card" :ui="{ fieldset: 'grid gap-2 sm:grid-cols-2' }" />
+            </UFormField>
+            <div v-if="form.plan.end === 'hours'" class="flex items-center gap-2">
+              <UInputNumber v-model="form.plan.hours" :min="1" :max="168" class="w-32" />
+              <span class="text-sm text-(--ui-text-muted)">{{ t('burn.plan.hoursUnit') }}</span>
+            </div>
+            <div v-else-if="form.plan.end === 'clock'" class="flex items-center gap-2">
+              <span class="text-sm text-(--ui-text-muted)">{{ t('burn.plan.clockPrefix') }}</span>
+              <UInput v-model="form.plan.clock" type="time" class="w-32" />
+            </div>
+            <div class="space-y-3 rounded-lg border border-(--ui-border) p-3">
+              <div class="flex items-center gap-3">
+                <div class="min-w-0 flex-1">
+                  <p class="text-sm font-medium">{{ t('burn.plan.auto') }}</p>
+                  <p class="text-xs text-(--ui-text-muted)">{{ t('burn.plan.autoHelp') }}</p>
+                </div>
+                <USwitch v-model="form.plan.auto" color="warning" />
+              </div>
+              <template v-if="form.plan.auto">
+                <div class="grid max-w-sm grid-cols-7 gap-1">
+                  <UButton v-for="d in weekDays" :key="d" size="sm" :color="form.plan.days.includes(d) ? 'warning' : 'neutral'" :variant="form.plan.days.includes(d) ? 'solid' : 'outline'"
+                    :label="t(`burn.plan.day.${d}`)" class="justify-center px-0" :aria-pressed="form.plan.days.includes(d)" @click="toggleDay(d)" />
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-sm text-(--ui-text-muted)">{{ t('burn.plan.atPrefix') }}</span>
+                  <UInput v-model="form.plan.at" type="time" class="w-32" />
+                  <span class="text-xs text-(--ui-text-dimmed)">{{ form.plan.tz }}</span>
+                </div>
+                <p v-if="!form.plan.days.length" class="text-xs text-(--ui-error)">{{ t('burn.plan.noDays') }}</p>
+              </template>
+            </div>
+          </section>
+
+          <USeparator />
+
+          <!-- what it looks for -->
+          <section class="space-y-3">
+            <div>
+              <p class="flex items-center gap-2 text-sm font-semibold"><UIcon name="i-lucide-target" class="size-4 text-(--ui-primary)" />{{ t('burn.sec.work') }}</p>
+              <p class="text-xs text-(--ui-text-muted)">{{ t('burn.sec.workDesc') }}</p>
+            </div>
+            <UFormField :label="t('burn.templateLabel')" :help="t(`burn.template.${form.template}Help`)">
+              <USelect v-model="form.template" :items="templateItems" class="w-full" />
+            </UFormField>
+            <UFormField v-if="form.template === 'custom'" :label="t('burn.huntPrompt')" :help="t('burn.huntPromptHelp')" required>
+              <UTextarea v-model="form.hunt_prompt" :rows="5" :maxlength="4000" autoresize class="w-full" :placeholder="t('burn.huntPromptPlaceholder')" />
+            </UFormField>
+            <UFormField v-if="form.template === 'general'" :label="t('burn.orderLabel')">
+              <URadioGroup v-model="form.order" :items="(['roadmap', 'bugs', 'auto'] as const).map(o => ({ value: o, label: t(`burn.order.${o}`), description: t(`burn.order.${o}Help`) }))" />
+            </UFormField>
+            <UFormField :label="t('burn.focus')" :help="t('burn.focusHelp')">
+              <UTextarea v-model="form.focus" :rows="3" :maxlength="2000" autoresize class="w-full" :placeholder="t('burn.focusPlaceholder')" />
+            </UFormField>
+          </section>
+
+          <USeparator />
+
+          <!-- who does it -->
+          <section class="space-y-3">
+            <div>
+              <p class="flex items-center gap-2 text-sm font-semibold"><UIcon name="i-lucide-bot" class="size-4 text-(--ui-info)" />{{ t('burn.sec.who') }}</p>
+              <p class="text-xs text-(--ui-text-muted)">{{ t('burn.sec.whoDesc') }}</p>
+            </div>
+            <UFormField :label="t('burn.agent')">
+              <USelect v-model="form.agent_id" :items="agentItems" class="w-full" />
+            </UFormField>
+            <UAlert v-if="offAgent" color="warning" variant="subtle" icon="i-lucide-power-off" :title="t('burn.agentOff', { name: offAgent.name })"
+              :actions="[{ label: t('burn.agentOffOpen'), color: 'warning', variant: 'outline', to: `/projects/${projectId}/agents/${offAgent.id}` }]" />
+            <div class="grid gap-3 sm:grid-cols-2">
+              <UFormField :label="t('burn.tierLabel')" :help="t('burn.tierHelp')">
+                <USelect v-model="form.model_tier" :items="tierItems" class="w-full" />
+              </UFormField>
+              <UFormField :label="t('burn.parallelLabel')" :help="t('burn.parallelHelp')">
+                <UInputNumber v-model="form.max_parallel" :min="1" :max="5" class="w-full" />
+              </UFormField>
+            </div>
+          </section>
+
+          <USeparator />
+
+          <!-- checks, review, report -->
+          <section class="space-y-3">
+            <div>
+              <p class="flex items-center gap-2 text-sm font-semibold"><UIcon name="i-lucide-shield-check" class="size-4 text-(--ui-success)" />{{ t('burn.sec.check') }}</p>
+              <p class="text-xs text-(--ui-text-muted)">{{ t('burn.sec.checkDesc') }}</p>
+            </div>
+            <UFormField :label="t('burn.verify')" :help="t('burn.verifyHelp')">
+              <UTextarea v-model="form.verify" :rows="3" :maxlength="2000" autoresize class="w-full font-mono text-xs" placeholder="go build ./...&#10;go test ./..." />
+            </UFormField>
+            <UFormField :label="t('burn.review.label')" :help="t('burn.review.help')">
+              <div class="flex gap-2">
+                <USelect v-model="reviewProfile" :items="profileItems" class="min-w-0 flex-1" />
+                <UButton color="neutral" variant="outline" icon="i-lucide-sliders-horizontal" :label="t('burn.review.manage')" :to="profilesPage" />
+              </div>
+            </UFormField>
+            <UFormField :label="t('burn.notify.label')" :help="t('burn.notify.help')">
+              <div class="grid gap-2 sm:grid-cols-2">
+                <NotifyBotPicker v-model="form.notify_channel_id" v-model:kind="notifyKind" :project-id="projectId" :none-label="t('burn.notify.off')" />
+                <UInput v-model="form.notify_chat_id" class="w-full font-mono text-xs" :disabled="!form.notify_channel_id" :placeholder="notifyKind === 'telegram' ? t('alert.chatTelegram') : t('alert.chatDiscord')" />
+              </div>
+            </UFormField>
+          </section>
+
+          <!-- rarely changed -->
+          <details class="group rounded-lg border border-(--ui-border)">
+            <summary class="flex cursor-pointer items-center gap-2 p-3 text-sm font-medium">
+              <UIcon name="i-lucide-chevron-right" class="size-4 transition group-open:rotate-90" />{{ t('burn.sec.advanced') }}
+            </summary>
+            <div class="space-y-3 px-3 pb-3">
+              <div class="grid gap-3 sm:grid-cols-2">
+                <UFormField :label="t('burn.reviewCap')" :help="t('burn.reviewCapHelp')">
+                  <UInputNumber v-model="form.review_cap" :min="0" :max="100" class="w-full" />
+                </UFormField>
+                <UFormField :label="t('burn.stopAfter')" :help="t('burn.stopAfterHelp')">
+                  <UInputNumber v-model="form.stop_after" :min="0" :max="100" class="w-full" />
+                </UFormField>
+              </div>
+              <div v-if="burn?.code_map || burn?.lessons || burn?.coverage" class="space-y-2 text-xs">
+                <p class="font-medium">{{ t('burn.learned') }}</p>
+                <template v-if="burn?.lessons">
+                  <p class="font-medium text-(--ui-text-muted)">{{ t('burn.lessons') }}</p>
+                  <p class="whitespace-pre-line">{{ burn.lessons }}</p>
+                </template>
+                <template v-if="burn?.coverage">
+                  <p class="font-medium text-(--ui-text-muted)">{{ t('burn.coverage', { n: coverage.done, max: coverage.total }) }}</p>
+                  <p class="max-h-64 overflow-y-auto whitespace-pre-line font-mono">{{ burn.coverage }}</p>
+                </template>
+                <template v-if="burn?.code_map">
+                  <p class="font-medium text-(--ui-text-muted)">{{ t('burn.codeMap') }}</p>
+                  <p class="max-h-64 overflow-y-auto whitespace-pre-line font-mono">{{ burn.code_map }}</p>
+                </template>
+              </div>
+            </div>
+          </details>
         </div>
       </template>
       <template #footer>
-        <UButton :label="t('common.save')" :loading="saving" :disabled="!!offAgent" @click="saveSettings" />
+        <div class="flex w-full items-center justify-end gap-2">
+          <UButton color="neutral" variant="ghost" :label="t('common.cancel')" @click="settingsOpen = false" />
+          <UButton icon="i-lucide-save" :label="t('common.save')" :loading="saving" :disabled="!!offAgent || (form.plan.auto && !form.plan.days.length)" @click="saveSettings" />
+        </div>
       </template>
     </USlideover>
 
-    <!-- starting: what it means, when it stops -->
-    <UModal v-model:open="confirmOpen" :title="t('burn.confirmTitle')">
+    <!-- a piece's reviews, to read -->
+    <USlideover :open="!!reviewing" :title="t('burn.review.viewTitle', { title: reviewing?.title ?? '' })" :ui="{ content: 'sm:max-w-2xl' }" @update:open="v => { if (!v) reviewingId = null }">
       <template #body>
-        <div class="space-y-3 text-sm">
-          <UAlert v-if="offAgent" color="error" variant="subtle" icon="i-lucide-power-off" :title="t('burn.agentOff', { name: offAgent.name })" />
-          <UAlert color="warning" variant="subtle" icon="i-lucide-shield-alert" :title="t('burn.confirmWarn')" :description="t('burn.confirmDesc', { mode: t(`burn.mode.${form.result_mode}`) })" />
-          <UFormField :label="t('burn.endLabel')">
-            <URadioGroup
-              v-model="endMode"
-              :items="[
-                ...(data?.weekly_reset ? [{ value: 'reset', label: t('burn.endReset', { at: when(data.weekly_reset) }) }] : []),
-                { value: 'hours', label: t('burn.endHours') },
-                { value: 'at', label: t('burn.endAt') },
-                { value: 'none', label: t('burn.endNone') }
-              ]"
-            />
+        <div v-if="reviewing" class="space-y-3">
+          <UTabs v-if="reviewTabs.length > 1" v-model="reviewTab" :items="reviewTabs" :content="false" size="sm" />
+          <RunTranscript v-if="chatOf(reviewing, reviewTab)" :key="reviewTab" :project-id="projectId" :conversation-id="chatOf(reviewing, reviewTab)!" />
+        </div>
+      </template>
+    </USlideover>
+
+    <!-- a quest to give -->
+    <UModal v-model:open="questOpen" :title="t('burn.quest.add')" :description="t('burn.quest.help')">
+      <template #body>
+        <div class="space-y-3">
+          <UFormField :label="t('burn.quest.title')" required>
+            <UInput v-model="quest.title" :maxlength="160" class="w-full" :placeholder="t('burn.quest.titlePlaceholder')" autofocus />
           </UFormField>
-          <UInputNumber v-if="endMode === 'hours'" v-model="endHours" :min="1" :max="168" class="w-40" />
-          <UInput v-if="endMode === 'at'" v-model="endAt" type="datetime-local" class="w-60" />
+          <UFormField :label="t('burn.quest.detail')">
+            <UTextarea v-model="quest.detail" :rows="4" :maxlength="4000" autoresize class="w-full" />
+          </UFormField>
         </div>
       </template>
       <template #footer>
         <div class="flex w-full justify-end gap-2">
-          <UButton color="neutral" variant="ghost" :label="t('common.cancel')" @click="confirmOpen = false" />
-          <UButton color="warning" icon="i-lucide-flame" :label="t('burn.confirmStart')" :loading="acting === 'start'" :disabled="!!offAgent" @click="start" />
+          <UButton color="neutral" variant="ghost" :label="t('common.cancel')" @click="questOpen = false" />
+          <UButton icon="i-lucide-plus" :label="t('burn.quest.add')" :loading="acting === 'quest'" :disabled="!quest.title.trim()" @click="addQuest" />
         </div>
       </template>
     </UModal>
+
   </div>
 </template>

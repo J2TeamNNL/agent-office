@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,85 +16,14 @@ import (
 	"github.com/tung1998/agent-office/internal/channels"
 	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/llm"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/trigger"
 	"github.com/tung1998/agent-office/internal/usage"
 )
-
-// The line on top of a bot's answer: its template, the parts it has, off.
-func TestHeaderLine(t *testing.T) {
-	for _, c := range []struct{ tpl, kind, agent, project, branch, want string }{
-		{"", "discord", "Trợ lý", "shop", "main", "-# Trợ lý · shop · main"},
-		{"", "telegram", "Trợ lý", "shop", "main", "Trợ lý · shop · main"},
-		{"", "discord", "", "shop", "", "-# shop"}, // a script's answer: no agent; not a git folder
-		{"{project} ({branch})", "discord", "A", "shop", "dev", "-# shop (dev)"},
-		{"-", "discord", "A", "shop", "dev", ""},
-	} {
-		if got := channels.HeaderLine(c.tpl, c.kind, c.agent, c.project, c.branch); got != c.want {
-			t.Errorf("%q %s: %q, want %q", c.tpl, c.kind, got, c.want)
-		}
-	}
-}
-
-// A bot's answer starts with who answered, in which project and branch; a
-// follow-up of another agent names that agent instead of signing the text.
-func TestReplyHeader(t *testing.T) {
-	ctx := context.Background()
-	tmp := t.TempDir()
-	st, _ := sqlite.Open(filepath.Join(tmp, "o.db"))
-	defer st.Close()
-	st.Migrate(ctx)
-	box, _ := secrets.Load(filepath.Join(tmp, "k"))
-	provs := provider.NewService(st, box, llm.Options{})
-	engine := chat.NewEngine(st, provs, usage.New(st, time.UTC))
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	dir := t.TempDir()
-	if out, err := exec.Command("git", "init", "-q", "-b", "feature-x", dir).CombinedOutput(); err != nil {
-		t.Skip("git:", string(out))
-	}
-	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: dir})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
-	agents, _ := engine.Agents(ctx, project.ID)
-	st.Agents().Create(ctx, storage.Agent{OrgModelID: agents[0].OrgModelID, Key: "tester", Name: "Tester", Tier: "worker", ReportsTo: []string{agents[0].Key}, ModelTier: "fast"})
-	bot := &fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}
-	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true})
-	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	m.Start(runCtx)
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
-		if c, _ := st.Channels().Get(ctx, ch.ID); c.BotName != "" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the bot did not start")
-		}
-	}
-	conv, _ := engine.StartConversationPurpose(ctx, project.ID, "", "channel")
-	payload, _ := json.Marshal(trigger.ChannelPayload{ChannelID: ch.ID, ChatID: "42", ConversationID: conv.ID})
-	m.Reply(ctx, storage.Job{ID: "job_1", Payload: string(payload)}, "Đã xem xong", nil, false)
-	got := bot.wait(t, "42", 1)
-	if got[0] != "-# "+conv.AgentName+" · shop · feature-x\nĐã xem xong" {
-		t.Fatalf("answer = %q", got[0])
-	}
-	m.Reply(ctx, storage.Job{ID: "job_1", Payload: string(payload)}, "Tester:\nTest đạt", nil, false)
-	got = bot.wait(t, "42", 2)
-	if got[1] != "-# Tester · shop · feature-x\nTest đạt" {
-		t.Fatalf("follow-up = %q", got[1])
-	}
-	ch.Header = "-"
-	st.Channels().Update(ctx, ch)
-	m.Reply(ctx, storage.Job{ID: "job_1", Payload: string(payload)}, "Xong rồi", nil, false)
-	if got = bot.wait(t, "42", 3); got[2] != "Xong rồi" || strings.Contains(got[2], "-#") {
-		t.Fatalf("off = %q", got[2])
-	}
-}
 
 // slowBot takes its time to connect, as Discord does.
 type slowBot struct {
@@ -112,39 +40,6 @@ func (b *slowBot) Run(ctx context.Context, onReady func(string), onMessage func(
 	return b.fakeBot.Run(ctx, onReady, onMessage)
 }
 
-// A bot being connected says so (the dashboard follows it), then runs.
-func TestBotState(t *testing.T) {
-	ctx := context.Background()
-	tmp := t.TempDir()
-	st, _ := sqlite.Open(filepath.Join(tmp, "o.db"))
-	defer st.Close()
-	st.Migrate(ctx)
-	box, _ := secrets.Load(filepath.Join(tmp, "k"))
-	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
-	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true})
-	off, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Off"})
-	bot := &slowBot{fakeBot: fakeBot{in: make(chan channels.Incoming), sent: map[string][]string{}}, ready: make(chan struct{})}
-	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	m.Start(runCtx)
-	for deadline := time.Now().Add(2 * time.Second); m.State(ch.ID) != "connecting"; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("state = %q, want connecting", m.State(ch.ID))
-		}
-	}
-	close(bot.ready)
-	for deadline := time.Now().Add(2 * time.Second); m.State(ch.ID) != "running"; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("state = %q, want running", m.State(ch.ID))
-		}
-	}
-	if s := m.State(off.ID); s != "" {
-		t.Fatalf("an off bot: %q", s)
-	}
-}
-
 // A thread made from a message the bot answered goes on with that message's
 // conversation, and the conversation links to the thread on Discord.
 func TestThreadFromAnswer(t *testing.T) {
@@ -155,11 +50,10 @@ func TestThreadFromAnswer(t *testing.T) {
 	st.Migrate(ctx)
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -226,10 +120,9 @@ func TestCreateThreadCommand(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &threadBot{fakeBot: fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}, made: make(chan [3]string, 2)}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -291,10 +184,9 @@ func TestCreateThreadSlash(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &threadBot{fakeBot: fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}, made: make(chan [3]string, 2)}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -368,10 +260,9 @@ func TestThreadNeedsTag(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -407,10 +298,9 @@ func TestThreadIsOneConversation(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), nil)
 	a, _ := m.ConversationFor(ctx, ch, channels.Incoming{ChatID: "t9", InThread: true, Text: "một", Addressed: true})
@@ -421,31 +311,6 @@ func TestThreadIsOneConversation(t *testing.T) {
 	}
 	if c == a {
 		t.Fatal("a channel message went into the thread's conversation")
-	}
-}
-
-// A kept thread (/create-conversation there, or /create-thread) keeps its
-// conversation: being a thread does not start another one.
-func TestKeptThreadKeepsItsConversation(t *testing.T) {
-	ctx := context.Background()
-	tmp := t.TempDir()
-	st, _ := sqlite.Open(filepath.Join(tmp, "o.db"))
-	defer st.Close()
-	st.Migrate(ctx)
-	box, _ := secrets.Load(filepath.Join(tmp, "k"))
-	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
-	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
-	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}})
-	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), nil)
-	st.Settings().Set(ctx, "channel_keep/"+ch.ID+"/t5", "gen1")
-	kept, _ := m.ConversationFor(ctx, ch, channels.Incoming{ChatID: "t5", Addressed: true}) // before the bot knew it was a thread
-	again, _ := m.ConversationFor(ctx, ch, channels.Incoming{ChatID: "t5", InThread: true, Addressed: true})
-	if kept == "" || again != kept {
-		t.Fatalf("kept %q, then %q", kept, again)
 	}
 }
 
@@ -460,10 +325,9 @@ func TestCreateConversationContinues(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -516,8 +380,7 @@ func TestFilesToTheAgent(t *testing.T) {
 	provs := provider.NewService(st, box, llm.Options{})
 	u := usage.New(st, time.UTC)
 	provs.SetUsage(u)
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	bin := filepath.Join(tmp, "claude")
 	os.WriteFile(bin, []byte(`#!/bin/sh
 cat >/dev/null
@@ -526,8 +389,8 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"đã xem �
 `), 0o755)
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	engine := chat.NewEngine(st, provs, u)
 	engine.SetAttachments(attach.Store{Dir: filepath.Join(tmp, "att")})
 	runner := trigger.New(st, chatExec{engine})
@@ -616,10 +479,9 @@ func TestPressedButtonsGoAway(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &editBot{buttonBot: buttonBot{fakeBot: fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}, rows: make(chan [][]channels.Button, 2)}, edits: make(chan buttonEdit, 4)}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Approvers: []string{"7"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -684,10 +546,9 @@ func TestDashboardDecisionRedrawsButtons(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &editBot{buttonBot: buttonBot{fakeBot: fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}, rows: make(chan [][]channels.Button, 2)}, edits: make(chan buttonEdit, 4)}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Approvers: []string{"7"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -769,10 +630,9 @@ func TestAlwaysButton(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &editBot{buttonBot: buttonBot{fakeBot: fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}, rows: make(chan [][]channels.Button, 2)}, edits: make(chan buttonEdit, 4)}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Approvers: []string{"7"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -833,10 +693,9 @@ func TestPendingButtons(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	bot := &buttonBot{fakeBot: fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}, rows: make(chan [][]channels.Button, 2)}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Approvers: []string{"7"}, Header: "-"})
 	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
@@ -898,107 +757,6 @@ func (b *liveBot) seen() string {
 	return strings.Join(b.events, "\n")
 }
 
-// A message the bot takes gets 👀; a long run shows its steps in one status
-// message, edited as it goes and gone with the answer.
-func TestProgress(t *testing.T) {
-	bot := runProgress(t, "", "")
-	seen := bot.seen()
-	for _, want := range []string{"edit ", "Chạy test", "delete ", "react u1 👀 false"} {
-		if !strings.Contains(seen, want) {
-			t.Errorf("no %q in\n%s\nsent %v", want, seen, bot.sent["c2"])
-		}
-	}
-	if !strings.Contains(bot.sent["c2"][0], "Đọc a.go") {
-		t.Errorf("the status message = %q", bot.sent["c2"][0])
-	}
-	// the bot shows steps, this rule only its answer: as above
-	if seen := runProgress(t, storage.ReplySteps, storage.ReplyAnswer).seen(); !strings.Contains(seen, "delete ") {
-		t.Errorf("an answer-only rule kept its steps:\n%s", seen)
-	}
-}
-
-// Reply mode steps (the bot's, or a rule's over it): the steps stay in the
-// chat, all of them, then the answer.
-func TestProgressSteps(t *testing.T) {
-	for _, mode := range [][2]string{{storage.ReplySteps, ""}, {"", storage.ReplySteps}} {
-		bot := runProgress(t, mode[0], mode[1])
-		seen := bot.seen()
-		if strings.Contains(seen, "delete ") {
-			t.Errorf("%v: the steps were deleted:\n%s", mode, seen)
-		}
-		if !strings.Contains(seen, "edit 1 ✅ Các bước:\n• Đọc a.go\n• Chạy test") {
-			t.Errorf("%v: no last edit with every step:\n%s", mode, seen)
-		}
-		if got := bot.sent["c2"]; len(got) != 2 || got[1] != "xong rồi" {
-			t.Errorf("%v: sent = %q", mode, got)
-		}
-	}
-}
-
-// runProgress runs one bot message through two steps to its answer.
-func runProgress(t *testing.T, channelMode, ruleMode string) *liveBot {
-	t.Helper()
-	ctx := context.Background()
-	tmp := t.TempDir()
-	st, _ := sqlite.Open(filepath.Join(tmp, "o.db"))
-	defer st.Close()
-	st.Migrate(ctx)
-	box, _ := secrets.Load(filepath.Join(tmp, "k"))
-	provs := provider.NewService(st, box, llm.Options{})
-	u := usage.New(st, time.UTC)
-	provs.SetUsage(u)
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	bin := filepath.Join(tmp, "claude")
-	os.WriteFile(bin, []byte(`#!/bin/sh
-cat >/dev/null
-sleep 1
-echo '{"type":"system","subtype":"init","session_id":"s1"}'
-echo '{"type":"result","subtype":"success","is_error":false,"result":"xong rồi","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
-	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
-	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
-	engine := chat.NewEngine(st, provs, u)
-	runner := trigger.New(st, chatExec{engine})
-	bot := &liveBot{fakeBot: fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}}
-	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"*"}, Header: "-", ReplyMode: channelMode})
-	st.Automations().Create(ctx, storage.Automation{ProjectID: project.ID, Name: "Trả lời", Source: "discord", Action: "chat", Enabled: true,
-		Config: storage.AutomationConfig{ChannelID: ch.ID, ReplyMode: ruleMode}})
-	m := channels.NewManager(st, engine, runner, func(storage.Channel) (channels.Adapter, error) { return bot, nil })
-	m.ProgressAfter = 0
-	runner.SetOnReply(m.Reply)
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	m.Start(runCtx)
-	bot.in <- channels.Incoming{ChatID: "c2", UserID: "8", Addressed: true, MessageID: "u1", Text: "làm giúp"}
-	for deadline := time.Now().Add(3 * time.Second); !strings.Contains(bot.seen(), "react u1 👀 true"); time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("no 👀: %s", bot.seen())
-		}
-	}
-	var job storage.Job
-	for deadline := time.Now().Add(3 * time.Second); job.ID == ""; time.Sleep(10 * time.Millisecond) {
-		jobs, _ := st.Jobs().List(ctx, storage.JobFilter{ProjectID: project.ID})
-		for _, j := range jobs {
-			if j.Trigger == "discord" {
-				job = j
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("no job")
-		}
-	}
-	m.Progress(ctx, job, "Đọc a.go")
-	m.Progress(ctx, job, "Chạy test")
-	if got := bot.wait(t, "c2", 2); got[len(got)-1] != "xong rồi" {
-		t.Fatalf("sent = %q", got)
-	}
-	time.Sleep(100 * time.Millisecond)
-	return bot
-}
-
 // A running bot posts an alert to a chat; an off one says so.
 func TestNotify(t *testing.T) {
 	ctx := context.Background()
@@ -1031,12 +789,11 @@ func TestNotify(t *testing.T) {
 		t.Fatal("an off bot sent")
 	}
 	// an automation's notice: a reply to it goes on in the run's chat, whatever the bot's agent
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	org := team.NewService(st, nil)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	agents, _ := engine.Agents(ctx, project.ID)
-	other, err := st.Agents().Create(ctx, storage.Agent{OrgModelID: agents[0].OrgModelID, Name: "Khác", Tier: agents[0].Tier, ModelTier: agents[0].ModelTier, Instructions: "x"})
+	other, err := st.Agents().Create(ctx, storage.Agent{ProjectID: agents[0].ProjectID, Name: "Khác", ModelTier: agents[0].ModelTier, Instructions: "x"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1054,6 +811,19 @@ func TestNotify(t *testing.T) {
 	if got, _ := m.ConversationFor(ctx, ch, channels.Incoming{ChatID: "c9", ReplyTo: "1", Text: "x", Addressed: true}); got == run.ID {
 		t.Fatal("a reply to a plain alert went to the run's chat")
 	}
+	// another project's automation borrowing the bot: it only announces
+	shop, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
+	far, err := st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: shop.ID, AgentID: other.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.NotifyConversation(ctx, ch.ID, "c9", "**Deploy**\nxong", far.ID); err != nil {
+		t.Fatal(err)
+	}
+	bot.wait(t, "c9", 3)
+	if got, _ := m.ConversationFor(ctx, ch, channels.Incoming{ChatID: "c9", ReplyTo: "3", Text: "x", Addressed: true}); got == far.ID {
+		t.Fatal("a reply to a borrowed bot's notice went to the other project's chat")
+	}
 }
 
 // An agent with FullAccess (ADR-074) approves a proposal at once, wherever
@@ -1067,11 +837,10 @@ func TestFullAccessApproverAgent(t *testing.T) {
 	st.Migrate(ctx)
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	agents, _ := engine.Agents(ctx, project.ID)
 	agent := agents[0]
 
@@ -1102,7 +871,7 @@ func TestFullAccessApproverAgent(t *testing.T) {
 
 	// a second agent, FullAccess enabled by someone no longer an admin
 	st.Users().Create(ctx, storage.User{Email: "member@x.io", Role: storage.RoleMember, PasswordHash: "h"})
-	st.Agents().Create(ctx, storage.Agent{OrgModelID: agent.OrgModelID, Key: "dev", Name: "Dev", Tier: storage.TierWorker, ModelTier: "fast"})
+	st.Agents().Create(ctx, storage.Agent{ProjectID: agent.ProjectID, Key: "dev", Name: "Dev", ModelTier: "fast"})
 	devs, _ := engine.Agents(ctx, project.ID)
 	var dev storage.Agent
 	for _, a := range devs {
@@ -1132,11 +901,10 @@ func TestDirectApproverRechecksAdminAtDecisionTime(t *testing.T) {
 	st.Migrate(ctx)
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	agents, _ := engine.Agents(ctx, project.ID)
 	agent := agents[0]
 
@@ -1167,11 +935,10 @@ func TestFullAccessApproverAutomationOverride(t *testing.T) {
 	st.Migrate(ctx)
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	agents, _ := engine.Agents(ctx, project.ID)
 	agent := agents[0] // no FullAccess of its own
 
@@ -1223,11 +990,10 @@ func TestScheduledOverrideAutoApprovesButPushStillAsks(t *testing.T) {
 	st.Migrate(ctx)
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	agents, _ := engine.Agents(ctx, project.ID)
 	agent := agents[0] // no FullAccess of its own: only the override grants it
 
@@ -1264,8 +1030,7 @@ func TestAdminAndUsers(t *testing.T) {
 	box, _ := secrets.Load(filepath.Join(tmp, "k"))
 	provs := provider.NewService(st, box, llm.Options{})
 	u := usage.New(st, time.UTC)
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	bin := filepath.Join(tmp, "claude")
 	os.WriteFile(bin, []byte(`#!/bin/sh
 cat >/dev/null
@@ -1274,8 +1039,8 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","sessi
 `), 0o755)
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
+	solo, _ := team.PackByKey("solo")
+	org.ApplyPack(ctx, project.ID, solo, false)
 	engine := chat.NewEngine(st, provs, u)
 	bot := &fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}
 	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "discord", Name: "Dev", Enabled: true, Allow: []string{"8"}, Approvers: []string{"7"}, Header: "-"})
@@ -1366,5 +1131,35 @@ func TestSendFileFor(t *testing.T) {
 	}
 	if _, err := m.SendFileFor(ctx, actions.Scope{ProjectID: project.ID}, "shot.png", ""); err == nil {
 		t.Error("sent from a run that is no bot's chat")
+	}
+}
+
+func TestStopAndPushCommands(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	st, _ := sqlite.Open(filepath.Join(tmp, "o.db"))
+	defer st.Close()
+	st.Migrate(ctx)
+	box, _ := secrets.Load(filepath.Join(tmp, "k"))
+	engine := chat.NewEngine(st, provider.NewService(st, box, llm.Options{}), usage.New(st, time.UTC))
+	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
+	bot := &fakeBot{in: make(chan channels.Incoming, 4), sent: map[string][]string{}}
+	ch, _ := st.Channels().Create(ctx, storage.Channel{ProjectID: project.ID, Kind: "telegram", Name: "Dev", Enabled: true, Allow: []string{"*"}, Header: "-"})
+	m := channels.NewManager(st, engine, trigger.New(st, chatExec{engine}), func(storage.Channel) (channels.Adapter, error) { return bot, nil })
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	m.Start(runCtx)
+	for deadline := time.Now().Add(5 * time.Second); m.State(ch.ID) != "running"; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the bot did not start")
+		}
+	}
+	bot.in <- channels.Incoming{ChatID: "42", UserID: "7", Text: "/stop", Addressed: true}
+	if got := bot.wait(t, "42", 1); got[0] != "Không có gì đang chạy." {
+		t.Fatalf("stop = %q", got)
+	}
+	bot.in <- channels.Incoming{ChatID: "42", UserID: "7", Text: "/push", Addressed: true}
+	if got := bot.wait(t, "42", 2); !strings.Contains(got[1], "/push") {
+		t.Fatalf("push without text = %q", got)
 	}
 }

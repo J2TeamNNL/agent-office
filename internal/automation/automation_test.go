@@ -251,7 +251,7 @@ func TestSkillCall(t *testing.T) {
 		}
 	}
 	p, s, err := ExpandSkillCall(home, proj, "/deploy lên staging")
-	if err != nil || s.Source != "project" || !strings.Contains(p, "notes.md") || !strings.HasSuffix(p, "Yêu cầu: lên staging") {
+	if err != nil || s.Source != "project" || !strings.Contains(p, "notes.md") || !strings.HasSuffix(p, "Request: lên staging") {
 		t.Fatal(p, err)
 	}
 	if _, _, err := ExpandSkillCall(home, proj, "/nope x"); !errors.Is(err, ErrUnknownSkill) {
@@ -290,6 +290,41 @@ func TestInstallSkillFromFiles(t *testing.T) {
 	}
 }
 
+// An overwrite that fails (bad relative path rejected before anything is
+// touched) must leave the existing skill exactly as it was, with nothing new
+// in the trash.
+func TestInstallSkillOverwriteBadPathKeepsOriginal(t *testing.T) {
+	home := t.TempDir()
+	trash := filepath.Join(home, "trash")
+	in := Installer{Home: home, Trash: trash}
+	dir := filepath.Join(home, ".claude", "skills")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orig := "---\nname: x\n---\noriginal"
+	if _, err := in.InstallSkill(Target{Scope: "user"}, "x", map[string]string{"SKILL.md": orig}, false); err != nil {
+		t.Fatal(err)
+	}
+	_, err := in.InstallSkill(Target{Scope: "user"}, "x", map[string]string{
+		"SKILL.md": orig,
+		"../evil":  "bad",
+	}, true)
+	if err == nil {
+		t.Fatal("expected error for unsafe path")
+	}
+	got, rerr := os.ReadFile(filepath.Join(dir, "x", "SKILL.md"))
+	if rerr != nil {
+		t.Fatalf("original skill missing: %v", rerr)
+	}
+	if string(got) != orig {
+		t.Fatalf("SKILL.md = %q, want unchanged original", got)
+	}
+	entries, _ := os.ReadDir(trash)
+	if len(entries) != 0 {
+		t.Fatalf("trash should be empty, got %v", entries)
+	}
+}
+
 // Repos next to a known project are found too, though Claude Code never opened
 // them; a git worktree (.git is a file) and a plain folder are not.
 func TestScanSiblingRepos(t *testing.T) {
@@ -306,5 +341,90 @@ func TestScanSiblingRepos(t *testing.T) {
 	}
 	if !got["shop"] || !got["admin"] || got["wt"] || got["notes"] || got[".hidden"] {
 		t.Fatalf("projects = %v", got)
+	}
+}
+
+// fakeClaude writes a stand-in `claude` binary: it logs every call (one line
+// per call) to logPath, and makes the first "add-json" call fail (once) when
+// failAddOnce is true, so the InstallMCP rollback path can be exercised
+// without a real Claude Code CLI.
+func fakeClaude(t *testing.T, logPath string, failAddOnce bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "claude")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	if failAddOnce {
+		marker := filepath.Join(dir, "add-failed-once")
+		script += "if [ \"$1\" = mcp ] && [ \"$2\" = add-json ] && [ ! -f " + marker + " ]; then touch " + marker + "; exit 1; fi\n"
+	}
+	script += "exit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// Overwriting a server that add-json accepts normally: one remove, one add.
+func TestInstallMCPOverwriteSucceeds(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	cfg := map[string]any{"mcpServers": map[string]any{"x": map[string]any{"command": "old"}}}
+	raw, _ := json.Marshal(cfg)
+	write(t, filepath.Join(home, ".claude.json"), string(raw))
+
+	log := filepath.Join(t.TempDir(), "calls.log")
+	bin := fakeClaude(t, log, false)
+	in := Installer{Home: home, Trash: t.TempDir(), Claude: func() string { return bin }}
+
+	if err := in.InstallMCP(ctx, Target{Scope: "user"}, "x", map[string]any{"command": "new"}, true); err != nil {
+		t.Fatal(err)
+	}
+	calls, _ := os.ReadFile(log)
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "remove") || !strings.Contains(lines[1], "add-json") {
+		t.Fatalf("calls = %v", lines)
+	}
+}
+
+// Removing an MCP server at user or local scope must back ~/.claude.json up
+// before calling `claude mcp remove`, like every other removal path in this
+// package, so a broken removal has something to recover from.
+func TestRemoveMCPBacksUpClaudeJSON(t *testing.T) {
+	ctx := context.Background()
+	for _, scope := range []string{"user", "local"} {
+		t.Run(scope, func(t *testing.T) {
+			home := t.TempDir()
+			trash := t.TempDir()
+			raw := `{"mcpServers":{"x":{"command":"old"}}}`
+			write(t, filepath.Join(home, ".claude.json"), raw)
+
+			log := filepath.Join(t.TempDir(), "calls.log")
+			bin := fakeClaude(t, log, false)
+			in := Installer{Home: home, Trash: trash, Claude: func() string { return bin }}
+
+			loc := Location{Type: scope}
+			if scope == "local" {
+				loc.ProjectPath = t.TempDir()
+			}
+			bk, err := in.Remove(ctx, Item{Kind: "mcp", Name: "x", Location: loc})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bk == "" {
+				t.Fatal("want a backup path, got none")
+			}
+			got, err := os.ReadFile(bk)
+			if err != nil {
+				t.Fatalf("backup not readable: %v", err)
+			}
+			if string(got) != raw {
+				t.Fatalf("backup = %q, want %q (the file before removal)", got, raw)
+			}
+			calls, _ := os.ReadFile(log)
+			lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+			if len(lines) != 1 || !strings.Contains(lines[0], "remove") {
+				t.Fatalf("calls = %v, want a single remove", lines)
+			}
+		})
 	}
 }

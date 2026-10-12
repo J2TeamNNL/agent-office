@@ -23,6 +23,7 @@ import (
 	"github.com/tung1998/agent-office/internal/selfupdate"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
 	"github.com/tung1998/agent-office/internal/trigger"
+	"github.com/tung1998/agent-office/internal/workflow"
 	"github.com/tung1998/agent-office/internal/worktree"
 	"log/slog"
 	"net"
@@ -62,6 +63,7 @@ func serveCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			shareGoBuildCache() // before anything starts a child process
 
 			cfg, err := loadConfig()
 			if err != nil {
@@ -103,6 +105,11 @@ func serveCmd() *cobra.Command {
 			}
 			// and their tasks, so the tasks list is right and "Chạy lại" works
 			_, _ = a.store.Tasks().FailRunning(ctx, "Office khởi động lại khi Việc đang chạy", time.Now().UTC())
+			// and the workflows they were part of (their turns do not run again);
+			// the chats that called them are told
+			if n, err := a.workflows.EndInterrupted(ctx); err == nil && n > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "office: %d quy trình đang chạy dở được đánh dấu lỗi (khởi động lại)\n", n)
+			}
 			chatEngine := chat.NewEngine(a.store, a.providers, a.usage)
 			chatEngine.SetAttachments(attach.Store{Dir: filepath.Join(h.Dir, "attachments")})
 			// agents edit and check in their own git worktrees (ADR-037)
@@ -118,7 +125,8 @@ func serveCmd() *cobra.Command {
 			// agents' long-term notes (ADR-068); too long, a fast model compacts them
 			mem := memory.New(a.store, compactNotes(a.store, chatEngine))
 			acts.SetMemory(mem)
-			acts.SetSender(chatEngine) // send_to_chat: an agent writes to another chat in its person's name
+			acts.SetSender(chatEngine)  // send_to_chat: an agent writes to another chat in its person's name
+			chatEngine.SetActions(acts) // a workflow's gates: approval cards and check commands
 			office := officetools.New(a.store, procs, acts)
 			mcp := mcpserver.New(office, version)
 			chatEngine.SetOffice(office, mcp, "http://"+loopback(addr)+"/mcp")
@@ -127,7 +135,7 @@ func serveCmd() *cobra.Command {
 			runner := trigger.New(a.store, officeExecutor{chat: chatEngine})
 			go runner.Run(ctx)
 			// the office assistant: a hidden project whose chats span projects (ADR-046)
-			if _, err := assistant.Ensure(ctx, a.store, a.org, filepath.Join(h.Dir, "assistant")); err != nil {
+			if _, err := assistant.Ensure(ctx, a.store, filepath.Join(h.Dir, "assistant")); err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "office: không dựng được trợ lý office: %v\n", err)
 			}
 			assistantID := func(ctx context.Context) string { return assistant.ID(ctx, a.store) }
@@ -164,12 +172,23 @@ func serveCmd() *cobra.Command {
 			bots.SetDecider(chatDecider{store: a.store, chat: chatEngine, acts: acts}) // proposals decided from the chat (ADR-054)
 			office.SetSendFile(bots.SendFileFor)                                       // an agent in a bot's chat posts images and files there (ADR-083)
 			chatEngine.SetOnBotDecided(bots.DecidedOnDashboard)                        // a bot chat's card decided on the dashboard: the bot goes on (ADR-084)
+			chatEngine.SetOnRunWait(bots.AnnounceRun)                                  // a workflow a bot's chat called waits on a person: the chat is told
 			// a project's agent running on its own, finding work (spec 2026-10-01-burn-design)
 			burner := burn.New(a.store, chatEngine, trees)
 			office.SetBurn(func(ctx context.Context, sc officetools.Scope, name string, in officetools.BurnInput) (string, error) {
-				return burner.Tool(ctx, sc, name, burn.ToolInput{Title: in.Title, Kind: in.Kind, Detail: in.Detail, Item: in.Item, Summary: in.Summary, Reason: in.Reason})
+				return burner.Tool(ctx, sc, name, burn.ToolInput{Title: in.Title, Kind: in.Kind, Detail: in.Detail, Item: in.Item, Summary: in.Summary, Reason: in.Reason, What: in.What, Scanned: in.Scanned, Map: in.Map, Priority: in.Priority, Lessons: in.Lessons, Coverage: in.Coverage})
+			})
+			burner.SetNotify(bots.Notify) // a run's summary to the bot's chat its Burn names (ADR-120)
+			// a script's @@quest lines feed the Burn, and may start it (ADR-132)
+			runner.SetQuests(func(ctx context.Context, projectID string, qs []trigger.Quest, start bool, who string) (int, bool, error) {
+				list := make([]burn.Quest, len(qs))
+				for i, q := range qs {
+					list[i] = burn.Quest{Title: q.Title, Detail: q.Detail}
+				}
+				return burner.AddQuests(ctx, projectID, list, start, who)
 			})
 			burner.Start(ctx)
+			chatEngine.SendAllQueued(ctx) // messages that waited in chats when office stopped
 			bots.Start(ctx)
 			// data management: measuring, cleaning by hand and on its own (ADR-095)
 			cleaner := cleanup.New(a.store, chatEngine, trees, filepath.Join(h.Dir, "attachments"), h.DB())
@@ -207,8 +226,8 @@ func serveCmd() *cobra.Command {
 				Office: office, Channels: bots, Memory: mem, Events: liveBus,
 				Store: st, Auth: a.auth, AllowedOrigins: origins,
 				SecureCookies: secureCookies, TrustedProxies: proxies, Logger: log, Version: version,
-				Providers: a.providers, Org: a.org, Setup: setup.New(a.store, a.providers, a.org),
-				Transfer:   transfer.New(a.store, a.providers, a.org),
+				Providers: a.providers, Team: a.team, Setup: setup.New(a.store, a.providers, a.team),
+				Transfer:   transfer.New(a.store, a.providers, a.team, a.workflows.Lib),
 				Usage:      a.usage,
 				CLITools:   cliTools,
 				Chat:       chatEngine,
@@ -216,6 +235,7 @@ func serveCmd() *cobra.Command {
 				Cleanup:    cleaner,
 				Trigger:    runner,
 				Automation: newAutomation(a, h),
+				Workflows:  a.workflows,
 				Ops:        procs,
 				Monitors:   monitors,
 				MCP:        mcp,
@@ -332,6 +352,11 @@ func newAutomation(a *app, h home.Home) *automation.Service {
 	}
 }
 
+// workflowLibrary is the office's workflows (library/workflows/<key>.md).
+func workflowLibrary(h home.Home) workflow.Library {
+	return workflow.Library{Dir: filepath.Join(h.Dir, "library", "workflows")}
+}
+
 // loopback turns a listen address into one reachable from this machine
 // (":8787" or "0.0.0.0:8787" → "127.0.0.1:8787").
 func loopback(addr string) string {
@@ -343,6 +368,17 @@ func loopback(addr string) string {
 		host = "127.0.0.1"
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// shareGoBuildCache has the Go builds and tests office starts (agents,
+// checks, scripts, processes) leave the folder out of the build cache's keys:
+// otherwise every chat worktree caches its own copy of each package and test
+// binary, and the cache grows by tens of GB. GOFLAGS set, even empty, is
+// left as it is.
+func shareGoBuildCache() {
+	if _, set := os.LookupEnv("GOFLAGS"); !set {
+		_ = os.Setenv("GOFLAGS", "-trimpath")
+	}
 }
 
 // exitWithParent stops the server (as on Ctrl+C) when its supervisor dies, so

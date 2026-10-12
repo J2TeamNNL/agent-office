@@ -13,7 +13,9 @@ import (
 
 // choices are the connections a turn of agent may run on, in order: its own
 // one, then its fallbacks top to bottom. One known to be over its limit right
-// now goes to the back (still tried when every other one fails).
+// now goes to the back (still tried when every other one fails); one past a
+// stop threshold the person set is left out (ADR-136), and when that leaves
+// none the turn does not start (a *CapError, read as out of tokens).
 func (e *Engine) choices(ctx context.Context, agent storage.Agent) ([]provider.Choice, error) {
 	chain, err := e.providers.Chain(ctx, agent)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -22,25 +24,100 @@ func (e *Engine) choices(ctx context.Context, agent storage.Agent) ([]provider.C
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now()
 	var ok, over []provider.Choice
+	var capped *CapError
 	for _, c := range chain {
-		if e.overLimit(ctx, c.Provider.ID) {
+		l, has := e.limits(ctx, c.Provider.ID)
+		if ce := capHit(c.Provider, l, has, now); ce != nil {
+			if capped == nil || ce.Until.Before(capped.Until) { // the first one free again
+				capped = ce
+			}
+			continue
+		}
+		if has && overNow(l, now) {
 			over = append(over, c)
 		} else {
 			ok = append(ok, c)
 		}
 	}
+	if len(ok)+len(over) == 0 && capped != nil {
+		return nil, capped
+	}
 	return append(ok, over...), nil
+}
+
+// CapStop: every connection agent may run on is past its stop threshold —
+// until the first of them resets (a Burn waits for it).
+func (e *Engine) CapStop(ctx context.Context, agent storage.Agent) (time.Time, bool) {
+	if e.providers == nil {
+		return time.Time{}, false
+	}
+	var ce *CapError
+	if _, err := e.choices(ctx, agent); errors.As(err, &ce) {
+		return ce.Until, true
+	}
+	return time.Time{}, false
+}
+
+// CapError: a turn not started because its connections passed the stop
+// thresholds the person set on them. Its text says "quota", so the turn is
+// out of tokens: the chat goes on once a window resets.
+type CapError struct {
+	Provider string
+	Window   string
+	Percent  int
+	Until    time.Time
+}
+
+func (c *CapError) Error() string {
+	name := map[string]string{"five_hour": "giới hạn 5 giờ", "seven_day": "giới hạn tuần"}[c.Window] // i18n-ignore
+	if name == "" {
+		name = c.Window
+	}
+	return fmt.Sprintf("%s đã dùng %d%% %s, chạm ngưỡng dừng quota đã đặt: chờ tới %s", // i18n-ignore
+		c.Provider, c.Percent, name, c.Until.Local().Format("02/01 15:04"))
+}
+
+// capHit: p's last report shows a window at or past the stop threshold set
+// for it, not reset yet. Past several: the one resetting last holds it.
+func capHit(p storage.Provider, l Limits, has bool, now time.Time) *CapError {
+	if !has || len(p.LimitCaps) == 0 {
+		return nil
+	}
+	var hit *CapError
+	for name, pct := range p.LimitCaps {
+		w, ok := l.Windows[name]
+		if pct <= 0 || !ok || !w.ResetsAt.After(now) || w.Utilization*100 < float64(pct)-0.5 {
+			continue
+		}
+		if hit == nil || w.ResetsAt.After(hit.Until) {
+			hit = &CapError{Provider: p.Name, Window: name, Percent: int(w.Utilization*100 + 0.5), Until: w.ResetsAt}
+		}
+	}
+	return hit
+}
+
+// limits is the connection's last usage report.
+func (e *Engine) limits(ctx context.Context, providerID string) (Limits, bool) {
+	var l Limits
+	ok, _ := e.store.Settings().Get(ctx, LimitsKey(providerID), &l)
+	return l, ok
 }
 
 // overLimit: the connection's last report says it is out of its quota until
 // a window resets.
 func (e *Engine) overLimit(ctx context.Context, providerID string) bool {
-	var l Limits
-	if ok, _ := e.store.Settings().Get(ctx, LimitsKey(providerID), &l); !ok {
-		return false
+	l, ok := e.limits(ctx, providerID)
+	return ok && overNow(l, time.Now())
+}
+
+func overNow(l Limits, now time.Time) bool {
+	if l.Status == "rejected" && len(l.Windows) == 0 {
+		// Rejected without window detail: no reset time to trust, so treat the
+		// rejection as valid for a short cooldown instead of ignoring it.
+		return l.UpdatedAt.Add(RejectedCooldown).After(now)
 	}
-	now := time.Now()
 	for _, w := range l.Windows {
 		if w.ResetsAt.After(now) && (l.Status == "rejected" || w.Utilization >= 1) {
 			return true
@@ -48,6 +125,11 @@ func (e *Engine) overLimit(ctx context.Context, providerID string) bool {
 	}
 	return false
 }
+
+// RejectedCooldown is how long a provider stays deprioritized/blocked after a
+// "rejected" report that carried no window detail to time a real reset by.
+// Shared with burn.limitHit so chat fallback and Burn's wait agree on it.
+const RejectedCooldown = 5 * time.Minute
 
 // tryNext: a failed run moves on to the next connection only when it failed
 // before doing anything (no tokens written, no tool; its text is then the
@@ -60,5 +142,13 @@ func tryNext(ctx context.Context, res RunResult, err error) bool {
 
 // switchNote is the status line shown when a turn moves to the next connection.
 func switchNote(agent string, from, to provider.Choice, err error) string {
-	return fmt.Sprintf("%s: %s lỗi (%s), chuyển sang %s", agent, from.Provider.Name, truncate(err.Error(), 160), to.Provider.Name)
+	return fmt.Sprintf("%s: %s lỗi (%s), chuyển sang %s", agent, choiceName(from, to), truncate(err.Error(), 160), choiceName(to, from))
+}
+
+// choiceName names a connection, with its model when other names the same one.
+func choiceName(c, other provider.Choice) string {
+	if c.Provider.ID == other.Provider.ID && c.Model != "" {
+		return c.Provider.Name + " · " + c.Model
+	}
+	return c.Provider.Name
 }

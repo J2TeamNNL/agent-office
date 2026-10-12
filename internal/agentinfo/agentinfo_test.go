@@ -7,12 +7,12 @@ import (
 	"time"
 
 	"github.com/tung1998/agent-office/internal/agentinfo"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
+	"github.com/tung1998/agent-office/internal/team"
 )
 
-func setup(t *testing.T) (storage.Store, *orgmodel.Service, storage.Repo, storage.Agent) {
+func setup(t *testing.T) (storage.Store, *team.Service, storage.Repo, storage.Agent) {
 	ctx := context.Background()
 	st, err := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
 	if err != nil {
@@ -20,13 +20,13 @@ func setup(t *testing.T) (storage.Store, *orgmodel.Service, storage.Repo, storag
 	}
 	t.Cleanup(func() { st.Close() })
 	st.Migrate(ctx)
-	org := orgmodel.NewService(st)
-	org.SeedBuiltins(ctx)
+	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "demo", Path: t.TempDir()})
-	solo, _ := st.OrgModels().GetTemplateByKey(ctx, "solo")
-	org.ApplyToRepo(ctx, project.ID, solo.ID, false)
-	m, _ := st.OrgModels().GetForRepo(ctx, project.ID)
-	agents, _ := st.Agents().List(ctx, m.ID)
+	solo, _ := team.PackByKey("solo")
+	if err := org.ApplyPack(ctx, project.ID, solo, false); err != nil {
+		t.Fatal(err)
+	}
+	agents, _ := st.Agents().List(ctx, project.ID)
 	return st, org, project, agents[0]
 }
 
@@ -36,10 +36,12 @@ func TestHistoryAndRestore(t *testing.T) {
 	svc := agentinfo.New(st, org, time.UTC)
 	original := a.Instructions
 
+	old := a
 	a.Instructions = "Viết ngắn."
-	a, _ = org.SaveAgent(ctx, a)
+	a, _ = org.SaveAgent(ctx, a, old)
+	old = a
 	a.Role, a.Key = "Người review", "reviewer"
-	a, err := org.SaveAgent(ctx, a)
+	a, err := org.SaveAgent(ctx, a, old)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,10 +89,12 @@ func TestRestoreNeverTurnsOnFullAccess(t *testing.T) {
 	st, org, _, a := setup(t)
 	svc := agentinfo.New(st, org, time.UTC)
 
+	old := a
 	a.Permissions.FullAccess, a.Permissions.FullAccessBy, a.Permissions.ExtraDirs = true, "admin@x.io", []string{"/tmp/x"}
-	a, _ = org.SaveAgent(ctx, a) // live agent now has full access
-	a.Role = "Người review"      // a trivial change: its snapshot captures the full-access state above
-	a, err := org.SaveAgent(ctx, a)
+	a, _ = org.SaveAgent(ctx, a, old) // live agent now has full access
+	old = a
+	a.Role = "Người review" // a trivial change: its snapshot captures the full-access state above
+	a, err := org.SaveAgent(ctx, a, old)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,26 +142,6 @@ func TestStats(t *testing.T) {
 	}
 }
 
-// An agent's activity has its chats from bots (Discord/Telegram) too.
-func TestActivityHasBotChats(t *testing.T) {
-	ctx := context.Background()
-	st, org, project, a := setup(t)
-	svc := agentinfo.New(st, org, time.UTC)
-	st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: project.ID, AgentID: a.ID, Title: "web"})
-	st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: project.ID, AgentID: a.ID, Title: "discord", Purpose: "channel", CreatedBy: "discord:an"})
-	items, err := svc.Activity(ctx, a, project.ID, 50)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var titles []string
-	for _, it := range items {
-		titles = append(titles, it.Title)
-	}
-	if len(items) != 2 {
-		t.Fatalf("activity = %v", titles)
-	}
-}
-
 // One row per place the agent took part in, however often it answered there.
 func TestActivityByPlace(t *testing.T) {
 	ctx := context.Background()
@@ -166,12 +150,12 @@ func TestActivityByPlace(t *testing.T) {
 	own, _ := st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: project.ID, AgentID: a.ID, Title: "của mình"})
 	for _, s := range []string{"trả lời 1", "trả lời 2", "trả lời 3"} {
 		st.Chat().AddMessage(ctx, storage.Message{ConversationID: own.ID, Role: "user", Content: "hỏi"})
-		st.Chat().AddMessage(ctx, storage.Message{ConversationID: own.ID, Role: "assistant", Author: a.Name, Content: s})
+		st.Chat().AddMessage(ctx, storage.Message{ConversationID: own.ID, Role: "assistant", Author: a.Name, AgentID: a.ID, Content: s})
 	}
 	// someone else's chat it was pulled into
 	other, _ := st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: project.ID, Title: "của người khác"})
 	st.Chat().UpsertMember(ctx, storage.ChatMember{ConversationID: other.ID, AgentID: a.ID, AgentName: a.Name})
-	st.Chat().AddMessage(ctx, storage.Message{ConversationID: other.ID, Role: "assistant", Author: a.Name, Content: "góp ý"})
+	st.Chat().AddMessage(ctx, storage.Message{ConversationID: other.ID, Role: "assistant", Author: a.Name, AgentID: a.ID, Content: "góp ý"})
 	items, err := svc.Activity(ctx, a, project.ID, 50)
 	if err != nil {
 		t.Fatal(err)

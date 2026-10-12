@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,8 +23,12 @@ var (
 	ErrNameTaken   = errors.New("tên kết nối đã tồn tại")
 	ErrNeedsKey    = errors.New("kết nối API cần API key hoặc tên biến môi trường chứa key")
 	ErrBadTier     = errors.New("hạng model chỉ gồm strong, balanced, fast")
+	ErrBadCap      = errors.New("ngưỡng dừng chỉ cho giới hạn 5 giờ, tuần; từ 1 tới 100%")
 	// ErrKeyRequiredForNewURL: a stored key never follows a changed endpoint.
 	ErrKeyRequiredForNewURL = errors.New("đổi địa chỉ API thì phải nhập lại API key (key đã lưu không được gửi tới địa chỉ mới)")
+	// ErrIsDefault: deleting the default connection would leave every agent
+	// without ProviderID (and Default()) unable to resolve a model.
+	ErrIsDefault = errors.New("đây là kết nối mặc định, hãy chọn kết nối khác làm mặc định trước khi xóa")
 )
 
 // Service is the provider use-case layer.
@@ -79,8 +85,12 @@ type Input struct {
 	APIKey     *string
 	APIKeyEnv  string
 	TierModels map[string]string
+	LimitCaps  map[string]int // nil keeps the current ones (ADR-136)
 	Enabled    *bool
 }
+
+// CapWindows are the usage windows a stop threshold can be set on.
+var CapWindows = []string{"five_hour", "seven_day"}
 
 func (s *Service) apply(p *storage.Provider, in Input) error {
 	// A stored key must not follow a new endpoint: whoever can edit the URL could
@@ -127,6 +137,18 @@ func (s *Service) apply(p *storage.Provider, in Input) error {
 	if len(p.TierModels) == 0 {
 		p.TierModels = llm.DefaultTierModels(p.Kind)
 	}
+	if in.LimitCaps != nil {
+		caps := map[string]int{}
+		for k, v := range in.LimitCaps {
+			if !slices.Contains(CapWindows, k) || v < 0 || v > 100 {
+				return ErrBadCap
+			}
+			if v > 0 {
+				caps[k] = v
+			}
+		}
+		p.LimitCaps = caps
+	}
 	if in.Enabled != nil {
 		p.Enabled = *in.Enabled
 	}
@@ -172,6 +194,51 @@ func (s *Service) Update(ctx context.Context, id string, in Input) (storage.Prov
 	return s.store.Providers().Get(ctx, id)
 }
 
+// Delete removes a provider. The default connection cannot be deleted
+// (ErrIsDefault): without it, every agent with no ProviderID of its own
+// breaks on every run (ResolveModel → Default()).
+func (s *Service) Delete(ctx context.Context, id string) error {
+	p, err := s.store.Providers().Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if p.IsDefault {
+		return ErrIsDefault
+	}
+	return s.store.Providers().Delete(ctx, id)
+}
+
+// AgentsUsing returns, across every project, the agents whose own ProviderID
+// or fallback list names providerID. Used to warn before a delete unlinks
+// them (ON DELETE SET NULL silently falls them back to the default).
+func (s *Service) AgentsUsing(ctx context.Context, providerID string) ([]storage.Agent, error) {
+	repos, err := s.store.Repos().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []storage.Agent
+	for _, repo := range repos {
+		agents, err := s.store.Agents().List(ctx, repo.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range agents {
+			if a.ProviderID == providerID {
+				out = append(out, a)
+				continue
+			}
+			for _, entry := range a.FallbackProviderIDs {
+				id, _ := storage.SplitFallback(entry)
+				if id == providerID {
+					out = append(out, a)
+					break
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 // APIKey returns the usable key: from the env var when configured, else decrypted.
 func (s *Service) APIKey(p storage.Provider) (string, error) {
 	if p.APIKeyEnv != "" {
@@ -185,6 +252,9 @@ func (s *Service) APIKey(p storage.Provider) (string, error) {
 	return s.box.Open(p.APIKeyEnc)
 }
 
+// cliBins is the command each CLI provider runs.
+var cliBins = map[storage.ProviderKind]string{storage.ProviderClaudeCLI: "claude", storage.ProviderCodexCLI: "codex", storage.ProviderGeminiCLI: "gemini", storage.ProviderAntigravityCLI: "agy"}
+
 // CLIBin returns the binary a CLI provider runs (explicit path, or the resolver's
 // lookup, or the bare command name).
 func (s *Service) CLIBin(p storage.Provider) string {
@@ -194,7 +264,7 @@ func (s *Service) CLIBin(p storage.Provider) string {
 	if p.BaseURL != "" {
 		return p.BaseURL
 	}
-	bin := map[storage.ProviderKind]string{storage.ProviderClaudeCLI: "claude", storage.ProviderCodexCLI: "codex"}[p.Kind]
+	bin := cliBins[p.Kind]
 	if s.resolveBin != nil {
 		if path := s.resolveBin(bin); path != "" {
 			return path
@@ -206,7 +276,7 @@ func (s *Service) CLIBin(p storage.Provider) string {
 // Client builds an llm client for p.
 func (s *Service) Client(p storage.Provider) (llm.Client, error) {
 	if p.Kind.IsCLI() && p.BaseURL == "" && s.resolveBin != nil {
-		bin := map[storage.ProviderKind]string{storage.ProviderClaudeCLI: "claude", storage.ProviderCodexCLI: "codex"}[p.Kind]
+		bin := cliBins[p.Kind]
 		if path := s.resolveBin(bin); path != "" {
 			p.BaseURL = path
 		}
@@ -227,7 +297,7 @@ type TestResult struct {
 	Response *llm.Result      `json:"response,omitempty"`
 	Provider storage.Provider `json:"-"`
 	// NeedsLogin marks a CLI provider whose account is signed out; CLITool is
-	// the tool the dashboard can sign in without a terminal (claude | codex).
+	// the tool the dashboard can sign in without a terminal (claude | codex | gemini | antigravity).
 	NeedsLogin bool   `json:"needs_login,omitempty"`
 	CLITool    string `json:"cli_tool,omitempty"`
 }
@@ -239,6 +309,10 @@ func cliToolOf(p storage.Provider) string {
 		return "claude"
 	case storage.ProviderCodexCLI:
 		return "codex"
+	case storage.ProviderGeminiCLI:
+		return "gemini"
+	case storage.ProviderAntigravityCLI:
+		return "antigravity"
 	}
 	return ""
 }
@@ -271,10 +345,19 @@ func (s *Service) Test(ctx context.Context, id, prompt, model string) (TestResul
 	res := TestResult{OK: true, Detail: chk.Detail, Models: chk.Models, Version: chk.Version}
 	// Fill tiers the user left empty from the listed models (OpenAI, local servers).
 	if len(chk.Models) > 0 && (p.TierModels[storage.TierStrong] == "" || p.TierModels[storage.TierBalanced] == "" || p.TierModels[storage.TierFast] == "") && !p.Kind.IsCLI() {
-		p.TierModels = llm.SuggestTiers(p.TierModels, chk.Models)
-		if err := s.store.Providers().Update(ctx, p); err != nil {
+		newTiers := llm.SuggestTiers(p.TierModels, chk.Models)
+		ok, err := s.store.Providers().SetTierModels(ctx, id, newTiers, p.TierModels, p.BaseURL, p.Kind)
+		if err != nil {
 			return res, err
 		}
+		if !ok {
+			// Provider was edited (or tiers changed) since Check() started: the
+			// admin's save wins, do not overwrite it with this stale snapshot.
+			slog.Warn("provider test: skipped tier auto-fill, provider changed concurrently", "provider_id", id)
+		}
+		// Keep newTiers on the local snapshot (regardless of whether the DB write
+		// above won) so the prompt call below can pick the balanced model just filled in.
+		p.TierModels = newTiers
 	}
 	if prompt != "" {
 		if model == "" {
@@ -331,28 +414,45 @@ type Choice struct {
 
 // Chain is every connection an agent may run on, in the order to try them:
 // its own (ResolveModel) first, then its fallbacks top to bottom. A fallback
-// runs the agent's tier model of that connection (an explicit model belongs
-// to the first one); deleted, disabled or repeated ones are left out.
+// runs the model its entry names, else the agent's tier model of that
+// connection (an explicit model belongs to the first one). Deleted, turned
+// off or repeated ones are left out: a turned-off own connection hands the
+// agent to the next one.
 func (s *Service) Chain(ctx context.Context, a storage.Agent) ([]Choice, error) {
 	p, model, err := s.ResolveModel(ctx, a)
-	if err != nil {
+	if err != nil && len(a.FallbackProviderIDs) == 0 {
 		return nil, err
 	}
-	out := []Choice{{Provider: p, Model: model}}
-	seen := map[string]bool{p.ID: true}
-	for _, id := range a.FallbackProviderIDs {
-		if seen[id] {
-			continue
+	var out []Choice
+	seen := map[string]bool{}
+	if err == nil {
+		seen[storage.FallbackEntry(p.ID, model)] = true
+		if p.Enabled {
+			out = append(out, Choice{Provider: p, Model: model})
 		}
-		seen[id] = true
+	}
+	for _, entry := range a.FallbackProviderIDs {
+		id, m := storage.SplitFallback(entry)
 		fp, err := s.store.Providers().Get(ctx, id)
 		if err != nil || !fp.Enabled {
 			continue
 		}
-		out = append(out, Choice{Provider: fp, Model: fp.TierModels[a.ModelTier]})
+		if m == "" {
+			m = fp.TierModels[a.ModelTier]
+		}
+		if key := storage.FallbackEntry(id, m); !seen[key] {
+			seen[key] = true
+			out = append(out, Choice{Provider: fp, Model: m})
+		}
+	}
+	if len(out) == 0 {
+		return nil, ErrAllOff
 	}
 	return out, nil
 }
+
+// ErrAllOff: every connection an agent may run on is turned off.
+var ErrAllOff = errors.New("các kết nối AI của agent đều đang tắt")
 
 // Default returns the default provider.
 func (s *Service) Default(ctx context.Context) (storage.Provider, error) {

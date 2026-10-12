@@ -42,6 +42,7 @@ var Kinds = map[string]string{
 	"remember":          "Ghi nhớ",
 	"mcp_call":          "Gọi tool MCP",
 	"send_message":      "Gửi tin sang chat khác",
+	"workflow_gate":     "Duyệt cổng quy trình",
 }
 
 // Sender sends a message to another chat in the name of the person whose
@@ -94,7 +95,7 @@ func isAutomation(kind string) bool {
 
 // Memory keeps agents' notes (ADR-068).
 type Memory interface {
-	Add(ctx context.Context, projectID, agentID, text, source, by string) (storage.Memory, error)
+	Keep(ctx context.Context, m storage.Memory) (storage.Memory, error)
 	Auto(ctx context.Context, projectID string) bool
 }
 
@@ -159,11 +160,7 @@ func isProcess(kind string) bool { return strings.HasSuffix(kind, "_process") }
 
 // agentID is the id of the project's agent of that name.
 func (s *Service) agentID(ctx context.Context, projectID, name string) (string, error) {
-	model, err := s.store.OrgModels().GetForRepo(ctx, projectID)
-	if err != nil {
-		return "", err
-	}
-	agents, err := s.store.Agents().List(ctx, model.ID)
+	agents, err := s.store.Agents().List(ctx, projectID)
 	if err != nil {
 		return "", err
 	}
@@ -201,6 +198,10 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 			return a, errors.New("không gọi tool MCP được ở đây")
 		}
 		a.Target = a.Args.MCP.Server + "/" + a.Args.MCP.Tool
+	} else if kind == "workflow_gate" { // a workflow waits on a person: approving runs nothing
+		if sc.ConversationID == "" || a.Target == "" || a.Reason == "" {
+			return a, errors.New("cổng quy trình cần cuộc chat, tên cổng và điều cần duyệt")
+		}
 	} else if kind == "send_message" { // Target: the chat it goes to, Args.Message: what it says
 		if err := s.checkSend(ctx, sc, &a); err != nil {
 			return a, err
@@ -276,9 +277,13 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 	if (sc.ConversationID != "" || sc.TaskID != "") && kind != "mcp_call" && kind != "send_message" { // differs by its arguments
 		if list, err := s.store.Actions().List(ctx, sc.ConversationID, sc.TaskID, ""); err == nil {
 			for _, x := range list {
-				if x.Status == "pending" && x.Kind == a.Kind && x.Target == a.Target {
-					return x, nil
+				if x.Status != "pending" || x.Kind != a.Kind || x.Target != a.Target {
+					continue
 				}
+				if a.Kind == "git_commit" && !sameFiles(x.Args.Files, a.Args.Files) {
+					continue
+				}
+				return x, nil
 			}
 		}
 	}
@@ -295,7 +300,7 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 	}
 	// a bot's chat in direct mode: approved now, so the agent gets the result
 	// in this turn and goes on (not after its answer, waiting to be asked again)
-	if s.direct != nil && a.JobID != "" {
+	if s.direct != nil && a.JobID != "" && a.Kind != "workflow_gate" { // a gate waits on a person, whatever the chat's way
 		if by, ok := s.direct(ctx, a); ok {
 			done, err := s.Decide(ctx, a.ID, true, by)
 			if err != nil {
@@ -339,6 +344,8 @@ func (s *Service) autoAllowed(ctx context.Context, a storage.Action, acc perm.Ac
 		return false // code that runs unattended, or settings: a person always decides
 	case "mcp_call":
 		return false // the gateway already let through what the agent may call itself
+	case "workflow_gate":
+		return false // the point of the gate: a person decides
 	case "send_message": // never on and on: what a relayed message started asks a person
 		return acc.Can(perm.CapChatSend) && s.sender != nil && !s.sender.Relayed(ctx, a.ConversationID)
 	case "git_commit":
@@ -348,6 +355,9 @@ func (s *Service) autoAllowed(ctx context.Context, a storage.Action, acc perm.Ac
 	case "git_push":
 		return false // publishing code always needs a person
 	case "run_command":
+		if perm.Risky(a.Target) {
+			return false // always asked, never auto-run, even for a pattern saved before this check existed
+		}
 		args, _ := perm.SplitCommand(a.Target)
 		if _, safe := perm.MatchCommand(acc.Safe, args); safe {
 			return true // checks and reads, from read only
@@ -577,6 +587,17 @@ func (s *Service) projectPath(ctx context.Context, projectID string) (string, er
 	return p.Path, nil
 }
 
+// sameFiles compares two commits' file lists as sets, ignoring order.
+func sameFiles(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(a, b)
+}
+
 func firstNonEmpty(a, b string) string {
 	if strings.TrimSpace(a) != "" {
 		return a
@@ -585,8 +606,12 @@ func firstNonEmpty(a, b string) string {
 }
 
 func (s *Service) run(ctx context.Context, a storage.Action) error {
+	if a.Kind == "workflow_gate" {
+		return nil // approved: the workflow goes on (its coordinator is called back, ADR-084)
+	}
 	if a.Kind == "remember" {
-		_, err := s.memory.Add(ctx, a.ProjectID, a.TargetID, a.Target, "agent", a.ProposedBy)
+		_, err := s.memory.Keep(ctx, storage.Memory{ProjectID: a.ProjectID, AgentID: a.TargetID, Text: a.Target, Source: "agent",
+			CreatedBy: a.ProposedBy, Topic: a.Args.Topic, Summary: a.Args.Summary})
 		return err
 	}
 	if a.Kind == "send_message" {

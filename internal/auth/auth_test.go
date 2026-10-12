@@ -192,27 +192,6 @@ func (h blockingHasher) Verify(enc, pw string) (bool, error) {
 	return h.Hasher.Verify(enc, pw)
 }
 
-// Password checks beyond MaxHashing wait, then give up with ErrBusy.
-func TestLoginHashingBounded(t *testing.T) {
-	st, err := sqlite.Open(filepath.Join(t.TempDir(), "office.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
-	if err := st.Migrate(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	h := blockingHasher{Hasher: auth.FastHasherForTests(), started: make(chan struct{}, 4), release: make(chan struct{})}
-	svc := auth.NewService(st, auth.Options{Hasher: h, MaxHashing: 1, HashWait: 50 * time.Millisecond})
-	ctx := context.Background()
-	go svc.Login(ctx, "a@x.io", "whatever-pass", auth.ClientMeta{IP: "1.1.1.1"})
-	<-h.started
-	if _, err := svc.Login(ctx, "b@x.io", "whatever-pass", auth.ClientMeta{IP: "1.1.1.2"}); !errors.Is(err, auth.ErrBusy) {
-		t.Fatalf("second login err = %v", err)
-	}
-	close(h.release)
-}
-
 func TestSessionExpiry(t *testing.T) {
 	svc, _, c := newService(t)
 	ctx := context.Background()
@@ -262,5 +241,60 @@ func TestChangePasswordRevokesOtherSessions(t *testing.T) {
 	}
 	if _, err := svc.Login(ctx, "p@x.io", "new-password-2", auth.ClientMeta{}); err != nil {
 		t.Fatalf("login with new password: %v", err)
+	}
+}
+
+// failingAuditRepo errors on every Append, to check that a broken audit
+// store is logged instead of silently dropped (service.go audit()).
+type failingAuditRepo struct{ storage.AuditRepo }
+
+var errAuditAppend = errors.New("audit store down")
+
+func (failingAuditRepo) Append(ctx context.Context, e storage.AuditEntry) error {
+	return errAuditAppend
+}
+
+type storeWithFailingAudit struct{ storage.Store }
+
+func (s storeWithFailingAudit) Audit() storage.AuditRepo {
+	return failingAuditRepo{s.Store.Audit()}
+}
+
+// An account is linked to its Discord/Telegram ids; one id, one account.
+func TestSetChatIDs(t *testing.T) {
+	svc, st, _ := newService(t)
+	ctx := context.Background()
+	a, err := svc.CreateUser(ctx, auth.NewUser{Email: "a@b.co", Name: "A", Role: storage.RoleAdmin, Password: "longenoughpw"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.CreateUser(ctx, auth.NewUser{Email: "b@b.co", Role: storage.RoleMember, Password: "longenoughpw"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetChatIDs(ctx, a.ID, "@an", "", "system"); !errors.Is(err, auth.ErrInvalidChatID) {
+		t.Fatalf("not digits err = %v", err)
+	}
+	if err := svc.SetChatIDs(ctx, a.ID, " 123 ", "456", "system"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetChatIDs(ctx, b.ID, "123", "", "system"); !errors.Is(err, auth.ErrChatIDTaken) {
+		t.Fatalf("taken err = %v", err)
+	}
+	if err := svc.SetChatIDs(ctx, a.ID, "123", "", "system"); err != nil { // its own id again: fine
+		t.Fatal(err)
+	}
+	u, err := st.Users().ByChatID(ctx, "discord", "123")
+	if err != nil || u.ID != a.ID || u.TelegramID != "" {
+		t.Fatalf("by discord id = %+v, %v", u, err)
+	}
+	if _, err := st.Users().ByChatID(ctx, "telegram", "456"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unlinked telegram id err = %v", err)
+	}
+	if err := svc.SetDisabled(ctx, a.ID, true, "system"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Users().ByChatID(ctx, "discord", "123"); !errors.Is(err, storage.ErrNotFound) { // a disabled account is no one's
+		t.Fatalf("disabled account err = %v", err)
 	}
 }

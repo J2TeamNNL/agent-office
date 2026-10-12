@@ -26,17 +26,19 @@ import (
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/mcpgateway"
 	"github.com/tung1998/agent-office/internal/mcpserver"
+	"github.com/tung1998/agent-office/internal/monitor"
 	"github.com/tung1998/agent-office/internal/officetools"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
 	officesetup "github.com/tung1998/agent-office/internal/setup"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/transfer"
 	"github.com/tung1998/agent-office/internal/trigger"
 	"github.com/tung1998/agent-office/internal/usage"
+	"github.com/tung1998/agent-office/internal/workflow"
 )
 
 type env struct {
@@ -65,32 +67,41 @@ func setup(t *testing.T) *env { return setupWith(t, nil) }
 var cliPath string
 
 func setupWith(t *testing.T, proxies []netip.Prefix) *env {
+	return setupWithStore(t, proxies, nil)
+}
+
+// setupWithStore is setupWith with an optional wrap around the real sqlite
+// store (e.g. to fail a specific repo call and exercise an error branch).
+func setupWithStore(t *testing.T, proxies []netip.Prefix, wrap func(storage.Store) storage.Store) *env {
 	t.Helper()
-	st, err := sqlite.Open(filepath.Join(t.TempDir(), "office.db"))
+	sqliteSt, err := sqlite.Open(filepath.Join(t.TempDir(), "office.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
-	if err := st.Migrate(context.Background()); err != nil {
+	t.Cleanup(func() { sqliteSt.Close() })
+	if err := sqliteSt.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	var st storage.Store = sqliteSt
+	if wrap != nil {
+		st = wrap(st)
 	}
 	svc := auth.NewService(st, auth.Options{Hasher: auth.FastHasherForTests()})
 	box, err := secrets.Load(filepath.Join(t.TempDir(), "secret.key"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	org := orgmodel.NewService(st)
-	if _, err := org.SeedBuiltins(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	wfs := &workflow.Service{Store: st, Lib: workflow.Library{Dir: filepath.Join(t.TempDir(), "workflows")}}
+	wfs.Lib.Seed()
+	org := team.NewService(st, wfs)
 	provs := provider.NewService(st, box, llm.Options{})
 	u := usage.New(st, time.UTC)
 	provs.SetUsage(u)
 	chatEng := chat.NewEngine(st, provs, u)
 	acts := actions.New(st, nil)
 	bus := events.New(20 * time.Millisecond)
-	st.OnWrite(bus.Wrote)
-	st.OnChat(bus.Chat)
+	sqliteSt.OnWrite(bus.Wrote)
+	sqliteSt.OnChat(bus.Chat)
 	mem := memory.New(st, func(_ context.Context, _, _ string, items []storage.Memory) ([]string, error) {
 		return []string{fmt.Sprintf("gộp %d ghi nhớ", len(items))}, nil
 	})
@@ -99,9 +110,10 @@ func setupWith(t *testing.T, proxies []netip.Prefix) *env {
 	office.SetOffice(func(ctx context.Context) string { return assistant.ID(ctx, st) })
 	mcp := mcpserver.New(office, "test")
 	h := api.New(api.Config{Store: st, Auth: svc, AllowedOrigins: []string{"http://localhost:3000"}, TrustedProxies: proxies,
-		Providers: provs, Org: org, Setup: officesetup.New(st, provs, org), Transfer: transfer.New(st, provs, org), Usage: u, CLITools: cliManager(), Chat: chatEng,
+		Providers: provs, Team: org, Setup: officesetup.New(st, provs, org), Transfer: transfer.New(st, provs, org, wfs.Lib), Workflows: wfs, Usage: u, CLITools: cliManager(), Chat: chatEng,
 		Trigger: trigger.New(st, idleExec{}), Actions: acts, Office: office, MCP: mcp, Memory: mem, Events: bus, Automation: testAutomation(t, st),
-		Gateway: &mcpgateway.Gateway{Store: st, Box: box, Auth: mcp.Authorized, Identify: testIdentify(mcp)}})
+		Monitors: monitor.New(st, nil, chatEng),
+		Gateway:  &mcpgateway.Gateway{Store: st, Box: box, Auth: mcp.Authorized, Identify: testIdentify(mcp)}})
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	ctx := context.Background()

@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"errors"
 	"github.com/tung1998/agent-office/internal/assistant"
+	"github.com/tung1998/agent-office/internal/chat"
 	"net/http"
 	"strconv"
 	"strings"
@@ -158,6 +160,10 @@ func (s *server) jobStats(w http.ResponseWriter, r *http.Request) {
 		f.Since = time.Now().UTC().AddDate(0, 0, -7)
 	}
 	f.Status, f.Before, f.Limit = "", "", 0
+	own, me := assistant.ID(r.Context(), s.cfg.Store), "human:"+userFrom(r).Email
+	if own != "" {
+		f.HideOthersIn, f.Me = own, me // an assistant chat is its creator's alone (ADR-046)
+	}
 	by := r.URL.Query().Get("by")
 	rows, err := s.cfg.Store.Jobs().Stats(r.Context(), f, by)
 	if err != nil {
@@ -165,7 +171,7 @@ func (s *server) jobStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// the numbers of the moment: running and waiting now, failed and spent in 24h
-	now := storage.JobFilter{ProjectID: f.ProjectID, Kind: f.Kind, Origin: f.Origin, OriginID: f.OriginID, AgentID: f.AgentID}
+	now := storage.JobFilter{ProjectID: f.ProjectID, Kind: f.Kind, Origin: f.Origin, OriginID: f.OriginID, AgentID: f.AgentID, HideOthersIn: f.HideOthersIn, Me: f.Me}
 	count := func(status string, since time.Time) int {
 		x := now
 		x.Status, x.Since, x.Limit = status, since, 200
@@ -187,22 +193,62 @@ func (s *server) jobStats(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
+// cancelJobRaceHook runs right after cancelJob's initial Get, before it acts
+// on the job's status. Tests use it to force the window where StartReady's
+// Claim flips a still-pending job to running between that Get and the
+// FinishIfPending write below.
+var cancelJobRaceHook = func() {}
+
 func (s *server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	j, err := s.cfg.Store.Jobs().Get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		s.writeDomainError(w, r, err)
 		return
 	}
-	switch {
-	case j.Status == "pending":
-		j, err = s.cfg.Store.Jobs().Finish(r.Context(), j.ID, "cancelled", "cancelled", "", time.Now().UTC())
-		if err != nil {
-			s.internal(w, r, err)
+	cancelJobRaceHook()
+	racedClaim := false // StartReady/Claim won the race between our Get and the pending write below
+	if j.Status == "pending" {
+		nj, ferr := s.cfg.Store.Jobs().FinishIfPending(r.Context(), j.ID, "cancelled", "cancelled", "", time.Now().UTC())
+		switch {
+		case ferr == nil:
+			j = nj
+		case errors.Is(ferr, storage.ErrConflict):
+			if cur, gerr := s.cfg.Store.Jobs().Get(r.Context(), j.ID); gerr == nil {
+				j = cur
+			}
+			racedClaim = true
+		default:
+			s.internal(w, r, ferr)
 			return
 		}
+	}
+	switch {
+	case j.Status == "cancelled":
+		// already finished above
 	case j.Status == "running" && j.Kind == "chat_turn" && j.ConversationID != "":
 		if t, ok := s.cfg.Chat.TurnByJob(j.ID); ok { // a hand-off in the background has its own job
 			t.Cancel()
+		} else if racedClaim {
+			// Claim just flipped it to running: execute() is still setting up
+			// (reading the automation, building the prompt) and hasn't
+			// registered a Turn yet, so TurnByJob finding nothing here does NOT
+			// mean the run is dead — unlike the same situation reached directly
+			// below. Treat it as still alive: refuse the cancel instead of
+			// calling FinishIfRunning, which would mark it cancelled while the
+			// run goes on to actually execute.
+			writeError(w, http.StatusConflict, "job này không còn chạy")
+			return
+		} else if nj, ferr := s.cfg.Store.Jobs().FinishIfRunning(r.Context(), j.ID, "cancelled", "cancelled", "", time.Now().UTC()); ferr == nil {
+			j = nj // no turn in memory (already finished, or lost on restart): cancel the job record itself
+		} else if errors.Is(ferr, storage.ErrConflict) {
+			if cur, gerr := s.cfg.Store.Jobs().Get(r.Context(), j.ID); gerr == nil {
+				j = cur
+			}
+			writeError(w, http.StatusConflict, "job này không còn chạy")
+			return
+		} else {
+			s.internal(w, r, ferr)
+			return
 		}
 	default:
 		writeError(w, http.StatusConflict, "job này không còn chạy")
@@ -313,8 +359,19 @@ func (s *server) jobGroups(w http.ResponseWriter, r *http.Request) {
 				if c.Purpose == "skill" { // a skill editor's chat opens the editor again
 					d.Link = base + "/skills/edit?c=" + c.ID
 				}
-				if c.Purpose == "template" { // a template written with the assistant: its editor
-					d.Link = "/templates/new?c=" + c.ID
+				if c.Purpose == chat.BurnReviewPurpose || c.Purpose == chat.BurnWorkPurpose { // a Burn piece's own chat: the Burn
+					d.Link = base + "?tab=burn"
+				}
+				if c.Purpose == chat.RunPurpose { // a workflow run's own chat: the run's page
+					if runs, err := s.cfg.Store.WorkflowRuns().List(ctx, c.ProjectID, c.ID, 1); err == nil && len(runs) > 0 {
+						d.Link = base + "/workflows/runs/" + runs[0].ID
+					}
+				}
+				if c.Purpose == "workflow" { // a workflow's editor: the library's (the assistant's chat) or the project's
+					d.Link = base + "/workflows/edit?c=" + c.ID
+					if c.ProjectID == assistant.ID(ctx, s.cfg.Store) {
+						d.Link = "/workflows/edit?c=" + c.ID
+					}
 				}
 			}
 		case "t:": // a task from before Việc was dropped (ADR-057): its latest job

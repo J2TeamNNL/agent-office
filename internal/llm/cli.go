@@ -3,11 +3,15 @@ package llm
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -15,7 +19,15 @@ import (
 
 // run executes bin with args, feeding stdin; stderr is kept for error messages.
 func run(ctx context.Context, bin string, stdin string, args ...string) (string, error) {
+	return runEnv(ctx, bin, stdin, nil, args...)
+}
+
+// runEnv is run with extra environment variables.
+func runEnv(ctx context.Context, bin string, stdin string, env []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -26,10 +38,16 @@ func run(ctx context.Context, bin string, stdin string, args ...string) (string,
 		return "", fmt.Errorf("không tìm thấy lệnh %q trong PATH", bin)
 	}
 	if err != nil {
-		return stdout.String(), fmt.Errorf("%s: %v: %s", bin, err, cliFailure(stdout.String(), stderr.String()))
+		return stdout.String(), &cliError{msg: fmt.Sprintf("%s: %v: %s", bin, err, cliFailure(stdout.String(), stderr.String())), stderr: stderr.String()}
 	}
 	return stdout.String(), nil
 }
+
+// cliError keeps a failed run's whole stderr for CLIs whose reason is not
+// at the end (Gemini prints it first, then a stack trace).
+type cliError struct{ msg, stderr string }
+
+func (e *cliError) Error() string { return e.msg }
 
 // cliFailure turns a failed run's output into one readable line. CLIs print
 // their result as JSON whose reason (result/subtype/errors) sits at the END of
@@ -227,10 +245,258 @@ func (c *codexCLI) Complete(ctx context.Context, req Request) (Result, error) {
 			res.InputTokens, res.OutputTokens = ev.Usage.InputTokens, ev.Usage.OutputTokens
 		}
 	}
+	if err := sc.Err(); err != nil {
+		return Result{}, fmt.Errorf("codex: đọc output lỗi: %w", err)
+	}
 	if res.Text == "" {
 		return Result{}, errors.New("codex: không có câu trả lời trong output")
 	}
 	return res, nil
+}
+
+// ---- Gemini ----
+
+type geminiCLI struct{ bin string }
+
+// DefaultModelsGemini are Gemini CLI's model aliases (they follow its newest
+// models) and a few pinned names; the CLI cannot list models.
+var DefaultModelsGemini = []string{"auto", "pro", "flash", "flash-lite", "gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-2.5-pro", "gemini-2.5-flash"}
+
+// GeminiSignedIn reports whether Gemini CLI has credentials: a Google sign-in
+// cached in ~/.gemini, or an API key / Vertex / Code Assist setup in the
+// environment or ~/.gemini/.env.
+func GeminiSignedIn() bool {
+	ok, _ := GeminiAccount()
+	return ok
+}
+
+// GeminiAccount is GeminiSignedIn plus the Google account Gemini CLI signed
+// in with ("" for a key from the environment or an unknown account).
+func GeminiAccount() (bool, string) {
+	for _, k := range []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA", "GOOGLE_CLOUD_ACCESS_TOKEN"} {
+		if os.Getenv(k) != "" {
+			return true, ""
+		}
+	}
+	home := os.Getenv("GEMINI_CLI_HOME")
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	dir := filepath.Join(home, ".gemini")
+	if _, err := os.Stat(filepath.Join(dir, "oauth_creds.json")); err == nil {
+		var acc struct {
+			Active string `json:"active"`
+		}
+		raw, _ := os.ReadFile(filepath.Join(dir, "google_accounts.json"))
+		_ = json.Unmarshal(raw, &acc)
+		return true, acc.Active
+	}
+	env, _ := os.ReadFile(filepath.Join(dir, ".env"))
+	return geminiEnvKey.Match(env), ""
+}
+
+var geminiEnvKey = regexp.MustCompile(`(?m)^\s*(export\s+)?(GEMINI_API_KEY|GOOGLE_API_KEY)\s*=\s*\S`)
+
+func (c *geminiCLI) Check(ctx context.Context) (CheckResult, error) {
+	out, err := run(ctx, c.bin, "", "--version")
+	if err != nil {
+		return CheckResult{}, err
+	}
+	v := strings.TrimSpace(out)
+	if !GeminiSignedIn() {
+		return CheckResult{}, fmt.Errorf("%s · %w: hãy bấm Đăng nhập (tài khoản Google) hoặc đặt GEMINI_API_KEY", v, ErrNeedsLogin)
+	}
+	return CheckResult{Version: v, Models: DefaultModelsGemini, Detail: v}, nil
+}
+
+func (c *geminiCLI) Complete(ctx context.Context, req Request) (Result, error) {
+	start := time.Now()
+	// headless because stdin is not a terminal; default approval keeps it to reading
+	args := []string{"--output-format", "json", "--approval-mode", "default"}
+	if req.Model != "" {
+		args = append(args, "-m", req.Model)
+	}
+	prompt := req.Prompt
+	if req.System != "" {
+		prompt = req.System + "\n\n" + req.Prompt
+	}
+	out, err := runEnv(ctx, c.bin, prompt, []string{"GEMINI_CLI_TRUST_WORKSPACE=true"}, args...)
+	var res struct {
+		Response string `json:"response"`
+		Error    *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Stats struct {
+			Models map[string]struct {
+				Tokens struct {
+					Prompt     int `json:"prompt"`
+					Candidates int `json:"candidates"`
+				} `json:"tokens"`
+			} `json:"models"`
+		} `json:"stats"`
+	}
+	jerr := json.Unmarshal([]byte(lastJSONObject(out)), &res)
+	if err != nil || jerr != nil || res.Error != nil {
+		var ce *cliError
+		if errors.As(err, &ce) && res.Error == nil {
+			if msg := GeminiError(ce.stderr); msg != "" {
+				return Result{}, fmt.Errorf("gemini: %s", msg)
+			}
+		}
+		if !GeminiSignedIn() {
+			return Result{}, fmt.Errorf("%w: Gemini CLI chưa đăng nhập", ErrNeedsLogin)
+		}
+		if res.Error != nil && res.Error.Message != "" {
+			return Result{}, fmt.Errorf("gemini: %s", clip(res.Error.Message, 400))
+		}
+		if err != nil {
+			return Result{}, err
+		}
+		return Result{}, fmt.Errorf("gemini: không đọc được output JSON: %w", jerr)
+	}
+	r := Result{Text: strings.TrimSpace(res.Response), Model: req.Model, DurationMS: time.Since(start).Milliseconds()}
+	for m, s := range res.Stats.Models {
+		r.InputTokens += s.Tokens.Prompt
+		r.OutputTokens += s.Tokens.Candidates
+		if r.Model == "" {
+			r.Model = m
+		}
+	}
+	if r.Text == "" {
+		return Result{}, errors.New("gemini: không có câu trả lời trong output")
+	}
+	return r, nil
+}
+
+var (
+	ansiColor  = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	geminiFail = regexp.MustCompile(`(?:Error[^:]*|[A-Za-z]+Error): (.+)$`)
+)
+
+// GeminiError reads why Gemini CLI failed from its stderr: the first error
+// line without its "Error authenticating: XError:" prefixes and the stack
+// trace after it, with a hint for the refusals people can act on.
+func GeminiError(stderr string) string {
+	var lines []string
+	for _, l := range strings.Split(stderr, "\n") {
+		l = strings.TrimSpace(ansiColor.ReplaceAllString(l, ""))
+		if l != "" && !strings.HasPrefix(l, "at ") && !slices.Contains(lines, l) {
+			lines = append(lines, l)
+		}
+	}
+	msg := ""
+	for _, l := range lines {
+		if m := geminiFail.FindStringSubmatch(l); m != nil {
+			msg = m[1]
+			for { // "Error authenticating: IneligibleTierError: reason"
+				n := geminiFail.FindStringSubmatch(msg)
+				if n == nil {
+					break
+				}
+				msg = n[1]
+			}
+			break
+		}
+	}
+	if msg == "" {
+		msg = strings.Join(lines, "\n")
+	}
+	switch {
+	case strings.Contains(stderr, "UNSUPPORTED_CLIENT") || strings.Contains(stderr, "IneligibleTierError"):
+		msg += " — Google không còn cho Gemini CLI dùng tài khoản Google cá nhân (gói miễn phí): dùng API key (GEMINI_API_KEY từ aistudio.google.com/apikey) hoặc gói Code Assist có dự án Google Cloud (GOOGLE_CLOUD_PROJECT)."
+	case strings.Contains(stderr, "ProjectIdRequiredError"):
+		msg += " — tài khoản này cần dự án Google Cloud: đặt GOOGLE_CLOUD_PROJECT cho office."
+	}
+	return clip(msg, 600)
+}
+
+// ---- Antigravity ----
+
+type antigravityCLI struct{ bin string }
+
+// agyModel is a model slug in `agy models` output.
+var agyModel = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)+$`)
+
+// AntigravityModels lists the models of the signed-in account (`agy models`);
+// a signed-out CLI gives ErrNeedsLogin.
+func AntigravityModels(ctx context.Context, bin string, env []string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, bin, "models")
+	if len(env) > 0 {
+		cmd.Env = env
+	}
+	out, err := cmd.CombinedOutput()
+	text := string(out)
+	if strings.Contains(strings.ToLower(text), "sign in") || strings.Contains(text, "authentication") {
+		return nil, fmt.Errorf("%w: hãy bấm Đăng nhập (tài khoản Google) cho Antigravity CLI", ErrNeedsLogin)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("agy models: %v: %s", err, clip(strings.TrimSpace(text), 300))
+	}
+	var models []string
+	for _, l := range strings.Split(text, "\n") {
+		f := strings.Fields(strings.Trim(l, " \t-*•>"))
+		if len(f) > 0 && agyModel.MatchString(f[0]) && !slices.Contains(models, f[0]) {
+			models = append(models, f[0])
+		}
+	}
+	return models, nil
+}
+
+func (c *antigravityCLI) Check(ctx context.Context) (CheckResult, error) {
+	out, err := run(ctx, c.bin, "", "--version")
+	if err != nil {
+		return CheckResult{}, err
+	}
+	v := strings.TrimSpace(out)
+	models, err := AntigravityModels(ctx, c.bin, nil)
+	if err != nil {
+		return CheckResult{}, fmt.Errorf("%s · %w", v, err)
+	}
+	return CheckResult{Version: v, Models: models, Detail: v}, nil
+}
+
+// agyResult is Antigravity's json output (and the payload of its
+// stream-json "result" event).
+type agyResult struct {
+	ConversationID string `json:"conversation_id"`
+	Status         string `json:"status"`
+	Response       string `json:"response"`
+	Error          string `json:"error"`
+	Usage          struct {
+		InputTokens     int `json:"input_tokens"`
+		OutputTokens    int `json:"output_tokens"`
+		ThinkingTokens  int `json:"thinking_tokens"`
+		CacheReadTokens int `json:"cache_read_tokens"`
+	} `json:"usage"`
+}
+
+func (c *antigravityCLI) Complete(ctx context.Context, req Request) (Result, error) {
+	start := time.Now()
+	// the prompt on stdin runs one turn non-interactively; plan mode only reads
+	args := []string{"--output-format", "json", "--mode", "plan", "--disable-slash-commands"}
+	if req.Model != "" {
+		args = append(args, "--model", req.Model)
+	}
+	prompt := req.Prompt
+	if req.System != "" {
+		prompt = req.System + "\n\n" + req.Prompt
+	}
+	out, err := run(ctx, c.bin, prompt, args...)
+	var res agyResult
+	if jerr := json.Unmarshal([]byte(lastJSONObject(out)), &res); jerr != nil {
+		if err != nil {
+			return Result{}, err
+		}
+		return Result{}, fmt.Errorf("agy: không đọc được output JSON: %w", jerr)
+	}
+	if res.Status != "SUCCESS" {
+		if strings.Contains(res.Error, "authentication") {
+			return Result{}, fmt.Errorf("%w: Antigravity CLI chưa đăng nhập", ErrNeedsLogin)
+		}
+		return Result{}, fmt.Errorf("agy: %s", clip(cmp.Or(res.Error, res.Status), 400))
+	}
+	return Result{Text: strings.TrimSpace(res.Response), Model: req.Model, DurationMS: time.Since(start).Milliseconds(),
+		InputTokens: res.Usage.InputTokens + res.Usage.CacheReadTokens, OutputTokens: res.Usage.OutputTokens + res.Usage.ThinkingTokens}, nil
 }
 
 // lastJSONObject returns the last line that looks like a JSON object, since

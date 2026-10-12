@@ -2,7 +2,12 @@ package chat
 
 import (
 	"context"
+	"errors"
+	"regexp"
+	"strings"
 	"time"
+
+	"github.com/tung1998/agent-office/internal/usage"
 
 	"github.com/tung1998/agent-office/internal/storage"
 )
@@ -32,13 +37,40 @@ func LimitsKey(providerID string) string { return "provider_limits:" + providerI
 
 // keepLimits stores the usage windows a run reported for its provider.
 func (e *Engine) keepLimits(p storage.Provider, l *Limits) {
-	if l == nil || len(l.Windows) == 0 {
+	if l == nil || (l.Status == "" && len(l.Windows) == 0) {
+		return
+	}
+	if len(l.Windows) == 0 && l.Status != "rejected" {
+		// Status-only report with no window detail: nothing new to persist,
+		// and saving it would wipe out whatever window data we already had.
 		return
 	}
 	_ = e.store.Settings().Set(context.Background(), LimitsKey(p.ID), l)
 	if fn := e.onLimits; fn != nil { // the limit alerts
 		go fn(p, *l)
 	}
+}
+
+// resetIn is how an out-of-quota error says when it resets ("Resets in
+// 9m51s", "try again in 30s").
+var resetIn = regexp.MustCompile(`(?i)(?:resets?|try again|retry) in ((?:\d+h)?(?:\d+m)?(?:\d+(?:\.\d+)?s)?)`)
+
+// limitsFromError reads a run's out-of-quota error as a "rejected" report
+// for a connection that reports no usage itself (agy, an API's 429): until
+// the reset the error names, else for RejectedCooldown. nil: not that error,
+// or the connection already reported it.
+func limitsFromError(reported *Limits, err error, now time.Time) *Limits {
+	var be *usage.BudgetError
+	if err == nil || !OutOfTokens(err) || errors.As(err, &be) || (reported != nil && reported.Status == "rejected") {
+		return nil
+	}
+	l := &Limits{Status: "rejected", UpdatedAt: now}
+	if m := resetIn.FindStringSubmatch(err.Error()); m != nil && m[1] != "" {
+		if d, perr := time.ParseDuration(strings.ToLower(m[1])); perr == nil && d > 0 {
+			l.Windows = map[string]LimitWindow{"quota": {Utilization: 1, ResetsAt: now.Add(d)}}
+		}
+	}
+	return l
 }
 
 // SetOnLimits hears every usage report of a provider (the limit alerts).

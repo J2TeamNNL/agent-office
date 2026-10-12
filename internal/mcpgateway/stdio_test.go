@@ -122,7 +122,7 @@ func TestStdio(t *testing.T) {
 	c := rpcClient{t, office.URL + "/mcp/s/local"}
 
 	checked, err := gw.CheckServer(ctx, m)
-	if err != nil || checked.LastCheckStatus != "ok" || len(checked.LastTools) != 7 {
+	if err != nil || checked.LastCheckStatus != "ok" || len(checked.LastTools) != 8 {
 		t.Fatalf("check = %+v %v", checked, err)
 	}
 	if names := gw.Names(ctx); len(names) != 1 || names[0] != "local" {
@@ -205,6 +205,28 @@ func TestStdio(t *testing.T) {
 		t.Fatalf("after crash = %q", v)
 	}
 
+	// a stdio call that fails (the process's own isError result, or a
+	// roundTrip error) is logged as "error", not "ok"
+	if _, v := c.tool(14, "fail", nil); !strings.Contains(v, "tool failed on purpose") {
+		t.Fatalf("fail = %q", v)
+	}
+	calls, err := st.MCPCalls().List(ctx, m.ID, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]int{}
+	for _, c := range calls {
+		by[c.Status]++
+	}
+	if by["ok"] == 0 || by["error"] == 0 {
+		t.Fatalf("mcp_calls log = %v (%+v)", by, calls)
+	}
+	for _, c := range calls {
+		if c.Tool == "fail" && (c.Status != "error" || c.Error != "tool failed on purpose") {
+			t.Fatalf("fail call log = %+v", c)
+		}
+	}
+
 	// office shutting down: nothing left running
 	_, pid3 := c.tool(13, "pid", nil)
 	var p3 int
@@ -212,6 +234,56 @@ func TestStdio(t *testing.T) {
 	gw.Close()
 	if len(gw.Running()) > 0 || alive(p3) {
 		t.Fatalf("after Close: %v alive=%v", gw.Running(), alive(p3))
+	}
+}
+
+// TestStdioOverlongLine: a stdio server writing one stdout line past the
+// scanner's max token kills the process instead of leaving it running but
+// deaf forever (the bug this guards: read()'s scanner error was never
+// checked, so the pool kept reusing a process nobody read from again).
+func TestStdioOverlongLine(t *testing.T) {
+	small := 4 << 10
+	restore := mcpgateway.SetStdioMaxLineForTest(small)
+	t.Cleanup(restore)
+
+	bin := fakeStdio(t)
+	st, box := openStore(t)
+	ctx := context.Background()
+	if _, err := st.MCPServers().Create(ctx, storage.MCPServer{Name: "local", Kind: "stdio", Command: bin, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	gw := &mcpgateway.Gateway{Store: st, Box: box, Identify: writerToken}
+	t.Cleanup(gw.Close)
+	mux := http.NewServeMux()
+	mux.Handle("/mcp/s/{name}", gw)
+	office := httptest.NewServer(mux)
+	t.Cleanup(office.Close)
+	c := rpcClient{t, office.URL + "/mcp/s/local"}
+
+	_, pid1 := c.tool(1, "pid", nil)
+	var p1 int
+	fmt.Sscan(pid1, &p1)
+
+	// the oversized line's own call never gets an answer (the process is
+	// killed before it can reply); the call should fail fast rather than
+	// hang until CallTimeout.
+	// bigger than both the scanner's initial 64KB buffer and stdioMaxLine
+	if _, v := c.tool(2, "bigline", map[string]any{"size": 80 << 10}); !strings.Contains(v, "đã dừng") {
+		t.Fatalf("bigline call = %q, want a dead-process error", v)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for alive(p1) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if alive(p1) {
+		t.Fatalf("process %d still alive after overlong line", p1)
+	}
+
+	// a fresh call starts a new process (the earlier one was fully evicted,
+	// not left registered-but-dead)
+	if _, pid2 := c.tool(3, "pid", nil); pid2 == "" || pid2 == pid1 {
+		t.Fatalf("restart after overlong line: %q then %q", pid1, pid2)
 	}
 }
 

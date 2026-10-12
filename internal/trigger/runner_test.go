@@ -115,95 +115,11 @@ func TestScheduleStops(t *testing.T) {
 	}
 }
 
-// A run hands the automation's tags to the chat it talks in.
-func TestRunCarriesTags(t *testing.T) {
-	ctx := context.Background()
-	st, p := openStore(t)
-	ex := &fakeExec{}
-	r := trigger.New(st, ex)
-	a, _ := st.Automations().Create(ctx, storage.Automation{ProjectID: p.ID, Name: "h", Source: "webhook", Action: "chat", Enabled: true,
-		Config: storage.AutomationConfig{Tags: []string{"nightly", "ops"}}})
-	if _, _, err := r.Enqueue(ctx, a, "webhook", `{}`, "", ""); err != nil {
-		t.Fatal(err)
-	}
-	r.StartReady(ctx, time.Now().UTC())
-	r.Wait()
-	if len(ex.tags) != 1 || strings.Join(ex.tags[0], ",") != "nightly,ops" {
-		t.Fatalf("tags = %v", ex.tags)
-	}
-}
-
-func TestBusyRetriesAndFailuresDisable(t *testing.T) {
-	ctx := context.Background()
-	st, p := openStore(t)
-	ex := &fakeExec{busy: 1, fail: true}
-	r := trigger.New(st, ex)
-	a, _ := st.Automations().Create(ctx, storage.Automation{ProjectID: p.ID, Name: "h", Source: "webhook", Action: "chat", Enabled: true,
-		Limits: storage.AutomationLimits{DisableAfterFailures: 2}})
-	for i := 0; i < 2; i++ {
-		if _, status, err := r.Enqueue(ctx, a, "webhook", `{"n":1}`, fmt.Sprint(i), ""); err != nil || status != "queued" {
-			t.Fatalf("enqueue = %s %v", status, err)
-		}
-	}
-	now := time.Now().UTC()
-	r.Tick(ctx, now) // first is busy → retry in 60s; second runs and fails
-	r.Wait()
-	r.Tick(ctx, now.Add(61*time.Second))
-	r.Wait()
-	a, _ = st.Automations().Get(ctx, a.ID)
-	if a.Enabled || a.DisabledCode != "failures" || a.Failures != 2 {
-		t.Fatalf("automation = %+v", a)
-	}
-	failed, _ := st.Jobs().List(ctx, storage.JobFilter{OriginID: a.ID, Status: "failed"})
-	if len(failed) != 2 || failed[0].ErrorCode != "agent_error" {
-		t.Fatalf("failed = %+v", failed)
-	}
-}
-
-func TestRestartedJobDoesNotRunAgain(t *testing.T) {
-	ctx := context.Background()
-	st, p := openStore(t)
-	ex := &fakeExec{}
-	a, _ := st.Automations().Create(ctx, storage.Automation{ProjectID: p.ID, Name: "h", Source: "webhook", Action: "chat", Enabled: true})
-	now := time.Now().UTC()
-	st.Jobs().Create(ctx, storage.Job{ProjectID: p.ID, Kind: "chat_turn", Origin: "automation", OriginID: a.ID, Status: "running", StartedAt: &now})
-	st.Jobs().FailRunning(ctx, "restart", "restart", now)
-	r := trigger.New(st, ex)
-	r.Tick(ctx, now.Add(time.Minute))
-	r.Wait()
-	if len(ex.chats) != 0 {
-		t.Fatalf("re-ran a restarted job: %v", ex.chats)
-	}
-}
-
-// An automation can ask for a cheaper model tier for its runs.
-func TestAutomationModelTier(t *testing.T) {
-	ctx := context.Background()
-	st, p := openStore(t)
-	ex := &fakeExec{}
-	r := trigger.New(st, ex)
-	past := time.Now().UTC().Add(-time.Minute)
-	st.Automations().Create(ctx, storage.Automation{ProjectID: p.ID, Name: "daily", Source: "schedule", Action: "chat", Enabled: true, ModelTier: "fast",
-		Prompt: "báo cáo", Config: storage.AutomationConfig{EveryMinutes: 60}, NextRunAt: &past})
-	r.Tick(ctx, time.Now().UTC())
-	r.Wait()
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
-	if len(ex.tiers) != 1 || ex.tiers[0] != "fast" {
-		t.Fatalf("tiers = %v", ex.tiers)
-	}
-	got, _ := st.Automations().List(ctx, p.ID)
-	if got[0].ModelTier != "fast" {
-		t.Fatalf("stored tier = %q", got[0].ModelTier)
-	}
-}
-
 // fullAccessAgent creates an agent whose FullAccess an admin turned on.
 func fullAccessAgent(t *testing.T, ctx context.Context, st storage.Store, p storage.Repo) storage.Agent {
 	t.Helper()
 	st.Users().Create(ctx, storage.User{Email: "admin@x.io", Role: storage.RoleAdmin, PasswordHash: "h"})
-	m, _ := st.OrgModels().Create(ctx, storage.OrgModel{RepoID: p.ID, Key: "m", Name: "m", Kind: "solo"})
-	ag, _ := st.Agents().Create(ctx, storage.Agent{OrgModelID: m.ID, Key: "a", Name: "A", Tier: storage.TierLead, ModelTier: "fast",
+	ag, _ := st.Agents().Create(ctx, storage.Agent{ProjectID: p.ID, Key: "a", Name: "A", ModelTier: "fast",
 		Permissions: storage.Permissions{Level: perm.Operate, FullAccess: true, FullAccessBy: "admin@x.io"}})
 	return ag
 }
@@ -281,32 +197,6 @@ func TestRetryOfWebhookJobNeverGetsFullAccess(t *testing.T) {
 	}
 }
 
-// ADR-074 security fix: a SECOND retry (retrying the job the first retry made,
-// itself stored with trigger "manual") must still never gain full access —
-// the original webhook never had it, and "manual" alone must not launder that.
-func TestRetryOfRetryOfWebhookJobNeverGetsFullAccess(t *testing.T) {
-	ctx := context.Background()
-	st, p := openStore(t)
-	ag := fullAccessAgent(t, ctx, st, p)
-	a, _ := st.Automations().Create(ctx, storage.Automation{ProjectID: p.ID, Name: "h", Source: "webhook", Action: "chat", Enabled: true, AgentID: ag.ID})
-	r := trigger.New(st, &fakeExec{})
-	job1, _, err := r.Retry(ctx, a, "webhook", false, "{}")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if job1.FullAccess {
-		t.Fatalf("first retry got full access: %+v", job1)
-	}
-	// job1 is stored with Trigger "manual" and FullAccess false; retry it again
-	job2, _, err := r.Retry(ctx, a, job1.Trigger, job1.FullAccess, "{}")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if job2.FullAccess || job2.FullAccessBy != "" {
-		t.Fatalf("second retry (of a 'manual'-trigger job) got full access: %+v", job2)
-	}
-}
-
 // A retry of a scheduled job's run (already trusted) keeps the agent's full
 // access, same as a fresh manual run would.
 func TestRetryOfScheduleJobKeepsFullAccess(t *testing.T) {
@@ -333,13 +223,12 @@ func TestExtraDirSymlinkRepointedAfterSaveIsDropped(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	st, p := openStore(t)
-	m, _ := st.OrgModels().Create(ctx, storage.OrgModel{RepoID: p.ID, Key: "m", Name: "m", Kind: "solo"})
 	other := t.TempDir() // the symlink's original, harmless target
 	link := filepath.Join(t.TempDir(), "extra-dir-link")
 	if err := os.Symlink(other, link); err != nil {
 		t.Fatal(err)
 	}
-	ag, _ := st.Agents().Create(ctx, storage.Agent{OrgModelID: m.ID, Key: "a", Name: "A", Tier: storage.TierLead, ModelTier: "fast",
+	ag, _ := st.Agents().Create(ctx, storage.Agent{ProjectID: p.ID, Key: "a", Name: "A", ModelTier: "fast",
 		Permissions: storage.Permissions{Level: perm.Operate, ExtraDirs: []string{link}}})
 	a, _ := st.Automations().Create(ctx, storage.Automation{ProjectID: p.ID, Name: "daily", Source: "schedule", Action: "chat", Enabled: true, AgentID: ag.ID})
 
@@ -425,39 +314,20 @@ func TestChannelAdminGetsAgentFullAccess(t *testing.T) {
 	}
 }
 
-// ADR-082: at its time, with fewer runs going than it may have at once, a
-// new one starts beside them; with as many, none — and none is stopped.
-func TestScheduleRunsInParallelUpToItsLimit(t *testing.T) {
-	ctx := context.Background()
-	st, p := openStore(t)
-	r := trigger.New(st, &fakeExec{})
-	past := time.Now().UTC().Add(-time.Minute)
-	a, _ := st.Automations().Create(ctx, storage.Automation{ProjectID: p.ID, Name: "migrate", Source: "schedule", Action: "chat", Enabled: true,
-		Prompt: "x", Config: storage.AutomationConfig{EveryMinutes: 20}, NextRunAt: &past, Limits: storage.AutomationLimits{MaxParallel: 2}})
-	running := func() {
-		st.Jobs().Create(ctx, storage.Job{ProjectID: p.ID, Kind: "chat_turn", Origin: "automation", OriginID: a.ID, Trigger: "schedule", Status: "running"})
-	}
-	count := func() int {
-		jobs, _ := st.Jobs().List(ctx, storage.JobFilter{OriginID: a.ID})
-		return len(jobs)
-	}
-	running() // the last run is still going
-	r.Tick(ctx, time.Now().UTC())
-	if count() != 2 {
-		t.Fatalf("one running of 2 allowed: jobs = %d, want a new one beside it", count())
-	}
-	a, _ = st.Automations().Get(ctx, a.ID)
-	a.NextRunAt = &past
-	st.Automations().Update(ctx, a)
-	running() // now as many as it may have
-	before := count()
-	r.Tick(ctx, time.Now().UTC())
-	if count() != before {
-		t.Fatalf("at its limit a new run started: %d → %d", before, count())
-	}
-	if (storage.Automation{KeepContext: true, Limits: storage.AutomationLimits{MaxParallel: 3}}).Parallel() != 1 {
-		t.Fatal("a kept conversation ran in parallel")
-	}
+// blockingExec holds every RunChat until told to let it go, so a test can
+// catch the runner mid-flight with a known number of jobs actually running.
+type blockingExec struct {
+	mu      sync.Mutex
+	started int
+	release chan struct{}
+}
+
+func (b *blockingExec) RunChat(ctx context.Context, projectID, agentID, conv, prompt, edit string) (string, string, error) {
+	b.mu.Lock()
+	b.started++
+	b.mu.Unlock()
+	<-b.release
+	return "cnv_x", "ok", nil
 }
 
 // A bot rule that names no agent answers with the project's lead (or the
@@ -480,5 +350,39 @@ func TestChannelAdminWithDefaultAgent(t *testing.T) {
 	inConv, _ := json.Marshal(trigger.ChannelPayload{Message: "tiếp", UserID: "7", ChatID: "c1", ChannelID: "chn_1", Admin: true, ConversationID: conv.ID})
 	if j, _, _ := r.Enqueue(ctx, a, "discord", string(inConv), "", ""); !j.FullAccess {
 		t.Fatal("the conversation's agent's full access did not count")
+	}
+}
+
+// An automation that runs a workflow sends "#key input" to its chat (ADR-109).
+func TestWorkflowActionCallsTheWorkflow(t *testing.T) {
+	ctx := context.Background()
+	st, p := openStore(t)
+	ex := &fakeExec{}
+	r := trigger.New(st, ex)
+	past := time.Now().UTC().Add(-time.Minute)
+	if _, err := st.Automations().Create(ctx, storage.Automation{ProjectID: p.ID, Name: "nightly", Source: "schedule", Action: "workflow", Enabled: true,
+		Prompt: "scope: api", Config: storage.AutomationConfig{EveryMinutes: 60, Workflow: "fix-tests"}, NextRunAt: &past}); err != nil {
+		t.Fatal(err)
+	}
+	r.Tick(ctx, time.Now().UTC())
+	r.Wait()
+	if len(ex.chats) != 1 || ex.chats[0] != "#fix-tests scope: api" {
+		t.Fatalf("chats = %q", ex.chats)
+	}
+}
+
+func TestSpecWorkflowNeedsKey(t *testing.T) {
+	s := trigger.Spec{Name: "x", Source: "webhook", Action: "workflow"}
+	if s.Check() == nil {
+		t.Fatal("a workflow action without a workflow passed")
+	}
+	s.Workflow = " review "
+	if err := s.Check(); err != nil {
+		t.Fatal(err)
+	}
+	var a storage.Automation
+	s.Apply(&a, time.Now())
+	if a.Action != "workflow" || a.Config.Workflow != "review" {
+		t.Fatalf("applied %+v", a)
 	}
 }

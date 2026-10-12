@@ -4,10 +4,10 @@
 const props = defineProps<{ projectId: string }>()
 const toast = useToast()
 const { isAdmin } = useAuth()
-const { t, dateLocale } = useLang()
+const { t, when: fmtWhen } = useLang()
 
 const { data, refresh } = await useLiveFetch<{ automations: Automation[] }>(() => `/api/projects/${props.projectId}/automations`)
-const { data: agentsData } = useLiveFetch<{ agents: Agent[] }>(() => `/api/projects/${props.projectId}/chat/agents`, { lazy: true })
+const { data: agentsData } = useLiveFetch<{ agents: Agent[], default_agent_id: string }>(() => `/api/projects/${props.projectId}/chat/agents`, { lazy: true })
 const list = computed(() => data.value?.automations ?? [])
 // a bot is one row: its commands are its automations (ADR-049)
 const others = computed(() => list.value.filter(a => !isChannelSource(a.source)))
@@ -52,24 +52,25 @@ function botMenu(b: BotRow) {
     [{ label: t('auto.delete'), icon: 'i-lucide-trash-2', color: 'error' as const, onSelect: () => removeBot(b) }]
   ]
 }
-const agentName = (id: string) => agentsData.value?.agents.find(a => a.id === id)?.name ?? t('auto.lead')
+const agentName = (id: string) => agentsData.value?.agents.find(a => a.id === id)?.name ?? t('team.defaultAgentLower')
 // ADR-074: an automation's effective permission is full access when it
 // overrides to one, or when it follows an agent that itself has one.
 function isFullAccess(a: Automation): boolean {
   if (a.permission_mode === 'override') return !!a.override_full_access
   const agents = agentsData.value?.agents ?? []
-  const agent = a.agent_id ? agents.find(x => x.id === a.agent_id) : (agents.find(x => x.tier === 'lead') ?? agents[0])
+  const agent = a.agent_id ? agents.find(x => x.id === a.agent_id) : (agents.find(x => x.id === agentsData.value?.default_agent_id) ?? agents[0])
   return !!agent?.permissions.full_access
 }
-const when = (d?: string | null) => d ? new Date(d).toLocaleString(dateLocale.value, { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' }) : t('auto.never')
+const when = (d?: string | null) => d ? fmtWhen(d) : t('auto.never')
 
 
 async function toggle(a: Automation, enabled: boolean) {
   try {
-    await $fetch(`/api/automations/${a.id}`, { method: 'PATCH', body: automationBody({ ...a, enabled }) })
+    await $fetch(`/api/automations/${a.id}`, { method: 'PATCH', body: { ...automationBody({ ...a, enabled }), version: a.version } })
     await refresh()
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
+    await refresh()
   }
 }
 // the bot stopped (a wrong token, an intent off): try again once it is fixed on Discord/Telegram
@@ -152,7 +153,7 @@ async function runNow(a: Automation) {
           <span class="block truncate font-medium">{{ a.name }}</span>
           <span class="block truncate text-xs text-(--ui-text-muted)">
             {{ scheduleText(a, t) }}
-            · {{ a.action === 'script' ? t('auto.toScript') : t('auto.toChat', { agent: agentName(a.agent_id) }) }}
+            · {{ a.action === 'script' ? t('auto.toScript') : a.action === 'workflow' ? t('auto.toWorkflow', { key: a.config.workflow ?? '' }) : t('auto.toChat', { agent: agentName(a.agent_id) }) }}
           </span>
         </NuxtLink>
         <span v-if="a.config.tags?.length" class="flex flex-wrap items-center gap-1"><ChatTags :tags="a.config.tags" /></span>

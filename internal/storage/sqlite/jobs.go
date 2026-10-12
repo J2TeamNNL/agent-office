@@ -108,6 +108,10 @@ func (r jobRepo) SetOutput(ctx context.Context, id, output string, exitCode int)
 	return execOne(ctx, r.db, `UPDATE jobs SET output=?, exit_code=? WHERE id=?`, output, exitCode, id)
 }
 
+func (r jobRepo) SetMessageID(ctx context.Context, id, messageID string) error {
+	return execOne(ctx, r.db, `UPDATE jobs SET message_id=? WHERE id=?`, messageID, id)
+}
+
 func (r jobRepo) Get(ctx context.Context, id string) (storage.Job, error) {
 	return scanJob(r.db.QueryRowContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE id=?`, id))
 }
@@ -117,6 +121,28 @@ func (r jobRepo) Update(ctx context.Context, j storage.Job) error {
 		debounce_until=?, payload=?, reply=?, next_attempt_at=?, started_at=?, full_access=?, full_access_by=?, extra_dirs=? WHERE id=?`,
 		nullStr(j.ConversationID), nullStr(j.MessageID), nullStr(j.TaskID), j.Status, j.Error, j.ErrorCode, j.AgentID, j.Title,
 		optTime(j.DebounceUntil), j.Payload, replyJSON(j.Reply), optTime(j.NextAttemptAt), optTime(j.StartedAt), j.FullAccess, j.FullAccessBy, extraDirsJSON(j.ExtraDirs), j.ID)
+}
+
+// StartIfRunning is the CAS counterpart of Update's automation-job stamp in
+// beginJob: it only applies while status is still "running", so a cancel
+// landing between Claim and this write (status already "cancelled") isn't
+// reverted back to "running".
+func (r jobRepo) StartIfRunning(ctx context.Context, id, conversationID, agentID, title string, startedAt time.Time) (storage.Job, error) {
+	res, err := r.db.ExecContext(ctx, `UPDATE jobs SET conversation_id=?, agent_id=?, started_at=?,
+		title=CASE WHEN COALESCE(title,'')='' THEN ? ELSE title END
+		WHERE id=? AND status='running'`,
+		nullStr(conversationID), agentID, optTime(&startedAt), title, id)
+	if err != nil {
+		return storage.Job{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return storage.Job{}, err
+	}
+	if n == 0 {
+		return storage.Job{}, storage.ErrConflict
+	}
+	return r.Get(ctx, id)
 }
 
 func (r jobRepo) Finish(ctx context.Context, id, status, errCode, errMsg string, at time.Time) (storage.Job, error) {
@@ -131,52 +157,127 @@ func (r jobRepo) Finish(ctx context.Context, id, status, errCode, errMsg string,
 	return r.Get(ctx, id)
 }
 
-func (r jobRepo) Claim(ctx context.Context, now time.Time, limit int, busy []string) ([]storage.Job, error) {
+func (r jobRepo) FinishIfRunning(ctx context.Context, id, status, errCode, errMsg string, at time.Time) (storage.Job, error) {
+	return r.finishIfStatus(ctx, id, "running", status, errCode, errMsg, at)
+}
+
+// FinishIfPending is Finish, but only applies when the job is still pending;
+// ErrConflict when it already started (e.g. a cancel racing Claim/StartReady).
+func (r jobRepo) FinishIfPending(ctx context.Context, id, status, errCode, errMsg string, at time.Time) (storage.Job, error) {
+	return r.finishIfStatus(ctx, id, "pending", status, errCode, errMsg, at)
+}
+
+func (r jobRepo) finishIfStatus(ctx context.Context, id, expected, status, errCode, errMsg string, at time.Time) (storage.Job, error) {
+	res, err := r.db.ExecContext(ctx, `UPDATE jobs SET status=?, error_code=?, error=?, finished_at=?,
+		cost_usd=(SELECT COALESCE(SUM(cost_usd),0) FROM runs WHERE job_id=jobs.id),
+		input_tokens=(SELECT COALESCE(SUM(input_tokens),0) FROM runs WHERE job_id=jobs.id),
+		output_tokens=(SELECT COALESCE(SUM(output_tokens),0) FROM runs WHERE job_id=jobs.id),
+		duration_ms=MAX(0, CAST(ROUND((julianday(?) - julianday(COALESCE(started_at, created_at))) * 86400000) AS INTEGER))
+		WHERE id=? AND status=?`, status, errCode, errMsg, fmtTime(at), fmtTime(at), id, expected)
+	if err != nil {
+		return storage.Job{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return storage.Job{}, err
+	}
+	if n == 0 {
+		return storage.Job{}, storage.ErrConflict
+	}
+	return r.Get(ctx, id)
+}
+
+// Claim marks up to limit due pending jobs running. remaining is, for every
+// origin the caller already has jobs running for, how many more it may run
+// at once right now (its Parallel() minus how many are running); an origin
+// at 0 is excluded entirely. An origin missing from remaining has nothing
+// running yet, so Claim looks up its own limit (1, or an automation's
+// Parallel()) and applies that instead.
+func (r jobRepo) Claim(ctx context.Context, now time.Time, limit int, remaining map[string]int) ([]storage.Job, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	if len(busy) == 0 {
-		busy = []string{""}
+	full := []string{""}
+	for id, n := range remaining {
+		if id != "" && n <= 0 {
+			full = append(full, id)
+		}
 	}
 	args := []any{fmtTime(now), fmtTime(now)}
-	for _, b := range busy {
+	for _, b := range full {
 		args = append(args, b)
 	}
 	args = append(args, limit)
 	rows, err := r.db.QueryContext(ctx, `UPDATE jobs SET status='running', started_at=?
 		WHERE id IN (SELECT id FROM jobs WHERE status='pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-			AND (origin_id = '' OR origin_id NOT IN (?`+strings.Repeat(",?", len(busy)-1)+`))
+			AND (origin_id = '' OR origin_id NOT IN (?`+strings.Repeat(",?", len(full)-1)+`))
 			ORDER BY next_attempt_at, created_at LIMIT ?)
 		RETURNING `+jobCols, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []storage.Job
 	for rows.Next() {
 		j, err := scanJob(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, j)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	rowsErr := rows.Err()
+	rows.Close() // must be closed before originParallel/requeue queries below share the connection
+	if rowsErr != nil {
+		return nil, rowsErr
 	}
-	// Two due jobs of one origin: keep the first running, put the rest back.
+	// Due jobs of one origin beyond its remaining capacity: keep the first
+	// ones running, put the rest back.
 	var keep []storage.Job
-	taken := map[string]bool{}
+	taken := map[string]int{}
+	max := map[string]int{}
 	for _, j := range out {
-		if j.OriginID != "" && taken[j.OriginID] {
+		if j.OriginID == "" {
+			keep = append(keep, j)
+			continue
+		}
+		m, ok := max[j.OriginID]
+		if !ok {
+			m, ok = remaining[j.OriginID]
+			if !ok {
+				m = 1
+				if j.Origin == "automation" {
+					m = r.originParallel(ctx, j.OriginID)
+				}
+			}
+			max[j.OriginID] = m
+		}
+		if taken[j.OriginID] >= m {
 			if _, err := r.db.ExecContext(ctx, `UPDATE jobs SET status='pending', started_at=NULL WHERE id=?`, j.ID); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		taken[j.OriginID] = true
+		taken[j.OriginID]++
 		keep = append(keep, j)
 	}
 	return keep, nil
+}
+
+// originParallel is how many runs of an automation may be running at once
+// (storage.Automation.Parallel), looked up straight from the table so Claim
+// doesn't need the whole automation. Only used the first time Claim sees an
+// origin with nothing running yet; once a job of it starts, the runner caches
+// its limit and Claim is told the remaining capacity directly instead.
+func (r jobRepo) originParallel(ctx context.Context, originID string) int {
+	var keepContext bool
+	var limitsJSON string
+	if err := r.db.QueryRowContext(ctx, `SELECT keep_context, limits FROM automations WHERE id=?`, originID).Scan(&keepContext, &limitsJSON); err != nil {
+		return 1
+	}
+	var limits storage.AutomationLimits
+	_ = json.Unmarshal([]byte(limitsJSON), &limits)
+	a := storage.Automation{KeepContext: keepContext, Limits: limits}
+	return a.Parallel()
 }
 
 func (r jobRepo) where(f storage.JobFilter) (string, []any) {
@@ -189,6 +290,10 @@ func (r jobRepo) where(f storage.JobFilter) (string, []any) {
 		}
 	}
 	add("project_id", f.ProjectID)
+	if f.ExcludeProjectID != "" {
+		conds = append(conds, "project_id<>?")
+		args = append(args, f.ExcludeProjectID)
+	}
 	add("kind", f.Kind)
 	add("origin", f.Origin)
 	add("origin_id", f.OriginID)
@@ -215,6 +320,10 @@ func (r jobRepo) where(f storage.JobFilter) (string, []any) {
 	}
 	add("status", f.Status)
 	add("agent_id", f.AgentID)
+	if f.HideOthersIn != "" {
+		conds = append(conds, "(project_id<>? OR created_by=?)")
+		args = append(args, f.HideOthersIn, f.Me)
+	}
 	if !f.Since.IsZero() {
 		conds = append(conds, "created_at >= ?")
 		args = append(args, fmtTime(f.Since))

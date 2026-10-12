@@ -30,15 +30,16 @@ import (
 	"github.com/tung1998/agent-office/internal/monitor"
 	"github.com/tung1998/agent-office/internal/officetools"
 	"github.com/tung1998/agent-office/internal/ops"
-	"github.com/tung1998/agent-office/internal/orgmodel"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/selfupdate"
 	"github.com/tung1998/agent-office/internal/setup"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/sysinfo"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/transfer"
 	"github.com/tung1998/agent-office/internal/trigger"
 	"github.com/tung1998/agent-office/internal/usage"
+	"github.com/tung1998/agent-office/internal/workflow"
 )
 
 // SessionCookie is the name of the login cookie.
@@ -57,7 +58,7 @@ type Config struct {
 	Version        string
 
 	Providers  *provider.Service // nil disables the provider/model/repo routes (auth-only tests)
-	Org        *orgmodel.Service
+	Team       *team.Service
 	Trigger    *trigger.Runner // automations: schedules and webhooks (nil = none)
 	Setup      *setup.Assistant
 	Transfer   *transfer.Service
@@ -89,6 +90,8 @@ type Config struct {
 	System   SystemInfo
 	Office   *officetools.Toolbox // agents' tools: describe/list/get/propose_change use the config registry
 	Channels ChannelReloader      // restarts a Telegram/Discord bot after its settings change (nil = off)
+	// Workflows: the library and the projects' workflows (spec 2026-10-07-workflows-design; nil = off)
+	Workflows *workflow.Service
 }
 
 // SystemInfo tells the dashboard how this office is installed.
@@ -107,13 +110,16 @@ type server struct {
 	log     *slog.Logger
 	build   buildInfo // what is running, read once at startup
 
+	turnFollows sync.Map // "sid:turn" → stop: answers a tab follows on its one stream (ADR-127)
+
 	automationMu    sync.Mutex             // guards automationLocks
-	automationLocks map[string]*sync.Mutex // one project's automation create/update at a time (ADR-049 command dedupe)
+	automationLocks map[string]*sync.Mutex // one project's automation create/update/delete at a time (ADR-049 command dedupe)
 }
 
-// lockAutomations serializes create/update of a project's automations, so
-// the check-then-write of a bot's custom /command (unique per channel) is
-// never raced by two requests reading "free" before either writes.
+// lockAutomations serializes create/update/delete of a project's automations, so
+// the check-then-write of a bot's custom /command (unique per channel), and of
+// releaseBot's check-then-delete of a shared bot, is never raced by two requests
+// reading "free" before either writes.
 func (s *server) lockAutomations(projectID string) func() {
 	s.automationMu.Lock()
 	if s.automationLocks == nil {
@@ -136,6 +142,9 @@ func New(cfg Config) http.Handler {
 	}
 	if cfg.Automation != nil && cfg.Automation.Stash == nil && cfg.Providers != nil && cfg.Store != nil {
 		cfg.Automation.Stash = mcpStash{st: cfg.Store, box: cfg.Providers.Box()} // MCP servers turned off
+	}
+	if cfg.Setup != nil && cfg.Setup.Toolbox == nil && cfg.Automation != nil {
+		cfg.Setup.Toolbox = setupToolbox(cfg.Automation) // skills/MCP the setup may pick
 	}
 	s := &server{cfg: cfg, origins: map[string]bool{}, log: cfg.Logger, sys: sysinfo.New(cmp.Or(cfg.System.HomeDir, "/"))}
 	src := ""
@@ -184,7 +193,7 @@ func New(cfg Config) http.Handler {
 	mux.Handle("GET /api/audit", s.requireRole(storage.RoleAdmin, http.HandlerFunc(s.listAudit)))
 	mux.Handle("GET /api/audit/stats", s.requireRole(storage.RoleAdmin, http.HandlerFunc(s.auditStats)))
 
-	if cfg.Providers != nil && cfg.Org != nil {
+	if cfg.Providers != nil && cfg.Team != nil {
 		s.orgRoutes(mux)
 	}
 	if cfg.Trigger != nil {
@@ -192,8 +201,11 @@ func New(cfg Config) http.Handler {
 		mux.Handle("POST /hooks/{id}", cfg.Trigger.Webhook())
 		mux.Handle("GET /hooks/{id}/jobs/{job}", cfg.Trigger.Webhook())
 	}
-	if cfg.Org != nil {
+	if cfg.Team != nil {
 		s.triggerRoutes(mux)
+	}
+	if cfg.Store != nil {
+		s.workflowRoutes(mux)
 	}
 
 	return gzipJSON(s.securityHeaders(s.csrf(mux)))
@@ -302,7 +314,7 @@ func (s *server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), ctxUser, u)
-		ctx = orgmodel.WithActor(ctx, "human:"+u.Email)
+		ctx = team.WithActor(ctx, "human:"+u.Email)
 		ctx = context.WithValue(ctx, ctxSession, sess)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

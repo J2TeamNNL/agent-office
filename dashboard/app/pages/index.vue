@@ -10,29 +10,28 @@ const tab = computed<HomeTab>({
   },
   set: v => navigateTo({ query: { ...route.query, tab: v === 'work' ? undefined : v } }, { replace: true })
 })
-const { t, dateLocale } = useLang()
+const { t, when } = useLang()
 
 const _f2 = useLiveFetch<{ providers: Provider[] }>('/api/providers', { lazy: true })
 const { data: prov } = _f2
 const _f3 = useLiveFetch<{ projects: Project[] }>('/api/projects', { lazy: true })
 const { data: proj } = _f3
-const _f4 = useLiveFetch<{ templates: OrgModel[] }>('/api/templates', { lazy: true })
-const { data: tpl } = _f4
 
 // the latest chats across projects (bots' too): where the work happens now
 interface RecentChat { id: string, project_id: string, title: string, agent_name: string, source?: Source, updated_at: string, active_turn?: string }
 const _f5 = useLiveFetch<{ conversations: RecentChat[], projects: Record<string, string> }>('/api/conversations/recent', { query: { limit: 6 }, lazy: true })
 const { data: chatData } = _f5
 const recentChats = computed(() => chatData.value?.conversations ?? [])
-const when = (d: string) => new Date(d).toLocaleString(dateLocale.value, { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })
 
 // what needs a person, and the last day in numbers
-interface Incident { kind: string, severity: 'error' | 'warning' | 'info', project_id: string, project_name: string, title: string, detail: string, link: string, id: string, key: string, prompt?: string }
+interface Incident { kind: string, severity: 'error' | 'warning' | 'info', project_id: string, project_name: string, title: string, detail: string, at: string, link: string, id: string, key: string, prompt?: string }
 const _f6 = useLiveFetch<{ incidents: Incident[], count: number }>('/api/incidents', { key: 'incidents', lazy: true })
 const { data: incData, refresh: refreshInc } = _f6
 const incidents = computed(() => incData.value?.incidents ?? [])
 // the kind of each, as a word next to it
 const incKind = (k: string) => t(`incidents.kind.${k}` as 'incidents.kind.monitor')
+// under the title: where, when (no zero time: an AI limit has none), what
+const incLine = (x: Incident) => [x.project_name, x.at && !x.at.startsWith('0001-') ? when(x.at) : '', x.detail].filter(Boolean).join(' · ')
 const _f7 = useLiveFetch<{ totals: { running: number, pending: number, failed_24h: number, cost_24h: number } }>('/api/jobs/stats?since=24h', { lazy: true })
 const { data: stats } = _f7
 // none is awaited: the page shows at once (a phone over a VPN), each block
@@ -54,9 +53,9 @@ async function seen(x: Incident) {
   }
 }
 // skip: rejected, and its agent is not run again about it
-async function act(x: Incident, what: 'approve' | 'reject' | 'skip' | 'retry' | 'dismiss' | 'continue') {
+async function act(x: Incident, what: 'approve' | 'reject' | 'skip' | 'retry' | 'dismiss' | 'continue'): Promise<boolean> {
   const key = x.key + what
-  if (acting.has(key)) return
+  if (acting.has(key)) return false
   acting.add(key)
   try {
     const decide = what === 'skip' ? 'reject' : what
@@ -70,8 +69,10 @@ async function act(x: Incident, what: 'approve' | 'reject' | 'skip' | 'retry' | 
     else await $fetch('/api/incidents/retry', { method: 'POST', body: { kind: x.kind, id: x.id } })
     toast.add({ title: t(`home.done_${what}`), color: 'success' })
     await refreshInc()
+    return true
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
+    return false
   } finally {
     acting.delete(key)
   }
@@ -91,6 +92,24 @@ async function skipAll() {
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
     skippingAll.value = false
+  }
+}
+// Bỏ qua N mục: every item that can be let go (not a card to decide, not a
+// chat to read), let go at once
+const dismissable = computed(() => incidents.value.filter(x => !['approval', 'patch', 'unread', 'stalled'].includes(x.kind)))
+const dismissingAll = ref(false)
+async function dismissAll() {
+  const keys = dismissable.value.map(x => x.key)
+  if (!keys.length || !confirm(t('home.dismissAllConfirm', { n: keys.length }))) return
+  dismissingAll.value = true
+  try {
+    await $fetch('/api/incidents/dismiss', { method: 'POST', body: { keys } })
+    toast.add({ title: t('home.dismissAllDone', { n: keys.length }), color: 'success' })
+    await refreshInc()
+  } catch (e) {
+    toast.add({ title: apiError(e), color: 'error' })
+  } finally {
+    dismissingAll.value = false
   }
 }
 // Điều tra: the project's lead looks into it in a new chat
@@ -128,7 +147,7 @@ const incIcon: Record<string, string> = {
 const providers = computed(() => prov.value?.providers ?? [])
 const projects = computed(() => proj.value?.projects ?? [])
 const okProviders = computed(() => providers.value.filter(p => p.status === 'ok').length)
-const withModel = computed(() => projects.value.filter(p => p.model).length)
+const withAgents = computed(() => projects.value.filter(p => p.agent_count > 0).length)
 
 const setupDone = computed(() => steps.value.every(s => s.done))
 const steps = computed(() => [
@@ -145,10 +164,10 @@ const steps = computed(() => [
     to: '/projects', icon: 'i-lucide-folder-git-2'
   },
   {
-    done: projects.value.length > 0 && withModel.value === projects.value.length,
-    title: t('home.step3Title'),
-    text: projects.value.length ? t('home.step3TextDone', { n: withModel.value, total: projects.value.length }) : t('home.step3TextTodo'),
-    to: projects.value.length ? '/projects' : '/templates', icon: 'i-lucide-network'
+    done: projects.value.length > 0 && withAgents.value === projects.value.length,
+    title: t('team.home.step3Title'),
+    text: projects.value.length ? t('team.home.step3TextDone', { n: withAgents.value, total: projects.value.length }) : t('team.home.step3TextTodo'),
+    to: projects.value.length ? '/projects' : '/workflows', icon: 'i-lucide-bot'
   }
 ])
 </script>
@@ -176,9 +195,12 @@ const steps = computed(() => [
               {{ t('home.attention') }}
               <UBadge v-if="incData?.count" :label="String(incData.count)" color="error" variant="subtle" size="sm" />
             </p>
-            <UTooltip v-if="isAdmin && proposalsN >= 2" :text="t('action.skipInfo')">
-              <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-skip-forward" :label="t('home.skipAll')" @click="skipAllOpen = true" />
-            </UTooltip>
+            <div v-if="isAdmin" class="flex items-center gap-1">
+              <UButton v-if="dismissable.length >= 2" size="xs" color="neutral" variant="ghost" icon="i-lucide-eye-off" :label="t('home.dismissAll', { n: dismissable.length })" :loading="dismissingAll" @click="dismissAll" />
+              <UTooltip v-if="proposalsN >= 2" :text="t('action.skipInfo')">
+                <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-skip-forward" :label="t('home.skipAll')" @click="skipAllOpen = true" />
+              </UTooltip>
+            </div>
           </div>
         </template>
         <LoadingRows v-if="!incData" :n="2" />
@@ -197,7 +219,7 @@ const steps = computed(() => [
                   <span class="truncate text-sm font-medium hover:underline">{{ x.title }}</span>
                   <UBadge :label="incKind(x.kind)" color="neutral" variant="subtle" size="sm" />
                 </span>
-                <span class="block truncate text-xs text-(--ui-text-muted)">{{ x.project_name }}<template v-if="x.detail"> · {{ x.detail }}</template></span>
+                <span class="block truncate text-xs text-(--ui-text-muted)">{{ incLine(x) }}</span>
               </span>
             </component>
             <!-- a chat answered since the person looked: theirs, whoever they are -->
@@ -255,7 +277,7 @@ const steps = computed(() => [
         </NuxtLink>
       </div>
 
-      <UCard v-if="prov && proj && tpl && !setupDone">
+      <UCard v-if="prov && proj && !setupDone">
         <template #header>
           <p class="font-medium">{{ t('home.setupTitle') }}</p>
           <p class="text-sm text-(--ui-text-muted)">{{ t('home.setupDesc') }}</p>
@@ -331,7 +353,7 @@ const steps = computed(() => [
         <template v-if="isAdmin">
           <UButton v-if="canRetry(shown.kind)" color="neutral" variant="outline" icon="i-lucide-rotate-cw" :label="t('home.retry')" :loading="acting.has(shown.key + 'retry')" @click="act(shown, 'retry')" />
           <UButton color="neutral" variant="outline" icon="i-lucide-search-check" :label="t('home.investigate')" @click="investigate(shown)" />
-          <UButton color="neutral" variant="ghost" :label="t('home.dismiss')" :loading="acting.has(shown.key + 'dismiss')" @click="act(shown, 'dismiss').then(() => { shown = null })" />
+          <UButton color="neutral" variant="ghost" :label="t('home.dismiss')" :loading="acting.has(shown.key + 'dismiss')" @click="act(shown, 'dismiss').then((ok) => { if (ok) shown = null })" />
         </template>
       </template>
     </WorkDetailModal>

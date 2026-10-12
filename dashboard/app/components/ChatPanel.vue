@@ -11,12 +11,15 @@ interface Message {
   tools: ToolCall[]
   attachments?: Attachment[]
   author: string
+  // who wrote it to a bot (Discord, Telegram); none = in office
+  sender?: { kind: 'discord' | 'telegram', id: string, username?: string, name?: string, private?: boolean, link?: string, account_id?: string, account?: string }
   created_at: string
   patches: Patch[]
   actions?: ProposedAction[]
   cost_usd?: number
 }
-interface Conversation { id: string, project_id?: string, agent_id: string, agent_name: string, title: string, updated_at: string, source?: Source, purpose?: string, external_url?: string, active_turn?: string, mode?: PermLevel, edit_mode?: 'worktree' | 'direct', effort?: string, cleaned?: string, context_tokens?: number, context_window?: number, tags?: string[] }
+interface Queued { id: string, text: string, attachments: Attachment[], created_at: string }
+interface Conversation { id: string, project_id?: string, agent_id: string, agent_name: string, title: string, updated_at: string, source?: Source, purpose?: string, external_url?: string, active_turn?: string, mode?: PermLevel, edit_mode?: 'worktree' | 'direct', effort?: string, cleaned?: string, context_tokens?: number, context_window?: number, tags?: string[], queued?: Queued[] }
 interface ChatEvent { seq: number, type: 'text' | 'tool' | 'status' | 'patch' | 'done' | 'error', text?: string, tool?: ToolCall, patch?: Patch, message?: Message, next_turn_id?: string }
 // the agents in a chat and the answers in progress (ADR-044)
 interface Member { agent_id: string, agent_name: string, level: string, context_tokens: number, context_window: number }
@@ -24,21 +27,27 @@ interface RunningTurn { turn_id: string, agent_name: string, background: boolean
 
 // purpose "automation": the chat that builds one automation (ADR-042), made on
 // first send or opened by automationId; its answers may fill the form.
+// subject (skill, workflow): what the editor writes; its chat is found again
+// by it (an editor's chat is not in the chat list).
 // compact: no thread column (a picker instead), fills its container.
 // pageContext: what the person is looking at, sent with each message.
 // pane: one box of the watch screen (compact, no prefill, its own header
 // buttons in the #lead/#actions slots); conversationId: the chat it opens on.
-const props = defineProps<{ projectId: string, purpose?: 'automation' | 'skill' | 'template', automationId?: string, compact?: boolean, pane?: boolean, conversationId?: string, pageContext?: () => string }>()
-const emit = defineEmits<{ 'automation-patch': [Record<string, unknown>], 'skill-patch': [Record<string, unknown>], 'template-patch': [Record<string, unknown>], 'history': [Record<string, unknown>[]], 'conversation': [string], 'current': [string], 'back': [] }>()
+const props = defineProps<{ projectId: string, purpose?: 'automation' | 'skill' | 'workflow', automationId?: string, subject?: string, compact?: boolean, pane?: boolean, conversationId?: string, pageContext?: () => string }>()
+const emit = defineEmits<{ 'automation-patch': [Record<string, unknown>], 'skill-patch': [Record<string, unknown>], 'workflow-patch': [Record<string, unknown>], 'history': [Record<string, unknown>[]], 'conversation': [string], 'current': [string], 'back': [] }>()
 const single = computed(() => !!props.purpose)
 // the chat page on a phone: the input stays behind a button until asked for,
 // so the messages get the whole screen
 const page = computed(() => !props.compact && !single.value)
 const composeOpen = ref(false)
+// the pickers by the send button: on a phone just their icon (as the mode
+// picker), the same square as the other buttons (the agent's name is in the placeholder)
+const iconOnPhone = { base: 'max-sm:!w-7 max-sm:!px-0', leading: 'max-sm:!ps-1.5', value: 'max-sm:hidden', trailing: 'max-sm:hidden' }
 const toast = useToast()
-const { t, dateLocale } = useLang()
+const { t, when } = useLang()
+const { user: me } = useAuth()
 
-const _f1 = useLiveFetch<{ agents: Agent[] }>(() => `/api/projects/${props.projectId}/chat/agents`, { lazy: true })
+const _f1 = useLiveFetch<{ agents: Agent[], default_agent_id: string }>(() => `/api/projects/${props.projectId}/chat/agents`, { lazy: true })
 const { data: agentsData } = _f1
 // where the chats started: the dashboard, a bot, an automation
 const origin = ref<ChatFilter>('all')
@@ -119,10 +128,10 @@ const effort = ref('')
 // who answers: each agent's own rights decide what it may do (no separate mode)
 const pick = ref('')
 const isOn = (id?: string) => !!id && onAgents.value.some(a => a.id === id)
-// the chat's agent is paused: the one that is on and answered here last, else a lead (as the server)
+// the chat's agent is paused: the one that is on and answered here last, else the default (as the server)
 function standIn() {
   const last = [...messages.value].reverse().find(m => m.role === 'assistant' && onAgents.value.some(a => a.name === m.author))
-  return onAgents.value.find(a => a.name === last?.author)?.id || onAgents.value.find(a => a.tier === 'lead')?.id || onAgents.value[0]?.id || ''
+  return onAgents.value.find(a => a.name === last?.author)?.id || onAgents.value.find(a => a.id === agentsData.value?.default_agent_id)?.id || onAgents.value[0]?.id || ''
 }
 watch([() => current.value?.id, () => current.value?.agent_id, agents, () => messages.value.length], (now, before) => {
   editMode.value = current.value?.edit_mode ?? 'worktree'
@@ -137,6 +146,13 @@ watch([() => current.value?.id, () => current.value?.agent_id, agents, () => mes
 }, { immediate: true })
 const picked = computed(() => agents.value.find(a => a.id === pick.value))
 const agentItems = computed(() => onAgents.value.map(a => ({ label: `${a.name} · ${permOf(agentLevel(a.permissions)).label}`, value: a.id, icon: permOf(agentLevel(a.permissions)).icon })))
+// the levels the picked agent's model takes: none, no picker (Antigravity names it in the model)
+const { data: provData } = useLiveFetch<{ providers: Provider[] }>('/api/providers', { lazy: true })
+const pickedEfforts = computed(() => {
+  const ps = provData.value?.providers
+  const p = ps?.find(x => x.id === picked.value?.provider_id) ?? ps?.find(x => x.is_default)
+  return effortsFor(p?.kind, picked.value?.llm_model || (picked.value && p?.tier_models[picked.value.model_tier]) || '')
+})
 const pickedLevel = computed(() => picked.value ? agentLevel(picked.value.permissions) : 'read')
 const prompt = ref<{ busy: boolean, focus?: () => void } | null>(null)
 
@@ -177,7 +193,7 @@ const sending = ref(false) // closes the window before streaming.value is set, i
 const liveText = ref('')
 const liveTools = ref<ToolCall[]>([])
 const liveStatus = ref('')
-let source: EventSource | null = null
+let unfollow: (() => void) | null = null // the answer followed on the tab's stream (ADR-127)
 let turnId = ''
 
 // older messages, a page at a time, the reading place kept
@@ -207,13 +223,26 @@ async function loadOlder() {
 // what changed elsewhere, pushed with its data (ADR-078): a message into the
 // open chat (a Discord message, a hand-off's answer) is put in place; a
 // chat's row replaces the old one in the list (a new one: the list again)
-const nearEnd = () => { const el = listEl.value; return !el || el.scrollHeight - el.scrollTop - el.clientHeight < 120 }
+// as Discord: at the end, what comes in scrolls into view; scrolled up to read,
+// it stays put and a button takes the person down (it says when something is new)
+const pinned = ref(true)
+const unseen = ref(false)
+function onListScroll() { // the person's scrolling (and ours, always to the end): a little up already leaves the end
+  const el = listEl.value
+  pinned.value = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  if (pinned.value) unseen.value = false
+}
+function toEnd() {
+  pinned.value = true
+  unseen.value = false
+  scrollDown(true)
+}
 const held: Message[] = [] // an agent's answer that came while one streams: the stream's own end brings it
 function place(m: Message) {
   if (messages.value.some(x => x.id === m.id)) return
-  const stay = nearEnd()
+  if (m.role === 'user') dropShown(m.content) // shown already, before office had it
   messages.value.push(m)
-  if (stay) scrollDown()
+  scrollDown()
 }
 onLiveEvent<{ conversation_id: string, message: Message }>('message', ({ conversation_id: id, message }) => {
   if (current.value?.id !== id || loadingMsgs.value) return
@@ -266,27 +295,37 @@ onLiveChange(async (tables) => {
     const fresh = res.messages.filter(m => !known.has(m.id))
     const changed = res.messages.some(m => { const x = messages.value.find(y => y.id === m.id); return x && JSON.stringify(x) !== JSON.stringify(m) })
     if (!fresh.length && !changed) return
-    const stay = nearEnd()
     messages.value = [...messages.value.filter(m => !res.messages.some(n => n.id === m.id)), ...res.messages]
     applyGroup(res.members, res.running)
     if (res.conversation.active_turn && !streaming.value) follow(res.conversation.active_turn)
-    if (stay) scrollDown()
+    if (fresh.length) scrollDown()
   } catch { /* gone, or offline: the next change tries again */ }
 })
 
+// something new at the end: in view if the person is at the end (or it is
+// theirs: force), else the button says so. Once a frame, however many tokens
+// came in it; at once, not smooth, so a stream stays pinned to the end.
 let scrollQueued = false
-async function scrollDown() { // once a frame, however many tokens came in it
+async function scrollDown(force = false) {
+  if (force) pinned.value = true
+  else if (!pinned.value) {
+    unseen.value = true
+    return
+  }
   if (scrollQueued) return
   scrollQueued = true
   await nextTick()
   requestAnimationFrame(() => {
     scrollQueued = false
-    listEl.value?.scrollTo({ top: listEl.value.scrollHeight, behavior: 'smooth' })
+    const el = listEl.value
+    if (el && pinned.value) el.scrollTop = el.scrollHeight
   })
 }
 // a chat just opened shows its last message at once (no scrolling down from
 // the top); it stays there while what it shows settles (markdown, images)
 async function jumpToEnd() {
+  pinned.value = true
+  unseen.value = false
   await nextTick()
   const el = listEl.value
   if (!el) return
@@ -320,40 +359,39 @@ async function afterTurn() {
 const members = ref<Member[]>([])
 const running = ref<RunningTurn[]>([])
 const background = computed(() => running.value.filter(r => r.background))
-const bgSources = new Map<string, EventSource>()
+const bgFollows = new Map<string, () => void>()
 function applyGroup(m?: Member[], r?: RunningTurn[]) {
   members.value = m ?? []
   running.value = r ?? []
   for (const b of background.value) {
-    if (bgSources.has(b.turn_id)) continue
-    const es = new EventSource(`/api/chat/turns/${b.turn_id}/stream`)
-    bgSources.set(b.turn_id, es)
-    es.onmessage = (msg) => {
-      const ev = JSON.parse(msg.data) as ChatEvent
+    if (bgFollows.has(b.turn_id)) continue
+    bgFollows.set(b.turn_id, followTurn<ChatEvent>(b.turn_id, (ev) => {
       if (ev.type !== 'done' && ev.type !== 'error') return
       if (ev.message && !messages.value.some(x => x.id === ev.message!.id)) messages.value.push(ev.message)
-      es.close()
-      bgSources.delete(b.turn_id)
+      bgFollows.delete(b.turn_id)
       scrollDown()
       afterTurn()
-    }
-    es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) {
-        bgSources.delete(b.turn_id)
-        afterTurn()
-      }
-    }
+    }, () => {
+      bgFollows.delete(b.turn_id)
+      afterTurn()
+    }))
   }
   // the one who asked reports back: follow it when nothing else is streaming
   const fg = running.value.find(x => !x.background)
   if (fg && !streaming.value) follow(fg.turn_id)
 }
 function stopBackground() {
-  bgSources.forEach(es => es.close())
-  bgSources.clear()
+  bgFollows.forEach(stop => stop())
+  bgFollows.clear()
 }
 async function cancelTurn(id: string) {
   await $fetch(`/api/chat/turns/${id}/cancel`, { method: 'POST', body: {} }).catch(() => {})
+}
+// who wrote a message to a bot; an older one only kept "discord:<name>" as its author
+function senderOf(m: Message): Message['sender'] {
+  if (m.sender) return m.sender
+  const [kind, name] = [m.author.split(':', 1)[0], m.author.slice(m.author.indexOf(':') + 1)]
+  return (kind === 'discord' || kind === 'telegram') && name ? { kind, id: name, username: name } : undefined
 }
 // the person's message with the tags of agents marked
 function tagged(text: string) {
@@ -434,6 +472,7 @@ async function open(c: Conversation, messageId?: string) {
   } finally {
     loadingMsgs.value = false
   }
+  if (current.value?.id !== c.id) return // đã chuyển sang chat khác trong lúc chờ: bỏ kết quả cũ
   messages.value = res.messages
   hasOlder.value = !!res.has_more
   current.value = res.conversation
@@ -445,42 +484,52 @@ async function open(c: Conversation, messageId?: string) {
 
 async function newConversation(agentId = '') {
   try {
-    const res = await $fetch<{ conversation: Conversation }>(`/api/projects/${props.projectId}/conversations`, { method: 'POST', body: { agent_id: agentId, purpose: props.purpose ?? '' } })
+    const res = await $fetch<{ conversation: Conversation }>(`/api/projects/${props.projectId}/conversations`, { method: 'POST', body: { agent_id: agentId, purpose: props.purpose ?? '', subject: props.subject ?? '' } })
     if (props.purpose) emit('conversation', res.conversation.id)
     else await refreshConvs()
     // the skill editor's chat is in the URL: back, reload or a link reopens it
-    if (props.purpose === 'skill' || props.purpose === 'template') router.replace({ query: { ...route.query, c: res.conversation.id } })
+    if (props.purpose === 'skill' || props.purpose === 'workflow') router.replace({ query: { ...route.query, c: res.conversation.id } })
     await open(res.conversation)
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
   }
 }
 
-// written while an answer is on its way (as the CLI): shown greyed under it,
-// sent as the next message once the chat is free (several: as one)
-interface Queued { id: number, convId: string, text: string, files: Attachment[] }
-const queue = ref<Queued[]>([])
-let queueSeq = 0
-const queuedHere = computed(() => queue.value.filter(q => q.convId === current.value?.id))
-function unqueue(id: number) { queue.value = queue.value.filter(q => q.id !== id) }
-// Stop: what waited goes back into the box, not sent after all
-function unqueueAll() {
-  const here = queuedHere.value
-  if (!here.length) return
-  queue.value = queue.value.filter(q => q.convId !== current.value?.id)
-  draft.value = [...here.map(q => q.text), draft.value].filter(Boolean).join('\n\n')
-  draftFiles.value = [...here.flatMap(q => q.files), ...draftFiles.value]
-}
-watch([streaming, sending, loadingMsgs, () => current.value?.id], () => {
-  const here = queuedHere.value
-  if (!here.length || streaming.value || sending.value || loadingMsgs.value) return
-  queue.value = queue.value.filter(q => !here.includes(q))
-  void post(here.map(q => q.text).filter(Boolean).join('\n\n'), here.flatMap(q => q.files))
+// written while an answer is on its way (as the CLI): office keeps it (not
+// this page: leaving loses nothing), shown greyed under the answer and sent
+// as the next message once the chat is free (several: as one)
+// shown at once, before office answers (it only syncs them): "tmp-" ids
+let shownSeq = 0
+const shownQueued = ref<(Queued & { convId: string })[]>([])
+const queuedHere = computed(() => {
+  const kept = current.value?.queued ?? []
+  return [...kept, ...shownQueued.value.filter(q => q.convId === current.value?.id && !kept.some(k => k.text === q.text))]
 })
+function dropShown(text: string) {
+  messages.value = messages.value.filter(x => !(x.id.startsWith('tmp-') && x.content === text))
+}
+function setQueued(id: string, list: Queued[]) {
+  if (current.value?.id === id) current.value = { ...current.value, queued: list }
+}
+async function unqueue(q: Queued) {
+  const id = current.value?.id
+  if (!id) return
+  setQueued(id, queuedHere.value.filter(x => x.id !== q.id))
+  await $fetch(`/api/conversations/${id}/queued`, { method: 'DELETE', query: { id: q.id } }).catch(e => toast.add({ title: apiError(e), color: 'error' }))
+}
+// Stop: what waited goes back into the box, not sent after all
+async function unqueueAll() {
+  const id = current.value?.id
+  const here = queuedHere.value
+  if (!id || !here.length) return
+  setQueued(id, [])
+  draft.value = [...here.map(q => q.text), draft.value].filter(Boolean).join('\n\n')
+  draftFiles.value = [...here.flatMap(q => q.attachments), ...draftFiles.value]
+  await $fetch(`/api/conversations/${id}/queued`, { method: 'DELETE' }).catch(() => {})
+}
 
-// leaving the page: what waited is kept as this chat's draft, not lost
+// leaving the page: what is in the box is kept as this chat's draft
 onBeforeUnmount(() => {
-  unqueueAll()
   drafts.save(draftKey.value, draft.value, draftFiles.value)
 })
 
@@ -488,17 +537,10 @@ function send() {
   const text = draft.value.trim()
   const files = draftFiles.value
   if ((!text && !files.length) || prompt.value?.busy) return
-  if (streaming.value || sending.value) {
-    if (!current.value) return // the new chat is still being made: the box keeps it
-    queue.value.push({ id: ++queueSeq, convId: current.value.id, text, files })
-    draft.value = ''
-    draftFiles.value = []
-    scrollDown()
-    return
-  }
+  if ((streaming.value || sending.value) && !current.value) return // the new chat is still being made: the box keeps it
   draft.value = ''
   draftFiles.value = []
-  return post(text, files)
+  return post(text, files) // answering now: office keeps it for next
 }
 
 // post sends one message; it fails back into the box (with what is there now)
@@ -508,19 +550,31 @@ async function post(text: string, files: Attachment[]) {
   if (!current.value) await newConversation(pick.value)
   if (!current.value) return restore(text, files)
   const switching = !single.value && pick.value && pick.value !== current.value.agent_id ? pick.value : ''
+  // shown at once: waiting under the answer when it answers, else as sent
+  const shown = { id: `tmp-${++shownSeq}`, text, attachments: files, created_at: new Date().toISOString() }
+  if (streaming.value || sending.value) shownQueued.value.push({ ...shown, convId: current.value.id })
+  else messages.value.push({ id: shown.id, role: 'user', content: text, attachments: files, author: '', created_at: shown.created_at, tools: [], patches: [] })
+  scrollDown(true) // theirs: in view
   sending.value = true
   try {
     // mode operate: the agent's own rights are the limit (members are capped server-side)
-    const res = await $fetch<{ turn_id: string, message: Message, notice?: Message }>(`/api/conversations/${current.value.id}/messages`, { method: 'POST', body: { text, attachments: files.map(a => a.id), mode: 'operate', edit_mode: editMode.value, effort: effort.value, agent_id: switching, context: props.pageContext?.() ?? '' } })
+    const id = current.value.id
+    const res = await $fetch<{ turn_id: string, message: Message, notice?: Message, queued?: Queued }>(`/api/conversations/${id}/messages`, { method: 'POST', body: { text, attachments: files.map(a => a.id), mode: 'operate', edit_mode: editMode.value, effort: effort.value, agent_id: switching, context: props.pageContext?.() ?? '' } })
+    if (current.value?.id !== id) return // switched chats while this was in flight: the reply belongs to the old one
+    if (res.queued) { // it answers: sent once it is free (the live row may have it already)
+      if (!queuedHere.value.some(q => q.id === res.queued!.id)) setQueued(id, [...queuedHere.value, res.queued])
+      scrollDown(true) // theirs: in view
+      return
+    }
     if (switching && picked.value && current.value) current.value = { ...current.value, agent_id: picked.value.id, agent_name: picked.value.name }
-    const first = !messages.value.some(m => m.id !== res.message.id)
+    const first = !messages.value.some(m => m.id !== res.message.id && !m.id.startsWith('tmp-'))
     // the server's push of this message may have come first (ADR-078): once only
     if (!messages.value.some(m => m.id === res.message.id)) messages.value.push(res.message)
     if (first) refreshConvs() // the server titles a conversation from its first message
     // only paused agents were called: their notice, nothing streams
     if (res.notice && !messages.value.some(m => m.id === res.notice!.id)) messages.value.push(res.notice)
     if (res.turn_id) follow(res.turn_id)
-    scrollDown()
+    scrollDown(true) // the person's own message: in view
   } catch (e) {
     restore(text, files)
     const d = (e as { data?: { code?: string, error?: string } }).data
@@ -530,6 +584,8 @@ async function post(text: string, files: Attachment[]) {
       toast.add({ title: apiError(e), color: 'error' })
     }
   } finally {
+    shownQueued.value = shownQueued.value.filter(q => q.id !== shown.id)
+    messages.value = messages.value.filter(m => m.id !== shown.id)
     sending.value = false
   }
 }
@@ -545,20 +601,22 @@ function follow(id: string) {
   liveText.value = ''
   liveTools.value = []
   liveStatus.value = ''
-  source = new EventSource(`/api/chat/turns/${id}/stream`)
-  source.onmessage = (m) => {
-    const ev = JSON.parse(m.data) as ChatEvent
+  let afterTool = false // text after a tool call is a new paragraph, not glued to the last one
+  unfollow = followTurn<ChatEvent>(id, (ev) => {
     switch (ev.type) {
       case 'status': liveStatus.value = ev.text ?? ''; break
-      case 'text': liveText.value += ev.text ?? ''; scrollDown(); break
-      case 'tool': if (ev.tool) liveTools.value.push(ev.tool); scrollDown(); break
+      case 'text':
+        if (afterTool && liveText.value && ev.text) liveText.value += '\n\n'
+        afterTool = false
+        liveText.value += ev.text ?? ''; scrollDown(); break
+      case 'tool': if (ev.tool) liveTools.value.push(ev.tool); afterTool = true; scrollDown(); break
       case 'done':
       case 'error':
         if (ev.message) {
           if (!messages.value.some(x => x.id === ev.message!.id)) messages.value.push(ev.message) // the live refresh may have it already
           if (props.purpose === 'automation' && ev.type === 'done') fencedBlocks(ev.message.content, 'automation').forEach(p => emit('automation-patch', p))
           if (props.purpose === 'skill' && ev.type === 'done') fencedBlocks(ev.message.content, 'skill').forEach(p => emit('skill-patch', p))
-          if (props.purpose === 'template' && ev.type === 'done') fencedBlocks(ev.message.content, 'template').forEach(p => emit('template-patch', p))
+          if (props.purpose === 'workflow' && ev.type === 'done') fencedBlocks(ev.message.content, 'workflow').forEach(p => emit('workflow-patch', p))
         }
         if (ev.next_turn_id) { // the next agent tagged answers now
           follow(ev.next_turn_id)
@@ -566,31 +624,30 @@ function follow(id: string) {
           break
         }
         finishStream()
+        // what waited was sent as this ended: its answer streams now
+        if (current.value?.active_turn && current.value.active_turn !== id) follow(current.value.active_turn)
         afterTurn()
         if (!single.value) refreshConvs()
         scrollDown()
         break
     }
-  }
-  source.onerror = () => {
-    // the turn is gone (finished before we connected): reload the thread
-    if (source?.readyState === EventSource.CLOSED) {
-      finishStream()
-      if (current.value) open(current.value)
-    }
-  }
+  }, () => {
+    // the turn is gone (finished before we followed it): reload the thread
+    finishStream()
+    if (current.value) open(current.value)
+  })
 }
 
 function finishStream() {
-  source?.close()
-  source = null
+  unfollow?.()
+  unfollow = null
   streaming.value = false
   liveText.value = ''
   liveTools.value = []
 }
 function stopStream() {
-  source?.close()
-  source = null
+  unfollow?.()
+  unfollow = null
   streaming.value = false
 }
 // "Gửi ngay" on a queued message (as the CLI): the answer being written stops,
@@ -599,7 +656,7 @@ async function sendNow() {
   if (streaming.value && turnId) await cancelTurn(turnId)
 }
 async function cancel() {
-  unqueueAll()
+  await unqueueAll()
   // Stop: the answer and every agent working in the background in this chat
   if (current.value && !single.value) await $fetch(`/api/conversations/${current.value.id}/stop`, { method: 'POST', body: {} }).catch(() => {})
   else if (turnId) await $fetch(`/api/chat/turns/${turnId}/cancel`, { method: 'POST', body: {} }).catch(() => {})
@@ -621,19 +678,33 @@ function onPatchUpdated(msg: Message, p: Patch) {
   if (i >= 0) msg.patches[i] = p
 }
 
-const when = (d: string) => new Date(d).toLocaleString(dateLocale.value, { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })
 
 // ```automation {…}``` (or ```skill```) blocks of an answer: form changes (bad JSON is skipped)
 function fencedBlocks(text: string, lang: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = []
   // the closing fence starts a line: JSON has no raw newline, while a skill's body may hold ``` of its own
   for (const m of text.matchAll(new RegExp('```' + lang + '[ \\t]*\\n([\\s\\S]*?)\\n[ \\t]*```', 'g'))) {
+    if (lang === 'workflow') { // a workflow is its whole file, not JSON
+      out.push({ source: m[1]! })
+      continue
+    }
     try {
       const v = JSON.parse(m[1]!)
       if (v && typeof v === 'object' && !Array.isArray(v)) out.push(v)
     } catch { /* not JSON: ignore */ }
   }
   return out
+}
+
+// a code block's Apply (useMarkdown): the draft fills the editor next to the chat again
+function onMarkdownClick(e: MouseEvent) {
+  const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-md-act="apply"]')
+  const lang = btn?.dataset.lang
+  const code = btn?.closest('.md-code')?.querySelector('code')?.textContent
+  if (!lang || code == null || lang !== props.purpose) return
+  const blocks = fencedBlocks('```' + lang + '\n' + code.replace(/\n$/, '') + '\n```', lang)
+  if (!blocks.length) return toast.add({ title: t('chat.applyBad'), color: 'error' })
+  for (const b of blocks) emit(`${lang}-patch` as 'workflow-patch', b)
 }
 
 // a skill an agent drafted in the chat (Claude Code may not write .claude/): the
@@ -643,6 +714,49 @@ function openSkillDraft(d: Record<string, unknown>) {
   try { sessionStorage.setItem('office.skillDraft', JSON.stringify(d)) } catch { /* private mode: the editor opens empty */ }
   navigateTo(`/projects/${props.projectId}/skills/edit`)
 }
+
+// a workflow editor's chat, followed from the chat list: the library's lives
+// in the office assistant's project, a project's own in that project
+async function openWorkflowEditor(id: string) {
+  const asst = await $fetch<{ project_id: string }>('/api/assistant').catch(() => null)
+  await navigateTo(asst?.project_id === props.projectId ? `/workflows/edit?c=${id}` : `/projects/${props.projectId}/workflows/edit?c=${id}`)
+}
+
+// the workflow runs of the open chat (ADR-098): a card each, in the thread
+// where it started, kept up to date as the run goes
+const runs = ref<WorkflowRun[]>([])
+async function loadRuns() {
+  const id = current.value?.id
+  if (!id) { runs.value = []; return }
+  try {
+    const res = await $fetch<{ runs: WorkflowRun[] }>(`/api/projects/${props.projectId}/workflow-runs`, { query: { conversation: id } })
+    if (current.value?.id === id) runs.value = res.runs
+  } catch { /* workflows off, or offline: no cards */ }
+}
+watch(() => current.value?.id, (id, before) => {
+  if (id !== before) runs.value = []
+  void loadRuns()
+})
+useLive(['workflow_runs'], loadRuns)
+function onRunUpdated(r: WorkflowRun) {
+  runs.value = runs.value.map(x => x.id === r.id ? r : x)
+}
+// each card goes just before the first message after it started; one older
+// than the messages loaded waits for "older"
+const runsAt = computed(() => {
+  const before = new Map<string, WorkflowRun[]>()
+  const after: WorkflowRun[] = []
+  const msgs = messages.value
+  const first = msgs[0] ? Date.parse(msgs[0].created_at) : 0
+  for (const r of [...runs.value].sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at))) {
+    const at = Date.parse(r.started_at)
+    if (hasOlder.value && at < first) continue
+    const m = msgs.find(x => Date.parse(x.created_at) > at)
+    if (m) before.set(m.id, [...(before.get(m.id) ?? []), r])
+    else after.push(r)
+  }
+  return { before, after }
+})
 
 async function openAutomation() {
   if (!props.automationId) return
@@ -664,19 +778,48 @@ const threadPick = computed({
   set: (id?: string) => { const c = conversations.value.find(x => x.id === id); if (c) open(c) }
 })
 
-// an editor (skill, template) opened on its chat again: that chat, and the drafts it gave
+// an editor (skill, workflow) opened on its chat again: that chat, and the drafts it gave
 async function openEditorChat(id: string) {
   try {
     await open({ id } as Conversation)
+    emit('conversation', id)
     emit('history', messages.value.filter(m => m.role === 'assistant').flatMap(m => fencedBlocks(m.content, props.purpose!)))
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
   }
 }
 
+// a saved skill or workflow: the chat it was written with, if any
+async function openSubjectChat() {
+  if (!props.subject) return
+  try {
+    const res = await $fetch<{ conversation: Conversation | null }>(`/api/projects/${props.projectId}/editor-chat`, { query: { purpose: props.purpose, subject: props.subject } })
+    if (res.conversation && !current.value) await openEditorChat(res.conversation.id)
+  } catch { /* none: a new one on first send */ }
+}
+// an editor's chat cleared: gone, the next message starts a new one
+async function clearEditorChat() {
+  const c = current.value
+  if (!c || !confirm(t('chat.clearEditorConfirm'))) return
+  try {
+    if (streaming.value) await cancel()
+    await $fetch(`/api/conversations/${c.id}`, { method: 'DELETE' })
+  } catch (e) {
+    return toast.add({ title: apiError(e), color: 'error' })
+  }
+  current.value = null
+  messages.value = []
+  emit('conversation', '')
+  if (route.query.c === c.id) router.replace({ query: { ...route.query, c: undefined } })
+  if (props.purpose === 'automation') openAutomation() // a saved automation: a new chat tied to it
+}
+
 onMounted(() => {
   if (props.purpose === 'automation') openAutomation()
-  else if (props.purpose === 'skill' || props.purpose === 'template') { if (typeof route.query.c === 'string') openEditorChat(route.query.c) }
+  else if (props.purpose === 'skill' || props.purpose === 'workflow') {
+    if (typeof route.query.c === 'string') openEditorChat(route.query.c)
+    else openSubjectChat()
+  }
   else if (props.conversationId) open({ id: props.conversationId } as Conversation).catch(() => { openFirst.value = true }) // gone: the latest one
   else if (ownsUrl.value && typeof route.query.draft === 'string' && !tookPrefill) {
     // handed over by the office assistant: a new chat with the message ready to send
@@ -769,17 +912,22 @@ onBeforeUnmount(() => {
           </button>
         </span>
       </div>
-      <div ref="listEl" class="min-w-0 space-y-4" :class="['flex-1 overflow-y-auto overflow-x-hidden p-4 max-md:px-3', page && 'max-sm:pb-32' /* room for the floating input, open or not: nothing jumps */]">
+      <div class="relative flex min-h-0 flex-1 flex-col">
+      <div ref="listEl" class="min-w-0 space-y-4" :class="['flex-1 overflow-y-auto overflow-x-hidden p-4 max-md:px-3', page && 'max-sm:pb-32' /* room for the floating input, open or not: nothing jumps */]" @scroll.passive="onListScroll">
         <!-- a skill editor's chat, followed from the chat list: back to its editor -->
         <div v-if="!single && current?.purpose === 'skill'" class="flex items-center gap-2 rounded-lg border border-(--ui-border) px-3 py-2 text-sm">
           <UIcon name="i-lucide-sparkles" class="size-4 shrink-0 text-(--ui-primary)" />
           <span class="min-w-0 flex-1 truncate text-(--ui-text-muted)">{{ t('chat.skillChat') }}</span>
           <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-pencil" :label="t('chat.backToSkillEditor')" :to="`/projects/${projectId}/skills/edit?c=${current.id}`" />
         </div>
-        <div v-else-if="!single && current?.purpose === 'template'" class="flex items-center gap-2 rounded-lg border border-(--ui-border) px-3 py-2 text-sm">
-          <UIcon name="i-lucide-network" class="size-4 shrink-0 text-(--ui-primary)" />
-          <span class="min-w-0 flex-1 truncate text-(--ui-text-muted)">{{ t('chat.templateChat') }}</span>
-          <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-pencil" :label="t('chat.backToTemplateEditor')" :to="`/templates/new?c=${current.id}`" />
+        <div v-else-if="!single && current?.purpose === 'workflow'" class="flex items-center gap-2 rounded-lg border border-(--ui-border) px-3 py-2 text-sm">
+          <UIcon name="i-lucide-workflow" class="size-4 shrink-0 text-(--ui-primary)" />
+          <span class="min-w-0 flex-1 truncate text-(--ui-text-muted)">{{ t('chat.workflowChat') }}</span>
+          <UButton size="xs" color="neutral" variant="outline" icon="i-lucide-pencil" :label="t('chat.backToWorkflowEditor')" @click="openWorkflowEditor(current.id)" />
+        </div>
+        <!-- an editor's chat: cleared to start over -->
+        <div v-if="single && current && messages.length" class="flex justify-end">
+          <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-eraser" :label="t('chat.clearEditorChat')" @click="clearEditorChat" />
         </div>
         <div v-if="hasOlder" class="text-center">
           <UButton size="xs" color="neutral" variant="soft" icon="i-lucide-arrow-up" :loading="loadingOlder" :label="t('chat.older')" @click="loadOlder" />
@@ -800,9 +948,9 @@ onBeforeUnmount(() => {
             <p class="text-sm">{{ t('chat.askAboutAutomation') }}</p>
             <p class="text-xs">{{ t('chat.automationHint') }}</p>
           </template>
-          <template v-else-if="purpose === 'template'">
-            <p class="text-sm">{{ t('tplNew.askAI') }}</p>
-            <p class="text-xs">{{ t('tplNew.askAIHint') }}</p>
+          <template v-else-if="purpose === 'workflow'">
+            <p class="text-sm">{{ t('wf.askAI') }}</p>
+            <p class="text-xs">{{ t('wf.askAIHint') }}</p>
           </template>
           <template v-else-if="purpose === 'skill'">
             <p class="text-sm">{{ t('skill.askAI') }}</p>
@@ -810,12 +958,30 @@ onBeforeUnmount(() => {
           </template>
           <template v-else>
             <p class="text-sm">{{ t('chat.askAboutProject') }}</p>
-            <p class="text-xs">{{ t('chat.readOnlyHint') }}</p>
+            <!-- what the hint promises follows the picked agent's permission -->
+            <p class="text-xs">{{ t(permRank(pickedLevel) >= permRank('edit') ? 'chat.editHint' : 'chat.readOnlyHint') }}</p>
           </template>
         </div>
 
         <template v-for="m in messages" :key="m.id">
+          <WorkflowRunCard v-for="r in runsAt.before.get(m.id) ?? []" :key="r.id" :run="r" @updated="onRunUpdated" />
           <div v-if="m.role === 'user'" :id="`m-${m.id}`" class="group/msg flex flex-col items-end gap-1.5 rounded-lg transition" :class="marked === m.id && 'ring-2 ring-primary/60 ring-offset-4 ring-offset-(--ui-bg)'">
+            <div v-if="senderOf(m)" class="flex max-w-[80%] flex-wrap items-center justify-end gap-x-1.5 text-xs text-(--ui-text-muted)">
+              <UIcon :name="sourceIcon[senderOf(m)!.kind]" class="size-3.5 shrink-0" :title="t(`source.${senderOf(m)!.kind}`)" />
+              <template v-if="senderOf(m)!.account">
+                <UIcon name="i-lucide-user-check" class="size-3.5 shrink-0" :title="t('chat.senderAccount')" />
+                <span class="font-medium text-(--ui-text)">{{ senderOf(m)!.account }}</span>
+                <span v-if="senderOf(m)!.account_id === me?.id">({{ t('chat.senderYou') }})</span>
+                <span>· {{ senderOf(m)!.name || senderOf(m)!.username }}</span>
+              </template>
+              <template v-else>
+                <span class="font-medium text-(--ui-text)">{{ senderOf(m)!.name || senderOf(m)!.username || senderOf(m)!.id }}</span>
+                <span v-if="senderOf(m)!.name && senderOf(m)!.username">@{{ senderOf(m)!.username }}</span>
+              </template>
+              <span v-if="m.sender">· {{ senderOf(m)!.private ? t('chat.senderDm') : t(`chat.senderIn.${senderOf(m)!.kind}`) }}</span>
+              <span>· {{ when(m.created_at) }}</span>
+              <a v-if="senderOf(m)!.link" :href="senderOf(m)!.link" target="_blank" rel="noopener" class="hover:text-(--ui-text)" :aria-label="t('chat.senderOpen')" :title="t('chat.senderOpen')"><UIcon name="i-lucide-external-link" class="size-3.5" /></a>
+            </div>
             <AttachmentList :items="m.attachments ?? []" align="end" />
             <div class="flex max-w-[80%] items-start gap-1">
               <UDropdownMenu :items="messageMenu(m)" :content="{ align: 'end' }">
@@ -852,9 +1018,9 @@ onBeforeUnmount(() => {
               </ul>
             </details>
             <!-- eslint-disable-next-line vue/no-v-html -->
-            <div class="markdown min-w-0 text-sm" v-html="renderMarkdown(m.content)" />
+            <div class="markdown min-w-0 text-sm" :class="purpose && `md-apply-${purpose}`" @click="onMarkdownClick" v-html="renderMarkdown(m.content)" />
             <UButton
-              v-for="(d, i) in (purpose || current?.purpose === 'skill' || current?.purpose === 'template' ? [] : skillDrafts(m.content))" :key="`sk${i}`"
+              v-for="(d, i) in (purpose || current?.purpose === 'skill' || current?.purpose === 'workflow' ? [] : skillDrafts(m.content))" :key="`sk${i}`"
               icon="i-lucide-sparkles" size="sm" color="neutral" variant="outline" :label="t('chat.openSkillEditor', { name: String(d.name) })"
               @click="openSkillDraft(d)"
             />
@@ -865,33 +1031,44 @@ onBeforeUnmount(() => {
             />
           </div>
         </template>
+        <WorkflowRunCard v-for="r in runsAt.after" :key="r.id" :run="r" @updated="onRunUpdated" />
 
-        <div v-if="streaming" class="space-y-2">
+        <div v-if="streaming && !runs.some(r => r.status === 'running' && r.caller_conversation_id === current?.id)" class="space-y-2">
           <div class="flex items-center gap-2 text-xs text-(--ui-text-muted)">
             <UIcon name="i-lucide-loader-circle" class="size-4 animate-spin text-primary" />
             <span>{{ liveStatus || t('chat.replying') }}</span>
           </div>
           <ul v-if="liveTools.length" class="space-y-0.5 ps-6 text-xs text-(--ui-text-muted)">
-            <li v-for="(t, i) in liveTools" :key="i">{{ t.summary }}</li>
+            <li v-for="(t, i) in liveTools" :key="i" class="line-clamp-2 break-all" :title="t.summary">{{ t.summary }}</li>
           </ul>
           <!-- eslint-disable-next-line vue/no-v-html -->
           <div v-if="liveText" class="markdown text-sm" v-html="renderMarkdown(liveText)" />
         </div>
 
         <!-- written while it answers: sent next, greyed until then -->
-        <div v-for="q in queuedHere" :key="`q${q.id}`" class="flex flex-col items-end gap-1 opacity-50">
+        <div v-for="q in queuedHere" :key="q.id" class="flex flex-col items-end gap-1 opacity-50">
           <div v-if="q.text" class="min-w-0 max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-(--ui-bg-accented) px-3.5 py-2 text-sm">{{ q.text }}</div>
           <div class="flex items-center gap-1 text-xs text-(--ui-text-muted)">
             <UIcon name="i-lucide-clock" class="size-3.5" />
-            <span>{{ q.files.length ? `${t('chat.queued')} · ${q.files.map(f => f.name).join(', ')}` : t('chat.queued') }}</span>
+            <span>{{ q.attachments.length ? `${t('chat.queued')} · ${q.attachments.map(f => f.name).join(', ')}` : t('chat.queued') }}</span>
             <button v-if="streaming" type="button" class="flex items-center gap-0.5 rounded px-1 py-0.5 text-(--ui-text) hover:text-primary" :title="t('chat.sendNowHint')" @click="sendNow">
               <UIcon name="i-lucide-zap" class="size-3.5" />{{ t('chat.sendNow') }}
             </button>
-            <button type="button" class="rounded p-0.5 hover:text-(--ui-error)" :aria-label="t('chat.unqueue')" :title="t('chat.unqueue')" @click="unqueue(q.id)">
+            <button v-if="!q.id.startsWith('tmp-')" type="button" class="rounded p-0.5 hover:text-(--ui-error)" :aria-label="t('chat.unqueue')" :title="t('chat.unqueue')" @click="unqueue(q)">
               <UIcon name="i-lucide-x" class="size-3.5" />
             </button>
           </div>
         </div>
+      </div>
+      <!-- scrolled up to read: down to the newest (as Discord), saying when something came -->
+      <Transition enter-from-class="opacity-0 translate-y-2" leave-to-class="opacity-0 translate-y-2" enter-active-class="transition" leave-active-class="transition">
+        <UButton
+          v-if="!pinned && messages.length" size="sm" :color="unseen ? 'primary' : 'neutral'" :variant="unseen ? 'solid' : 'outline'" icon="i-lucide-arrow-down"
+          :label="unseen ? t('chat.newMessages') : undefined" :aria-label="t('chat.toLatest')" :title="t('chat.toLatest')"
+          :class="['absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full shadow-lg', !unseen && 'bg-(--ui-bg)', page && 'max-sm:bottom-20']"
+          @click="toEnd"
+        />
+      </Transition>
       </div>
 
       <p v-if="current?.cleaned" class="flex items-center gap-2 border-t border-(--ui-border) p-3 text-sm text-(--ui-text-muted) max-md:p-2">
@@ -913,10 +1090,10 @@ onBeforeUnmount(() => {
           <template #actions>
             <ContextMeter :tokens="current?.context_tokens" :window="current?.context_window" />
             <USelect
-              v-if="!single && onAgents.length > 1" v-model="pick" :items="agentItems" size="sm" variant="ghost" class="min-w-0 max-w-56 shrink"
+              v-if="!single && onAgents.length > 1" v-model="pick" :items="agentItems" size="sm" variant="ghost" class="min-w-0 max-w-56 shrink" :ui="iconOnPhone"
               :icon="permOf(pickedLevel).icon" :title="permOf(pickedLevel).description" :aria-label="t('chat.pickAgent')"
             />
-            <EffortSelect v-model="effort" :fallback="picked?.effort ?? ''" size="sm" class="min-w-0 max-w-44 shrink" :title="t('chat.effort')" :aria-label="t('chat.effort')" />
+            <EffortSelect v-if="pickedEfforts.length" v-model="effort" :options="pickedEfforts" :fallback="picked?.effort ?? ''" size="sm" variant="ghost" class="min-w-0 max-w-44 shrink" :ui="iconOnPhone" :title="t('chat.effort')" :aria-label="t('chat.effort')" />
             <EditModePicker v-if="permRank(pickedLevel) >= permRank('propose')" v-model="editMode" class="min-w-0 shrink" />
             <UButton v-if="streaming" size="sm" icon="i-lucide-square" color="neutral" variant="outline" :label="t('chat.stop')" @click="cancel" />
             <!-- while it answers: queued, sent next -->

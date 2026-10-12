@@ -22,7 +22,7 @@ func (r chatRepo) tell(c storage.Change) {
 	}
 }
 
-const convCols = `id, project_id, agent_id, agent_name, title, session_id, runtime, mode, task_id, created_by, created_at, updated_at, edit_mode, purpose, automation_id, context_tokens, context_window, effort`
+const convCols = `id, project_id, agent_id, agent_name, title, session_id, runtime, mode, task_id, created_by, created_at, updated_at, edit_mode, purpose, automation_id, context_tokens, context_window, effort, subject`
 
 // convRead: what is read back (cleaned is set by the data cleanup only)
 const convRead = convCols + `, cleaned, cleaned_at`
@@ -34,7 +34,7 @@ func scanConv(row scanner) (storage.Conversation, error) {
 		created, updated string
 		cleanedAt        sql.NullString
 	)
-	if err := row.Scan(&c.ID, &c.ProjectID, &agent, &c.AgentName, &c.Title, &c.SessionID, &c.Runtime, &c.Mode, &task, &c.CreatedBy, &created, &updated, &c.EditMode, &c.Purpose, &c.AutomationID, &c.ContextTokens, &c.ContextWindow, &c.Effort, &c.Cleaned, &cleanedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.ProjectID, &agent, &c.AgentName, &c.Title, &c.SessionID, &c.Runtime, &c.Mode, &task, &c.CreatedBy, &created, &updated, &c.EditMode, &c.Purpose, &c.AutomationID, &c.ContextTokens, &c.ContextWindow, &c.Effort, &c.Subject, &c.Cleaned, &cleanedAt); err != nil {
 		return c, notFound(err)
 	}
 	c.AgentID, c.TaskID = agent.String, task.String
@@ -58,8 +58,8 @@ func (r chatRepo) CreateConversation(ctx context.Context, c storage.Conversation
 	if c.EditMode == "" {
 		c.EditMode = "worktree"
 	}
-	_, err := r.db.ExecContext(ctx, `INSERT INTO conversations (`+convCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.ProjectID, nullStr(c.AgentID), c.AgentName, c.Title, c.SessionID, c.Runtime, c.Mode, nullStr(c.TaskID), c.CreatedBy, fmtTime(now), fmtTime(now), c.EditMode, c.Purpose, c.AutomationID, c.ContextTokens, c.ContextWindow, c.Effort)
+	_, err := r.db.ExecContext(ctx, `INSERT INTO conversations (`+convCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.ProjectID, nullStr(c.AgentID), c.AgentName, c.Title, c.SessionID, c.Runtime, c.Mode, nullStr(c.TaskID), c.CreatedBy, fmtTime(now), fmtTime(now), c.EditMode, c.Purpose, c.AutomationID, c.ContextTokens, c.ContextWindow, c.Effort, c.Subject)
 	if err == nil {
 		r.tell(storage.Change{Kind: "conversation", ConversationID: c.ID})
 	}
@@ -185,22 +185,23 @@ func (r chatRepo) ListConversationsFrom(ctx context.Context, projectID, source s
 }
 
 func (r chatRepo) ListConversationsBefore(ctx context.Context, projectID, source string, before time.Time, limit int) ([]storage.Conversation, error) {
-	return r.ListConversationsTagged(ctx, projectID, source, nil, before, limit)
+	return r.ListConversationsTagged(ctx, projectID, source, nil, before, limit, "")
 }
 
-func (r chatRepo) ListConversationsTagged(ctx context.Context, projectID, source string, tags []string, before time.Time, limit int) ([]storage.Conversation, error) {
+func (r chatRepo) ListConversationsTagged(ctx context.Context, projectID, source string, tags []string, before time.Time, limit int, createdBy string) ([]storage.Conversation, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	// the project's own chats (web, automations), a skill's or template's editor's among them
-	where := `purpose IN ('','skill','template')`
+	// the project's own chats (web, automations); an editor's (automation,
+	// skill, workflow) stays with what it writes
+	where := `purpose=''`
 	switch source {
 	case "all":
-		where = `purpose IN ('','skill','template','channel','burn')`
+		where = `purpose IN ('','channel','burn')`
 	case "burn":
 		where = `purpose='burn'`
 	case "web":
-		where = `purpose IN ('','skill','template') AND created_by LIKE 'human:%'`
+		where = `purpose='' AND created_by LIKE 'human:%'`
 	case "auto":
 		where = `purpose='' AND created_by LIKE 'auto:%'`
 	case "discord", "telegram":
@@ -218,6 +219,10 @@ func (r chatRepo) ListConversationsTagged(ctx context.Context, projectID, source
 			args = append(args, t)
 		}
 		args = append(args, len(tags))
+	}
+	if createdBy != "" {
+		page += ` AND created_by = ?`
+		args = append(args, createdBy)
 	}
 	args = append(args, limit)
 	rows, err := r.db.QueryContext(ctx, `SELECT `+convRead+` FROM conversations WHERE project_id=? AND task_id IS NULL AND `+where+page+` ORDER BY updated_at DESC LIMIT ?`, args...)
@@ -240,10 +245,42 @@ func (r chatRepo) ListConversationsTagged(ctx context.Context, projectID, source
 	return out, r.fillTags(ctx, out)
 }
 
+func (r chatRepo) ListAgentConversations(ctx context.Context, projectID, agentID string, since time.Time, limit int) ([]storage.Conversation, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 2000
+	}
+	where := `purpose IN ('','channel','burn') AND (agent_id=? OR id IN (SELECT conversation_id FROM conversation_agents WHERE agent_id=?))`
+	args := []any{projectID, agentID, agentID}
+	if !since.IsZero() {
+		where += ` AND updated_at >= ?`
+		args = append(args, fmtTime(since))
+	}
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, `SELECT `+convRead+` FROM conversations WHERE project_id=? AND task_id IS NULL AND `+where+` ORDER BY updated_at DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	var out []storage.Conversation
+	for rows.Next() {
+		c, err := scanConv(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, r.fillTags(ctx, out)
+}
+
 func (r chatRepo) DeleteConversation(ctx context.Context, id string) error {
+	conv, _ := r.GetConversation(ctx, id) // best effort: scope the change event even once the row is gone
 	err := execOne(ctx, r.db, `DELETE FROM conversations WHERE id=?`, id)
 	if err == nil {
-		r.tell(storage.Change{Kind: "conversation.deleted", ConversationID: id})
+		r.tell(storage.Change{Kind: "conversation.deleted", ConversationID: id, ProjectID: conv.ProjectID, CreatedBy: conv.CreatedBy})
 	}
 	return err
 }
@@ -261,8 +298,8 @@ func (r chatRepo) AddMessage(ctx context.Context, m storage.Message) (storage.Me
 	if m.Attachments == nil {
 		m.Attachments = []storage.Attachment{}
 	}
-	_, err := r.db.ExecContext(ctx, `INSERT INTO messages (id, conversation_id, role, content, tools, attachments, run_id, author, created_at, context) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		m.ID, m.ConversationID, m.Role, m.Content, toJSON(m.Tools), toJSON(m.Attachments), nullStr(m.RunID), m.Author, fmtTime(m.CreatedAt), m.Context)
+	_, err := r.db.ExecContext(ctx, `INSERT INTO messages (id, conversation_id, role, content, tools, attachments, run_id, author, created_at, context, agent_id, sender) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		m.ID, m.ConversationID, m.Role, m.Content, toJSON(m.Tools), toJSON(m.Attachments), nullStr(m.RunID), m.Author, fmtTime(m.CreatedAt), m.Context, m.AgentID, senderJSON(m.Sender))
 	if err == nil {
 		_, _ = r.db.ExecContext(ctx, `UPDATE conversations SET updated_at=? WHERE id=?`, fmtTime(m.CreatedAt), m.ConversationID)
 		r.tell(storage.Change{Kind: "message", ConversationID: m.ConversationID, Message: &m})
@@ -270,8 +307,16 @@ func (r chatRepo) AddMessage(ctx context.Context, m storage.Message) (storage.Me
 	return m, err
 }
 
+// senderJSON is a message's sender as stored (” = none).
+func senderJSON(s *storage.Sender) string {
+	if s == nil {
+		return ""
+	}
+	return toJSON(s)
+}
+
 func (r chatRepo) ListMessages(ctx context.Context, conversationID string) ([]storage.Message, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id, conversation_id, role, content, tools, attachments, run_id, author, created_at, context
+	rows, err := r.db.QueryContext(ctx, `SELECT id, conversation_id, role, content, tools, attachments, run_id, author, created_at, context, agent_id, sender
 		FROM messages WHERE conversation_id=? ORDER BY created_at, id`, conversationID)
 	if err != nil {
 		return nil, err
@@ -282,12 +327,19 @@ func (r chatRepo) ListMessages(ctx context.Context, conversationID string) ([]st
 		var (
 			m                    storage.Message
 			tools, atts, created string
+			sender               string
 			run                  sql.NullString
 		)
-		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &tools, &atts, &run, &m.Author, &created, &m.Context); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &tools, &atts, &run, &m.Author, &created, &m.Context, &m.AgentID, &sender); err != nil {
 			return nil, err
 		}
 		m.RunID = run.String
+		if sender != "" {
+			m.Sender = &storage.Sender{}
+			if err := json.Unmarshal([]byte(sender), m.Sender); err != nil {
+				return nil, err
+			}
+		}
 		if err := json.Unmarshal([]byte(tools), &m.Tools); err != nil {
 			return nil, err
 		}
@@ -397,6 +449,19 @@ func (r chatRepo) DecidePatch(ctx context.Context, id, status, detail, by string
 
 func (r chatRepo) AutomationConversation(ctx context.Context, automationID string) (storage.Conversation, error) {
 	return scanConv(r.db.QueryRowContext(ctx, `SELECT `+convRead+` FROM conversations WHERE automation_id=? ORDER BY updated_at DESC LIMIT 1`, automationID))
+}
+
+func (r chatRepo) SubjectConversation(ctx context.Context, projectID, purpose, subject, createdBy string) (storage.Conversation, error) {
+	return scanConv(r.db.QueryRowContext(ctx, `SELECT `+convRead+` FROM conversations WHERE project_id=? AND purpose=? AND subject=? AND subject!='' AND (?='' OR created_by=?) ORDER BY updated_at DESC LIMIT 1`,
+		projectID, purpose, subject, createdBy, createdBy))
+}
+
+func (r chatRepo) SetConversationSubject(ctx context.Context, conversationID, subject string) error {
+	err := execOne(ctx, r.db, `UPDATE conversations SET subject=? WHERE id=?`, subject, conversationID)
+	if err == nil {
+		r.tell(storage.Change{Kind: "conversation", ConversationID: conversationID})
+	}
+	return err
 }
 
 func (r chatRepo) LinkAutomation(ctx context.Context, conversationID, automationID string) error {
@@ -543,6 +608,85 @@ func (r chatRepo) SearchMessages(ctx context.Context, query string, f storage.Se
 		}
 		h.CreatedAt, _ = parseTime(at)
 		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+func (r chatRepo) QueueMessage(ctx context.Context, q storage.QueuedMessage) (storage.QueuedMessage, error) {
+	if q.ID == "" {
+		q.ID = ids.New("chq")
+	}
+	if q.CreatedAt.IsZero() {
+		q.CreatedAt = time.Now().UTC()
+	}
+	if q.Attachments == nil {
+		q.Attachments = []storage.Attachment{}
+	}
+	_, err := r.db.ExecContext(ctx, `INSERT INTO chat_queued (id, conversation_id, author, text, attachments, context, options, created_at) VALUES (?,?,?,?,?,?,?,?)`,
+		q.ID, q.ConversationID, q.Author, q.Text, toJSON(q.Attachments), q.Context, toJSON(q.Options), fmtTime(q.CreatedAt))
+	if err == nil {
+		r.tell(storage.Change{Kind: "conversation", ConversationID: q.ConversationID})
+	}
+	return q, err
+}
+
+func (r chatRepo) QueuedMessages(ctx context.Context, conversationID string) ([]storage.QueuedMessage, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id, conversation_id, author, text, attachments, context, options, created_at FROM chat_queued WHERE conversation_id=? ORDER BY created_at, id`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []storage.QueuedMessage
+	for rows.Next() {
+		var (
+			q             storage.QueuedMessage
+			att, opts, at string
+		)
+		if err := rows.Scan(&q.ID, &q.ConversationID, &q.Author, &q.Text, &att, &q.Context, &opts, &at); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(att), &q.Attachments)
+		_ = json.Unmarshal([]byte(opts), &q.Options)
+		if q.Attachments == nil {
+			q.Attachments = []storage.Attachment{}
+		}
+		q.CreatedAt, _ = parseTime(at)
+		out = append(out, q)
+	}
+	return out, rows.Err()
+}
+
+func (r chatRepo) DeleteQueued(ctx context.Context, conversationID string, ids ...string) error {
+	q, args := `DELETE FROM chat_queued WHERE conversation_id=?`, []any{conversationID}
+	if len(ids) > 0 {
+		q += ` AND id IN (?` + strings.Repeat(",?", len(ids)-1) + `)`
+		for _, id := range ids {
+			args = append(args, id)
+		}
+	}
+	res, err := r.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		r.tell(storage.Change{Kind: "conversation", ConversationID: conversationID})
+	}
+	return nil
+}
+
+func (r chatRepo) QueuedConversations(ctx context.Context) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT conversation_id FROM chat_queued`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
 	}
 	return out, rows.Err()
 }

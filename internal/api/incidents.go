@@ -203,20 +203,34 @@ func (s *server) incidentsFor(ctx context.Context, u storage.User) ([]incident, 
 // happens again.
 func (s *server) dismissIncident(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Key string `json:"key"`
+		Key  string   `json:"key"`
+		Keys []string `json:"keys"` // Bỏ qua tất cả: several at once
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	if in.Key == "" || strings.HasPrefix(in.Key, "approval:") || strings.HasPrefix(in.Key, "patch:") { // a card is decided, not let go
+	keys := in.Keys
+	if in.Key != "" {
+		keys = append(keys, in.Key)
+	}
+	if len(keys) == 0 {
 		writeError(w, http.StatusBadRequest, "không bỏ qua được mục này")
 		return
 	}
-	if err := s.cfg.Store.Settings().Set(r.Context(), dismissKey(in.Key), time.Now().UTC()); err != nil {
-		s.internal(w, r, err)
-		return
+	for _, k := range keys {
+		if k == "" || strings.HasPrefix(k, "approval:") || strings.HasPrefix(k, "patch:") { // a card is decided, not let go
+			writeError(w, http.StatusBadRequest, "không bỏ qua được mục này")
+			return
+		}
 	}
-	s.auditAction(r, "incident.dismiss", in.Key, nil)
+	now := time.Now().UTC()
+	for _, k := range keys {
+		if err := s.cfg.Store.Settings().Set(r.Context(), dismissKey(k), now); err != nil {
+			s.internal(w, r, err)
+			return
+		}
+		s.auditAction(r, "incident.dismiss", k, nil)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -251,14 +265,16 @@ func (s *server) retryIncident(w http.ResponseWriter, r *http.Request) {
 		if a, err = s.cfg.Store.Automations().Get(ctx, in.ID); err == nil && a.Config.EndsAt != nil && !a.Config.EndsAt.After(time.Now()) {
 			err = errors.New("giờ dừng đã qua: hãy đặt giờ dừng mới hoặc bỏ giờ dừng")
 		} else if err == nil {
-			a.Enabled, a.Failures, a.DisabledCode, a.DisabledReason = true, 0, "", "" // turned back on
+			var nextRunAt *time.Time
 			if a.Source == "schedule" {
 				if next, nerr := trigger.NextRun(a.Config, time.Now().UTC()); nerr == nil {
-					a.NextRunAt = &next
+					nextRunAt = &next
 				}
 			}
-			if err = s.cfg.Store.Automations().Update(ctx, a); err == nil {
-				s.reloadBot(a)
+			if err = s.cfg.Store.Automations().Reenable(ctx, a.ID, nextRunAt); err == nil {
+				if a, err = s.cfg.Store.Automations().Get(ctx, a.ID); err == nil {
+					s.reloadBot(a)
+				}
 			}
 		}
 	case "bot":

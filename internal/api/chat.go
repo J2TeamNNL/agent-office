@@ -44,6 +44,15 @@ type conversationDTO struct {
 	ContextWindow int      `json:"context_window"`
 	ExternalURL   string   `json:"external_url,omitempty"` // where it is on Discord: its thread, or its first message
 	Tags          []string `json:"tags"`
+	// written while it answered: sent together once it is free
+	Queued []queuedDTO `json:"queued"`
+}
+
+type queuedDTO struct {
+	ID          string               `json:"id"`
+	Text        string               `json:"text"`
+	Attachments []storage.Attachment `json:"attachments"`
+	CreatedAt   time.Time            `json:"created_at"`
 }
 
 func (s *server) toConvDTO(c storage.Conversation) conversationDTO {
@@ -54,6 +63,12 @@ func (s *server) toConvDTO(c storage.Conversation) conversationDTO {
 	}
 	if t, ok := s.cfg.Chat.Active(c.ID); ok {
 		d.ActiveTurn = t.ID
+	}
+	d.Queued = []queuedDTO{}
+	if list, err := s.cfg.Store.Chat().QueuedMessages(context.Background(), c.ID); err == nil {
+		for _, q := range list {
+			d.Queued = append(d.Queued, queuedDTO{q.ID, q.Text, q.Attachments, q.CreatedAt})
+		}
 	}
 	if c.Purpose == "channel" {
 		d.ExternalURL = channels.ConversationLink(context.Background(), s.cfg.Store, c.ID)
@@ -68,7 +83,7 @@ func (s *server) chatError(w http.ResponseWriter, r *http.Request, err error) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": be.Error(), "code": "budget"})
 	case errors.Is(err, chat.ErrBusy), errors.Is(err, chat.ErrAgentBusy), errors.Is(err, storage.ErrAgentOff), errors.Is(err, chat.ErrCleaned):
 		writeError(w, http.StatusConflict, err.Error())
-	case errors.Is(err, chat.ErrNoModel), errors.Is(err, chat.ErrNoAgent), errors.Is(err, chat.ErrNoFolder), errors.Is(err, chat.ErrDecided), errors.Is(err, automation.ErrUnknownSkill),
+	case errors.Is(err, chat.ErrNoAgents), errors.Is(err, chat.ErrNoAgent), errors.Is(err, chat.ErrNoFolder), errors.Is(err, chat.ErrDecided), errors.Is(err, automation.ErrUnknownSkill),
 		errors.Is(err, attach.ErrNotFound), errors.Is(err, attach.ErrTooMany):
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:
@@ -95,7 +110,11 @@ func (s *server) chatAgents(w http.ResponseWriter, r *http.Request) {
 	for _, a := range agents { // paused ones too (enabled=false): their past messages keep their avatar
 		out = append(out, toAgentDTO(a))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"agents": out})
+	def := ""
+	if p, err := s.cfg.Store.Repos().Get(r.Context(), r.PathValue("id")); err == nil {
+		def = p.DefaultAgentID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agents": out, "default_agent_id": def})
 }
 
 func (s *server) listConversations(w http.ResponseWriter, r *http.Request) {
@@ -113,7 +132,13 @@ func (s *server) listConversations(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	list, err := s.cfg.Store.Chat().ListConversationsTagged(r.Context(), r.PathValue("id"), r.URL.Query().Get("source"), tags, before, limit+1)
+	private := r.PathValue("id") == assistant.ID(r.Context(), s.cfg.Store) // assistant chats are each person's own
+	me := "human:" + userFrom(r).Email
+	filterBy := ""
+	if private {
+		filterBy = me
+	}
+	list, err := s.cfg.Store.Chat().ListConversationsTagged(r.Context(), r.PathValue("id"), r.URL.Query().Get("source"), tags, before, limit+1, filterBy)
 	if err != nil {
 		s.internal(w, r, err)
 		return
@@ -123,8 +148,6 @@ func (s *server) listConversations(w http.ResponseWriter, r *http.Request) {
 		list = list[:limit]
 	}
 	out := make([]conversationDTO, 0, len(list))
-	private := r.PathValue("id") == assistant.ID(r.Context(), s.cfg.Store) // assistant chats are each person's own
-	me := "human:" + userFrom(r).Email
 	for _, c := range list {
 		if private && c.CreatedBy != me {
 			continue
@@ -138,6 +161,7 @@ func (s *server) createConversation(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		AgentID string `json:"agent_id"`
 		Purpose string `json:"purpose"` // "automation": a chat that builds one automation (ADR-042)
+		Subject string `json:"subject"` // skill/workflow: what it writes, to find the chat again
 	}
 	if r.ContentLength != 0 && !decode(w, r, &in) {
 		return
@@ -146,8 +170,13 @@ func (s *server) createConversation(w http.ResponseWriter, r *http.Request) {
 		c   storage.Conversation
 		err error
 	)
-	if in.Purpose == "automation" || in.Purpose == "skill" || in.Purpose == "template" { // template: written with the office assistant // a chat that builds one automation, or writes one skill
+	if in.Purpose == "automation" || in.Purpose == "skill" || in.Purpose == "workflow" { // a chat that builds one automation, or writes one skill or workflow
 		c, err = s.cfg.Chat.StartConversationPurpose(r.Context(), r.PathValue("id"), in.AgentID, in.Purpose)
+		if err == nil && in.Subject != "" && in.Purpose != "automation" {
+			if err = s.cfg.Store.Chat().SetConversationSubject(r.Context(), c.ID, in.Subject); err == nil {
+				c.Subject = in.Subject
+			}
+		}
 	} else {
 		c, err = s.cfg.Chat.StartConversation(r.Context(), r.PathValue("id"), in.AgentID)
 	}
@@ -156,6 +185,55 @@ func (s *server) createConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"conversation": s.toConvDTO(c)})
+}
+
+// editorChat: the chat an editor (skill, workflow) had for what it writes
+// (?purpose=&subject=), null when none; the assistant's are each person's own.
+func (s *server) editorChat(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if p := q.Get("purpose"); (p != "skill" && p != "workflow") || q.Get("subject") == "" {
+		writeError(w, http.StatusBadRequest, "purpose (skill|workflow) và subject là bắt buộc")
+		return
+	}
+	who := ""
+	if r.PathValue("id") == assistant.ID(r.Context(), s.cfg.Store) {
+		who = "human:" + userFrom(r).Email
+	}
+	c, err := s.cfg.Store.Chat().SubjectConversation(r.Context(), r.PathValue("id"), q.Get("purpose"), q.Get("subject"), who)
+	if errors.Is(err, storage.ErrNotFound) {
+		writeJSON(w, http.StatusOK, map[string]any{"conversation": nil})
+		return
+	}
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"conversation": s.toConvDTO(c)})
+}
+
+// setSubject ties an editor's chat to what it wrote, once saved ({"subject"}).
+func (s *server) setSubject(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Subject string `json:"subject"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	c, err := s.cfg.Store.Chat().GetConversation(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.writeDomainError(w, r, err)
+		return
+	}
+	if c.Purpose != "skill" && c.Purpose != "workflow" {
+		writeError(w, http.StatusBadRequest, "chỉ chat của trình soạn skill/quy trình")
+		return
+	}
+	if err := s.cfg.Store.Chat().SetConversationSubject(r.Context(), c.ID, in.Subject); err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	c.Subject = in.Subject
+	writeJSON(w, http.StatusOK, map[string]any{"conversation": s.toConvDTO(c)})
 }
 
 func (s *server) getConversation(w http.ResponseWriter, r *http.Request) {
@@ -218,7 +296,7 @@ func (s *server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := s.cfg.Chat.DeleteConversation(r.Context(), r.PathValue("id")); err != nil {
-		s.writeDomainError(w, r, err)
+		s.chatError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -235,6 +313,25 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		Effort      *string  `json:"effort"`    // how hard it thinks from now on ("" = the agent's own; nil = keep)
 	}
 	if !decode(w, r, &in) {
+		return
+	}
+	if c, err := s.cfg.Store.Chat().GetConversation(r.Context(), r.PathValue("id")); err == nil && c.Purpose == chat.RunPurpose {
+		writeError(w, http.StatusConflict, "đây là chat riêng của một lần chạy quy trình: chỉ để xem, không nhắn vào được")
+		return
+	} else if err == nil && (c.Purpose == chat.BurnReviewPurpose || c.Purpose == chat.BurnWorkPurpose) {
+		writeError(w, http.StatusConflict, "đây là chat riêng của một việc Burn: chỉ để xem, không đổi được")
+		return
+	}
+	// answering now (or messages wait already): it waits, kept by office
+	if _, busy := s.cfg.Chat.Active(r.PathValue("id")); busy || s.cfg.Chat.HasQueued(r.Context(), r.PathValue("id")) {
+		opts := storage.QueuedOptions{AgentID: in.AgentID, Effort: in.Effort}
+		if in.Mode != "" {
+			opts.Mode = s.allowedMode(r, in.Mode)
+		}
+		if in.EditMode != "" {
+			opts.EditMode = s.allowedEditMode(r, in.EditMode)
+		}
+		s.queueMessage(w, r, in.Text, in.Context, in.Attachments, opts)
 		return
 	}
 	if in.Effort != nil {
@@ -262,6 +359,10 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	turn, msg, err := s.cfg.Chat.SendWithContext(r.Context(), r.PathValue("id"), in.Text, in.Context, in.Attachments)
+	if errors.Is(err, chat.ErrBusy) { // an answer started just now: it waits
+		s.queueMessage(w, r, in.Text, in.Context, in.Attachments, storage.QueuedOptions{})
+		return
+	}
 	var off *chat.OffError
 	if errors.As(err, &off) && msg.ID != "" { // only paused agents were called: the message and the notice, no turn
 		_ = s.cfg.Store.Chat().MarkSeen(r.Context(), userFrom(r).ID, r.PathValue("id"), true)
@@ -276,9 +377,34 @@ func (s *server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"turn_id": turn.ID, "message": plainMessageDTO(msg)})
 }
 
+// queueMessage keeps a message written while the chat answers (202, queued).
+func (s *server) queueMessage(w http.ResponseWriter, r *http.Request, text, pageContext string, attachments []string, opts storage.QueuedOptions) {
+	q, err := s.cfg.Chat.Queue(r.Context(), r.PathValue("id"), text, pageContext, attachments, opts)
+	if err != nil {
+		s.chatError(w, r, err)
+		return
+	}
+	_ = s.cfg.Store.Chat().MarkSeen(r.Context(), userFrom(r).ID, r.PathValue("id"), true)
+	writeJSON(w, http.StatusAccepted, map[string]any{"queued": queuedDTO{q.ID, q.Text, q.Attachments, q.CreatedAt}})
+}
+
+// unqueue drops a waiting message (?id=), or all of the chat's: the person
+// takes them back (Stop puts them into the box again).
+func (s *server) unqueue(w http.ResponseWriter, r *http.Request) {
+	var ids []string
+	if id := r.URL.Query().Get("id"); id != "" {
+		ids = append(ids, id)
+	}
+	if err := s.cfg.Store.Chat().DeleteQueued(r.Context(), r.PathValue("id"), ids...); err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // plainMessageDTO is a message just stored (no tools or diffs yet).
 func plainMessageDTO(m storage.Message) chat.MessageDTO {
-	return chat.MessageDTO{ID: m.ID, Role: m.Role, Content: m.Content, Attachments: m.Attachments, Author: m.Author, CreatedAt: m.CreatedAt,
+	return chat.MessageDTO{ID: m.ID, Role: m.Role, Content: m.Content, Attachments: m.Attachments, Author: m.Author, Sender: m.Sender, CreatedAt: m.CreatedAt,
 		Tools: []storage.ToolCall{}, Patches: []chat.PatchDTO{}}
 }
 

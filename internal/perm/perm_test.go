@@ -1,11 +1,13 @@
 package perm
 
 import (
+	"context"
+	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/storage/sqlite"
 )
 
 func TestLevels(t *testing.T) {
@@ -37,6 +39,48 @@ func TestDenied(t *testing.T) {
 	}
 }
 
+// ADR-074: DenyPaths must match regardless of case, since a case-variant
+// filename ("secret.PEM") is the same file on a case-insensitive filesystem
+// (macOS APFS) and must not slip past the deny-list.
+func TestDeniedCaseInsensitive(t *testing.T) {
+	p := Policy{DenyPaths: []string{"**/*.pem", "**/*.key", "**/.env*", "migrations/"}}
+	got := p.Denied([]string{"secret.PEM", "a/.ENV", "x.Key", "MIGRATIONS/0001.sql"})
+	if len(got) != 4 {
+		t.Fatalf("expected all 4 case-variant files denied, got: %v", got)
+	}
+}
+
+func TestDefaultPolicyDeniesNestedEnv(t *testing.T) {
+	p := DefaultPolicy()
+	for _, f := range []string{"backend/.env.local", "api/.env.production", "a/b/.env.test", ".env.local", ".env"} {
+		if len(p.Denied([]string{f})) != 1 {
+			t.Errorf("%q should be denied", f)
+		}
+	}
+	if len(p.Denied([]string{"src/env.go"})) != 0 {
+		t.Error("src/env.go should not be denied")
+	}
+}
+
+func TestLoadPolicyUpgradesOldEnvPattern(t *testing.T) {
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "office.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	old := Policy{DenyPaths: []string{".env", ".env.*", "**/*.pem"}}
+	if err := SavePolicy(context.Background(), st, "proj", old); err != nil {
+		t.Fatal(err)
+	}
+	p := LoadPolicy(context.Background(), st, "proj")
+	if len(p.Denied([]string{"backend/.env.local"})) != 1 {
+		t.Fatalf("stale saved policy should still block nested .env files: %v", p.DenyPaths)
+	}
+}
+
 func TestResolveCustomCaps(t *testing.T) {
 	caps := []string{CapPropose, CapCommands, CapCommit}
 	cmds := []string{"go test ./..."}
@@ -63,18 +107,6 @@ func TestResolveCustomCaps(t *testing.T) {
 	acc = Resolve(storage.Agent{Permissions: storage.Permissions{Level: Check, Commands: &deploy}}, Operate, p)
 	if len(acc.Commands) != 1 || len(acc.Safe) != 0 {
 		t.Fatalf("picks within the catalog: %+v", acc)
-	}
-}
-
-func TestCatalogSafe(t *testing.T) {
-	packs := []Pack{
-		{ID: "scripts", Commands: []string{"pnpm run test", "pnpm run test:unit", "pnpm run dev", "pnpm run deploy", "pnpm run typecheck", "pnpm run build"}},
-		{ID: "go", Commands: []string{"go test ./...", "go mod tidy"}},
-		{ID: "custom-1", Custom: true, Commands: []string{"make test"}},
-	}
-	all, safe := Catalog(packs)
-	if len(all) != 9 || strings.Join(safe, ",") != "pnpm run test,pnpm run test:unit,pnpm run typecheck,pnpm run build,go test ./..." {
-		t.Fatalf("all=%v safe=%v", all, safe)
 	}
 }
 

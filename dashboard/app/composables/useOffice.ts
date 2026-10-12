@@ -1,5 +1,4 @@
 export type ModelTier = 'strong' | 'balanced' | 'fast'
-export type AgentTier = 'lead' | 'manager' | 'worker'
 
 export interface Provider {
   id: string
@@ -11,6 +10,7 @@ export interface Provider {
   api_key_hint: string
   api_key_env: string
   tier_models: Partial<Record<ModelTier, string>>
+  limit_caps?: Partial<Record<'five_hour' | 'seven_day', number>>
   models: string[]
   is_default: boolean
   enabled: boolean
@@ -114,13 +114,11 @@ export interface Permissions {
 
 export interface Agent {
   id: string
-  org_model_id: string
+  project_id: string
   key: string
   name: string
-  tier: AgentTier
   role: string
   description: string
-  reports_to: string[]
   provider_id: string
   fallback_provider_ids?: string[] // tried next, top to bottom
   model_tier: ModelTier
@@ -136,32 +134,25 @@ export interface Agent {
 // how hard the model thinks, lowest first ('max' shows as Ultra)
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export type Effort = typeof EFFORTS[number]
+// the levels a model takes on a connection (storage.EffortsFor): Antigravity
+// names it in the model (gemini-3.8-flash-high), so only its default model picks one
+export function effortsFor(kind: string | undefined, model: string | undefined): readonly string[] {
+  if (kind === 'antigravity_cli') return model ? [] : EFFORTS.slice(0, 3)
+  return EFFORTS
+}
 export function effortLabel(e: string, t: (k: `effort.${Effort}`) => string) {
   return (EFFORTS as readonly string[]).includes(e) ? t(`effort.${e as Effort}`) : e
 }
 
-export interface Governance {
-  mode: string
-  quorum?: number
-  veto?: string[]
-  notes?: string
-}
-
-export interface OrgModel {
-  id: string
-  repo_id: string
-  source_template_id: string
+// A starter pack (ADR-099): the agents a new project begins with and the
+// workflows installed for it.
+export interface Pack {
   key: string
   name: string
   description: string
-  kind: 'solo' | 'team' | 'council' | 'custom'
-  governance: Governance
-  builtin: boolean
-  is_template: boolean
-  agent_count: number
-  tiers: Partial<Record<AgentTier, number>>
-  agents?: Agent[]
-  updated_at: string
+  default: string
+  workflows: string[]
+  agents: { key: string, name: string, role: string, model_tier: ModelTier }[]
 }
 
 export interface Project {
@@ -172,36 +163,15 @@ export interface Project {
   git_remote: string
   description: string
   exists: boolean
-  model: OrgModel | null
+  agent_count: number // 0: no agent yet (pick a starter pack)
+  default_agent_id: string // answers when nobody is named
+  agents?: Agent[]
   created_at: string
 }
 
-// Getter-backed records: `tierLabel.lead` etc. keep working at every call
-// site while re-evaluating the translation at render/access time.
-export const tierLabel: Record<AgentTier, string> = {
-  get lead() { return useLang().t('tier.lead') },
-  get manager() { return useLang().t('tier.manager') },
-  get worker() { return useLang().t('tier.worker') }
-}
+// Getter-backed records re-evaluate the translation at every access.
 export const modelTierLabel: Record<ModelTier, string> = {
   get strong() { return useLang().t('tier.model.strong') },
   get balanced() { return useLang().t('tier.model.balanced') },
   get fast() { return useLang().t('tier.model.fast') }
-}
-export const kindLabel: Record<string, string> = {
-  get solo() { return useLang().t('org.kind.solo') },
-  get team() { return useLang().t('org.kind.team') },
-  get council() { return useLang().t('org.kind.council') },
-  get custom() { return useLang().t('org.kind.custom') }
-}
-export const kindIcon: Record<string, string> = {
-  solo: 'i-lucide-user',
-  team: 'i-lucide-users',
-  council: 'i-lucide-landmark',
-  custom: 'i-lucide-shapes'
-}
-export const governanceLabel: Record<string, string> = {
-  get single() { return useLang().t('org.governance.single') },
-  get hierarchy() { return useLang().t('org.governance.hierarchy') },
-  get council() { return useLang().t('org.governance.council') }
 }

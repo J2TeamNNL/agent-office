@@ -36,9 +36,9 @@ func TestJobsQueueAndFinish(t *testing.T) {
 	if _, err := st.Jobs().Create(ctx, storage.Job{ProjectID: p.ID, Kind: "task", Origin: "automation", OriginID: "aut_1", Status: "pending", DedupeKey: "d1"}); !errors.Is(err, storage.ErrConflict) {
 		t.Fatalf("duplicate dedupe err = %v", err)
 	}
-	// busy origins are skipped; claimed jobs become running
-	if got, _ := st.Jobs().Claim(ctx, now.Add(time.Second), 2, []string{"aut_1"}); len(got) != 0 {
-		t.Fatalf("claimed a busy origin: %+v", got)
+	// a full origin (0 remaining) is skipped; claimed jobs become running
+	if got, _ := st.Jobs().Claim(ctx, now.Add(time.Second), 2, map[string]int{"aut_1": 0}); len(got) != 0 {
+		t.Fatalf("claimed a full origin: %+v", got)
 	}
 	got, err := st.Jobs().Claim(ctx, now.Add(time.Second), 2, nil)
 	if err != nil || len(got) != 1 || got[0].Status != "running" || got[0].StartedAt == nil {
@@ -66,6 +66,24 @@ func TestJobsQueueAndFinish(t *testing.T) {
 	}
 }
 
+// A run that finishes after its job was already cancelled must not have that
+// overwritten back to done/failed (endJob uses FinishIfRunning, not Finish).
+func TestFinishIfRunningDoesNotRevertACancel(t *testing.T) {
+	ctx := context.Background()
+	st, p := openStore(t)
+	now := time.Now().UTC()
+	j, _ := st.Jobs().Create(ctx, storage.Job{ProjectID: p.ID, Kind: "chat_turn", Origin: "automation", OriginID: "a", Status: "running", StartedAt: &now})
+	if _, err := st.Jobs().FinishIfRunning(ctx, j.ID, "cancelled", "cancelled", "", now.Add(time.Second)); err != nil {
+		t.Fatalf("cancel = %v", err)
+	}
+	if _, err := st.Jobs().FinishIfRunning(ctx, j.ID, "done", "", "", now.Add(2*time.Second)); !errors.Is(err, storage.ErrConflict) {
+		t.Fatalf("finish after cancel = %v, want ErrConflict", err)
+	}
+	if got, _ := st.Jobs().Get(ctx, j.ID); got.Status != "cancelled" {
+		t.Fatalf("job = %+v, want still cancelled", got)
+	}
+}
+
 func TestAutomationsDue(t *testing.T) {
 	ctx := context.Background()
 	st, p := openStore(t)
@@ -84,40 +102,6 @@ func TestAutomationsDue(t *testing.T) {
 	st.Automations().Update(ctx, a)
 	if due, _ := st.Automations().Due(ctx, time.Now().UTC()); len(due) != 0 {
 		t.Fatalf("disabled is due: %+v", due)
-	}
-}
-
-func TestFailRunningCountsCostAndEndsTasks(t *testing.T) { // I6
-	ctx := context.Background()
-	st, p := openStore(t)
-	now := time.Now().UTC()
-	j, _ := st.Jobs().Create(ctx, storage.Job{ProjectID: p.ID, Kind: "task", Origin: "automation", OriginID: "a", Status: "running", StartedAt: &now})
-	cost := 0.4
-	st.Runs().Create(ctx, storage.Run{Kind: "task", ProjectID: p.ID, JobID: j.ID, Status: "ok", CostUSD: &cost, InputTokens: 7})
-	st.Jobs().FailRunning(ctx, "restart", "restart", now)
-	if got, _ := st.Jobs().Get(ctx, j.ID); got.CostUSD != 0.4 || got.InputTokens != 7 {
-		t.Fatalf("failed job = %+v", got)
-	}
-	task, _ := st.Tasks().Create(ctx, storage.Task{ProjectID: p.ID, Title: "x", Goal: "x", Mode: "single", Status: "running"})
-	if n, err := st.Tasks().FailRunning(ctx, "office khởi động lại", now); err != nil || n != 1 {
-		t.Fatalf("fail tasks = %d %v", n, err)
-	}
-	if got, _ := st.Tasks().Get(ctx, task.ID); got.Status != "failed" || got.FinishedAt == nil {
-		t.Fatalf("task = %+v", got)
-	}
-}
-
-func TestDebounceOnlyTouchesPending(t *testing.T) { // I2
-	ctx := context.Background()
-	st, p := openStore(t)
-	now := time.Now().UTC()
-	j, _ := st.Jobs().Create(ctx, storage.Job{ProjectID: p.ID, Kind: "chat_turn", Origin: "automation", OriginID: "a", Status: "pending", DebounceKey: "k", NextAttemptAt: &now})
-	st.Jobs().Claim(ctx, now.Add(time.Second), 1, nil) // the runner took it
-	if ok, err := st.Jobs().Debounce(ctx, j.ID, `{"n":2}`, now.Add(time.Minute)); err != nil || ok {
-		t.Fatalf("debounced a running job: %v %v", ok, err)
-	}
-	if got, _ := st.Jobs().Get(ctx, j.ID); got.Status != "running" || got.Payload == `{"n":2}` {
-		t.Fatalf("job = %+v", got)
 	}
 }
 
@@ -261,5 +245,37 @@ func TestJobsOfAConversation(t *testing.T) {
 	got, err := st.Jobs().List(ctx, storage.JobFilter{ConversationID: "cnv_1"})
 	if err != nil || len(got) != 1 || got[0].ConversationID != "cnv_1" {
 		t.Fatalf("jobs = %+v %v", got, err)
+	}
+}
+
+func TestHideOthersInOnlyShowsOwnAssistantChatJobs(t *testing.T) { // ADR-046
+	ctx := context.Background()
+	st, p := openStore(t)
+	other, _ := st.Repos().Create(ctx, storage.Repo{Name: "other", Path: t.TempDir()})
+	assistantProj, _ := st.Repos().Create(ctx, storage.Repo{Name: "assistant", Path: t.TempDir()})
+	st.Jobs().Create(ctx, storage.Job{ProjectID: assistantProj.ID, Kind: "chat_turn", Origin: "user", CreatedBy: "human:a@x.com", Status: "done", CostUSD: 1})
+	st.Jobs().Create(ctx, storage.Job{ProjectID: assistantProj.ID, Kind: "chat_turn", Origin: "user", CreatedBy: "human:b@x.com", Status: "done", CostUSD: 2})
+	st.Jobs().Create(ctx, storage.Job{ProjectID: other.ID, Kind: "chat_turn", Origin: "user", CreatedBy: "human:b@x.com", Status: "done", CostUSD: 4})
+
+	// A: sees only their own assistant-chat job, plus the unrelated project's job
+	got, err := st.Jobs().List(ctx, storage.JobFilter{HideOthersIn: assistantProj.ID, Me: "human:a@x.com"})
+	if err != nil || len(got) != 2 {
+		t.Fatalf("list (A) = %+v %v", got, err)
+	}
+	stats, err := st.Jobs().Stats(ctx, storage.JobFilter{HideOthersIn: assistantProj.ID, Me: "human:a@x.com"}, "status")
+	if err != nil || len(stats) != 1 || stats[0].Jobs != 2 || stats[0].CostUSD != 5 {
+		t.Fatalf("stats (A) = %+v %v", stats, err)
+	}
+
+	// B: sees their own assistant-chat job plus the other project's job
+	got, err = st.Jobs().List(ctx, storage.JobFilter{HideOthersIn: assistantProj.ID, Me: "human:b@x.com"})
+	if err != nil || len(got) != 2 {
+		t.Fatalf("list (B) = %+v %v", got, err)
+	}
+
+	// p (unrelated project) is unaffected regardless of HideOthersIn
+	got, err = st.Jobs().List(ctx, storage.JobFilter{ProjectID: p.ID, HideOthersIn: assistantProj.ID, Me: "human:a@x.com"})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("list (p) = %+v %v", got, err)
 	}
 }

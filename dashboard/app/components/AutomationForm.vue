@@ -12,7 +12,7 @@ const { t, dateLocale } = useLang()
 // eslint-disable-next-line vue/no-mutating-props -- the draft is the parent's reactive object, edited in place
 const form = props.form
 
-const { data: agentsData } = useLiveFetch<{ agents: Agent[] }>(() => `/api/projects/${props.projectId}/chat/agents`, { lazy: true })
+const { data: agentsData } = useLiveFetch<{ agents: Agent[], default_agent_id: string }>(() => `/api/projects/${props.projectId}/chat/agents`, { lazy: true })
 // a bot's messages start it (ADR-049): bots are set up on their own page,
 // each of its commands being one automation edited here in "command" mode
 const fromChannel = computed(() => isChannelSource(form.source))
@@ -35,7 +35,7 @@ const { data: projBots } = useLiveFetch<{ channels: Channel[] }>(() => `/api/pro
 const LEAD = '__lead'
 const chatAgent = computed({ get: () => form.agent_id || LEAD, set: (v: string) => { form.agent_id = v === LEAD ? '' : v } })
 // who answers in a chat: one agent ("" = the lead)
-const replyAgentOptions = computed(() => [{ label: t('channels.agentLead'), value: LEAD }, ...(agentsData.value?.agents ?? []).map(a => ({ label: a.name, value: a.id }))])
+const replyAgentOptions = computed(() => [{ label: t('team.defaultAgent'), value: LEAD }, ...(agentsData.value?.agents ?? []).map(a => ({ label: a.name, value: a.id }))])
 // tags each run's chat gets; the project's chat tags to pick again
 const tags = computed({ get: () => form.config.tags ?? [], set: (v: string[]) => { form.config.tags = v } })
 const { data: tagsData } = useLiveFetch<{ tags: { tag: string }[] }>(() => `/api/projects/${props.projectId}/chat-tags`, { lazy: true })
@@ -68,7 +68,7 @@ const schedKind = computed({
 const presetActive = (p: { every: number, cron: string }) => (form.config.every_minutes ?? 0) === p.every && (form.config.cron ?? '') === p.cron
 // every IANA zone the browser/Node knows, searchable
 const timezones = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf?.('timeZone') ?? ['UTC', 'Asia/Ho_Chi_Minh']
-const tz = computed({ get: () => form.config.timezone || 'Asia/Ho_Chi_Minh', set: (v: string) => { form.config.timezone = v } })
+const tz = computed({ get: () => form.config.timezone || 'UTC', set: (v: string) => { form.config.timezone = v } })
 // the saved zone stays pickable even if this runtime spells it differently
 const tzItems = computed(() => timezones.includes(tz.value) ? timezones : [tz.value, ...timezones])
 // an agent answers (a bot's chat) or is sent the message (a schedule, a webhook), or a script runs
@@ -76,8 +76,19 @@ const actions = computed(() => [
   fromChannel.value
     ? { value: 'chat' as const, icon: 'i-lucide-message-circle-reply', title: t('auto.cardReply'), desc: t('auto.cardReplyDesc') }
     : { value: 'chat' as const, icon: 'i-lucide-send', title: t('auto.cardAgent'), desc: t('auto.cardAgentDesc') },
-  { value: 'script' as const, icon: 'i-lucide-square-terminal', title: t('auto.cardScript'), desc: fromChannel.value ? t('auto.cardScriptChannelDesc') : t('auto.cardScriptDesc') }
+  { value: 'script' as const, icon: 'i-lucide-square-terminal', title: t('auto.cardScript'), desc: fromChannel.value ? t('auto.cardScriptChannelDesc') : t('auto.cardScriptDesc') },
+  // a bot's command runs a workflow by its skill instead
+  ...(fromChannel.value ? [] : [{ value: 'workflow' as const, icon: 'i-lucide-workflow', title: t('auto.cardWorkflow'), desc: t('auto.cardWorkflowDesc') }])
 ])
+// the project's workflows a chat may run (ADR-109)
+const { data: wfData } = useLiveFetch<{ workflows: ProjectWorkflow[] }>(() => `/api/projects/${props.projectId}/workflows`, { lazy: true })
+const workflowItems = computed(() => (wfData.value?.workflows ?? []).filter(w => w.enabled && !w.error && w.callable !== 'sub')
+  .map(w => ({ label: `#${w.key} · ${w.name}`, value: w.key })))
+const workflowKey = computed({ get: () => form.config.workflow ?? '', set: (v: string) => { form.config.workflow = v } })
+// run until a goal is reached (ADR-132): a check command and/or a judge, at most N turns
+const goalOn = ref(!!form.config.goal)
+const goal = reactive({ text: '', check: '', judge: false, max_rounds: 5, ...form.config.goal })
+watch([goalOn, goal], () => { form.config.goal = goalOn.value ? { ...goal } : null }, { deep: true })
 
 // when a schedule stops on its own, as a Burn: the weekly limit's reset, after
 // some hours, at a time, or never (turned off by hand)
@@ -122,18 +133,15 @@ const placeholders = computed(() => fromChannel.value
   : form.config.pull_request
     ? ['{{diff}}', '{{payload.number}}', '{{payload.title}}', '{{payload.author}}', '{{payload.url}}', '{{payload.source}}', '{{payload.target}}']
     : ['{{payload}}', '{{payload.x}}', '{{now}}', '{{today}}', '{{yesterday}}', '{{source}}', '{{automation}}'])
-// the project's bots, for where answers go
-const { data: chData } = useLiveFetch<{ channels: Channel[] }>(() => `/api/projects/${props.projectId}/channels`, { lazy: true, immediate: isAdmin.value })
-const NO_BOT = '__none'
-const notifyBot = computed({ get: () => form.config.notify_channel_id || NO_BOT, set: (v: string) => { form.config.notify_channel_id = v === NO_BOT ? '' : v } })
-const notifyItems = computed(() => [{ label: t('auto.notifyNone'), value: NO_BOT }, ...(chData.value?.channels ?? []).map(c => ({ label: `${c.bot_name ? '@' + c.bot_name : c.name} · ${c.kind === 'discord' ? 'Discord' : 'Telegram'}`, value: c.id }))])
-const notifyKind = computed(() => chData.value?.channels.find(c => c.id === form.config.notify_channel_id)?.kind)
+// the bot answers go out by: the project's, or one borrowed (NotifyBotPicker)
+const notifyKind = ref<string>()
 // ADR-074: permission mode — "agent" follows the picked agent's own
 // permissions, "override" (admin only) replaces them for this automation.
 const effectiveAgent = computed(() => {
   const agents = agentsData.value?.agents ?? []
   if (form.agent_id) return agents.find(a => a.id === form.agent_id)
-  return agents.find(a => a.tier === 'lead') ?? agents[0]
+  // none picked: the project's default agent answers
+  return agents.find(a => a.id === agentsData.value?.default_agent_id) ?? agents[0]
 })
 const effectiveFullAccess = computed(() => form.permission_mode === 'override' ? !!form.override_full_access : !!effectiveAgent.value?.permissions.full_access)
 
@@ -296,9 +304,14 @@ async function testRun() {
         <UFormField :label="t('auto.scriptBody')" :help="t('auto.scriptHelp')" :class="hl('script')">
           <UTextarea v-model="form.script.body" :rows="12" autoresize class="w-full font-mono text-xs" placeholder="grep -c ERROR logs/app.log || true" />
         </UFormField>
+        <label class="flex items-center gap-2.5">
+          <USwitch size="sm" :model-value="form.script.burn_start ?? false" @update:model-value="(v: boolean) => { form.script.burn_start = v }" />
+          <span class="text-sm">{{ t('auto.burnStart') }}</span>
+          <UTooltip :text="t('auto.burnStartHint')"><UIcon name="i-lucide-info" class="size-4 text-(--ui-text-muted)" /></UTooltip>
+        </label>
         <div class="space-y-2 rounded-lg bg-(--ui-bg-elevated)/50 p-3">
           <div class="flex flex-wrap items-center gap-2">
-            <UInput v-model="testPayload" size="sm" class="min-w-0 flex-1 font-mono" :placeholder="t('auto.testPayload')" />
+            <UInput v-model="testPayload" size="sm" class="min-w-0 flex-1 basis-40 font-mono" :placeholder="t('auto.testPayload')" />
             <UButton v-if="isAdmin" size="sm" icon="i-lucide-play" :label="t('auto.testRun')" :loading="testing" :disabled="!form.script.body.trim()" @click="testRun" />
           </div>
           <template v-if="tested">
@@ -309,11 +322,14 @@ async function testRun() {
           </template>
         </div>
       </template>
-      <div v-else-if="form.action === 'chat'" class="space-y-2">
+      <div v-else class="space-y-2">
         <div class="flex flex-wrap items-end gap-3">
-          <UFormField :label="t('channels.agent')"><USelect v-model="chatAgent" :items="replyAgentOptions" class="min-w-56" /></UFormField>
+          <UFormField v-if="form.action === 'workflow'" :label="t('auto.workflow')" required :class="hl('config')">
+            <USelect v-model="workflowKey" :items="workflowItems" :placeholder="workflowItems.length ? t('auto.workflowPick') : t('auto.workflowNone')" class="min-w-64" />
+          </UFormField>
+          <UFormField :label="form.action === 'workflow' ? t('auto.workflowCoord') : t('channels.agent')"><USelect v-model="chatAgent" :items="replyAgentOptions" class="min-w-56" /></UFormField>
         </div>
-        <p class="text-xs text-(--ui-text-muted)">{{ t('auto.replyNoTools') }}</p>
+        <p v-if="form.action === 'chat'" class="text-xs text-(--ui-text-muted)">{{ t('auto.replyNoTools') }}</p>
         <UFormField :label="t('auto.tags')" :class="hl('config')">
           <template #hint>
             <UTooltip :text="t('auto.tagsHint')"><UIcon name="i-lucide-info" class="size-4 text-(--ui-text-muted)" /></UTooltip>
@@ -326,13 +342,37 @@ async function testRun() {
     <!-- 3. content -->
     <section v-if="form.action !== 'script'" class="space-y-3" :class="[box, hl('prompt')]">
       <p class="flex items-center gap-2 text-sm font-semibold">
-        <span v-if="!command" class="flex size-5 items-center justify-center rounded-full bg-primary/15 text-xs text-primary">3</span>{{ t('auto.stepPrompt') }}
+        <span v-if="!command" class="flex size-5 items-center justify-center rounded-full bg-primary/15 text-xs text-primary">3</span>{{ form.action === 'workflow' ? t('auto.stepWorkflowInput') : t('auto.stepPrompt') }}
       </p>
-      <UTextarea ref="promptEl" v-model="form.prompt" :rows="5" autoresize class="w-full" :placeholder="fromChannel ? t('auto.promptChannelPlaceholder') : t('auto.promptPlaceholder')" />
+      <UTextarea ref="promptEl" v-model="form.prompt" :rows="5" autoresize class="w-full" :placeholder="form.action === 'workflow' ? t('auto.workflowInputPlaceholder') : fromChannel ? t('auto.promptChannelPlaceholder') : t('auto.promptPlaceholder')" />
       <div class="flex flex-wrap items-center gap-1 text-xs text-(--ui-text-muted)">
         {{ t('auto.insert') }}
         <button v-for="p in placeholders" :key="p" type="button" class="rounded bg-(--ui-bg-elevated) px-1.5 py-0.5 font-mono hover:text-(--ui-text)" @click="insert(p)">{{ p }}</button>
       </div>
+      <!-- run until a goal is reached (ADR-132) -->
+      <template v-if="!fromChannel">
+        <label class="flex items-center gap-2.5">
+          <USwitch v-model="goalOn" size="sm" />
+          <span class="text-sm">{{ t('auto.goal') }}</span>
+          <UTooltip :text="t('auto.goalHint')"><UIcon name="i-lucide-info" class="size-4 text-(--ui-text-muted)" /></UTooltip>
+        </label>
+        <div v-if="goalOn" class="grid gap-3 @lg:grid-cols-[1fr_auto]">
+          <UFormField :label="t('auto.goalCheck')" :hint="t('auto.goalCheckHint')">
+            <UInput v-model="goal.check" class="w-full font-mono text-xs" placeholder="pnpm test" />
+          </UFormField>
+          <UFormField :label="t('auto.goalRounds')">
+            <UInputNumber v-model="goal.max_rounds" :min="1" :max="20" class="w-28" />
+          </UFormField>
+          <label class="flex items-center gap-2.5 @lg:col-span-2">
+            <USwitch v-model="goal.judge" size="sm" />
+            <span class="text-sm">{{ t('auto.goalJudge') }}</span>
+            <UTooltip :text="t('auto.goalJudgeHint')"><UIcon name="i-lucide-info" class="size-4 text-(--ui-text-muted)" /></UTooltip>
+          </label>
+          <UFormField v-if="goal.judge" :label="t('auto.goalText')" required class="@lg:col-span-2">
+            <UInput v-model="goal.text" class="w-full" :placeholder="t('auto.goalTextPlaceholder')" />
+          </UFormField>
+        </div>
+      </template>
     </section>
 
     <!-- where a run's answer goes besides office (a bot's chat) -->
@@ -340,7 +380,7 @@ async function testRun() {
       <p class="flex items-center gap-2 text-sm font-semibold"><UIcon name="i-lucide-send" class="size-4" />{{ t('auto.notifyTitle') }}</p>
       <div class="grid gap-3 @lg:grid-cols-2">
         <UFormField :label="t('auto.notifyBot')">
-          <USelect v-model="notifyBot" :items="notifyItems" class="w-full" />
+          <NotifyBotPicker v-model="form.config.notify_channel_id" v-model:kind="notifyKind" :project-id="projectId" :none-label="t('auto.notifyNone')" />
         </UFormField>
         <UFormField v-if="form.config.notify_channel_id" :label="notifyKind === 'telegram' ? t('alert.chatTelegram') : t('alert.chatDiscord')">
           <template #hint>
@@ -352,7 +392,7 @@ async function testRun() {
     </section>
 
     <!-- permission (ADR-074) -->
-    <section v-if="form.action === 'chat'" class="space-y-3" :class="box">
+    <section v-if="form.action !== 'script'" class="space-y-3" :class="box">
       <p class="flex items-center gap-2 text-sm font-semibold"><UIcon name="i-lucide-shield" class="size-4" />{{ t('auto.permTitle') }}</p>
       <div v-if="isAdmin" class="flex flex-wrap gap-2">
         <button

@@ -10,9 +10,13 @@ import watchScreen from './parts/watch.vi'
 import files from './parts/files.vi'
 import chatTags from './parts/tags.vi'
 import dataPage from './parts/data.vi'
+import team from './parts/team.vi'
+import workflows from './parts/workflows.vi'
 
 const vi = {
   ...dataPage,
+  ...team,
+  ...workflows,
   ...watchScreen,
   ...files,
   ...chatTags,
@@ -35,8 +39,6 @@ const vi = {
   'nav.addProject': 'Thêm project',
   'nav.providers': 'Kết nối AI',
   'nav.costs': 'Chi phí',
-  'nav.templates': 'Mô hình',
-  'nav.library': 'Thư viện',
   'nav.admin': 'Quản trị',
   'nav.users': 'Tài khoản',
   'nav.audit': 'Audit log',
@@ -77,6 +79,7 @@ const vi = {
   'account.newHint': 'Tối thiểu 10 ký tự',
   'account.confirm': 'Nhập lại mật khẩu mới',
   'account.mismatch': 'Hai lần nhập mật khẩu mới không khớp',
+'account.tooShort': 'Mật khẩu mới phải có ít nhất 10 ký tự',
   'account.saved': 'Đã đổi mật khẩu',
   'account.savedDesc': 'Các phiên đăng nhập khác đã bị đăng xuất.',
   'common.save': 'Lưu',
@@ -84,6 +87,7 @@ const vi = {
   'common.delete': 'Xóa',
   'common.edit': 'Sửa',
   'common.close': 'Đóng',
+  'common.leaveUnsaved': 'Có thay đổi chưa lưu. Rời đi và bỏ các thay đổi này?',
   'common.add': 'Thêm',
   'common.create': 'Tạo',
   'common.search': 'Tìm kiếm',
@@ -111,10 +115,6 @@ const vi = {
   'log.empty': 'Chưa có log.',
   'log.toBottom': '↓ Xuống dòng mới nhất',
   'soon.badge': 'Sẽ có ở {milestone}',
-  'noModel.title': 'Project chưa có mô hình tổ chức',
-  'noModel.desc': 'Cần mô hình để chat và giao việc. Để AI đề xuất, hoặc tự chọn Solo, Team, Tam quyền.',
-  'noModel.setupAi': 'Thiết lập bằng AI',
-  'noModel.choose': 'Tự chọn mô hình',
 } as const
 
 export type MessageKey = keyof typeof vi

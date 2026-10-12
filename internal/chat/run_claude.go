@@ -3,10 +3,12 @@ package chat
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"slices"
@@ -30,7 +32,7 @@ var claudeReadTools = []string{"Read", "Glob", "Grep"}
 
 // userMCPSettings: a PreToolUse hook that allows the tools of any MCP server
 // (the person's own Claude Code setup), for agents with perm.CapUserMCP.
-const userMCPSettings = `{"hooks":{"PreToolUse":[{"matcher":"mcp__.*","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"permissionDecisionReason\":\"agent-office: MCP của người dùng\"}}'"}]}]}}`
+const userMCPSettings = `{"hooks":{"PreToolUse":[{"matcher":"mcp__.*","hooks":[{"type":"command","command":"printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"permissionDecisionReason\":\"agent-office: an MCP of the person\"}}'"}]}]}}`
 
 // withEffort asks Claude Code to think this hard (--effort: low … max).
 func withEffort(a []string, effort string) []string {
@@ -69,6 +71,16 @@ func (claudeRunner) args(req RunRequest, resume bool) []string {
 		}
 		if resume && req.SessionID != "" {
 			a = append(a, "--resume", req.SessionID)
+		}
+		// nothing wakes the agent after its turn: no monitors, wakeups or
+		// background runs (they would be killed when the CLI exits)
+		disallow := headlessDisallowed
+		if req.NoSubagents {
+			disallow += " Agent Task"
+		}
+		a = append(a, "--disallowedTools", disallow)
+		if ForegroundCommand != "" {
+			a = append(a, "--settings", foregroundSettings())
 		}
 		return a
 	}
@@ -116,7 +128,7 @@ func (claudeRunner) args(req RunRequest, resume bool) []string {
 		if req.Office != nil {
 			gw = req.Office.Gateway
 		}
-		a = append(a, "--settings", guardSettings(req.UserMCP, gw))
+		a = append(a, "--settings", guardSettings(req.UserMCP, gw, req.QuickCheck, req.QuickChecks))
 	} else if req.UserMCP {
 		// dontAsk denies tools it was not told about, and the user's MCP
 		// servers are not known up front: a hook allows every mcp__ tool
@@ -211,8 +223,9 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 		resErr   error
 		gotFinal bool
 	)
-	pending := map[string]int{} // tool_use id → index in res.Tools
-	mainModel := ""             // the model of the last call (its context window is the one shown)
+	pending := map[string]int{}      // tool_use id → index in res.Tools
+	subagents := map[string]string{} // a Task call's id → the subagent's label, for the steps it takes
+	mainModel := ""                  // the model of the last call (its context window is the one shown)
 	sc := bufio.NewScanner(out)
 	sc.Buffer(make([]byte, 1<<20), 16<<20)
 	for sc.Scan() {
@@ -220,7 +233,9 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 			Type      string `json:"type"`
 			Subtype   string `json:"subtype"`
 			SessionID string `json:"session_id"`
-			Event     struct {
+			// set on what a subagent of Claude's own (Task) does: the Task call it runs under
+			ParentToolUseID string `json:"parent_tool_use_id"`
+			Event           struct {
 				Type  string `json:"type"`
 				Delta struct {
 					Type string `json:"type"`
@@ -291,6 +306,12 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 			for _, c := range ev.Message.Content {
 				if c.Type == "tool_use" {
 					tc := storage.ToolCall{Name: c.Name, Summary: toolSummary(c.Name, c.Input)}
+					if label, ok := subagents[ev.ParentToolUseID]; ok { // a step of a subagent: shown under it
+						tc.Summary = "↳ " + label + ": " + tc.Summary
+					}
+					if l := subagentLabel(c.Name, c.Input); l != "" {
+						subagents[c.ID] = l
+					}
 					pending[c.ID] = len(res.Tools)
 					res.Tools = append(res.Tools, tc)
 					emit(Event{Type: "tool", Tool: &tc})
@@ -339,6 +360,15 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 			}
 		}
 	}
+	if serr := sc.Err(); serr != nil && resErr == nil {
+		// the scan stopped on a read/buffer error (e.g. a JSON line over the
+		// 16MB cap), not a clean EOF: without this, a result that never
+		// arrived reads as a silent success instead of a failure
+		resErr = fmt.Errorf("claude: đọc output lỗi: %w", serr)
+	}
+	// the CLI may still be writing (e.g. the rest of the oversized line): drain
+	// it so that write doesn't block forever and deadlock cmd.Wait() below
+	io.Copy(io.Discard, out)
 	werr := cmd.Wait()
 	res.Usage.DurationMS = time.Since(start).Milliseconds()
 	// A signed-out CLI fails before any API call: say what to do instead of
@@ -423,15 +453,19 @@ func toolSummary(name string, input json.RawMessage) string {
 		return "Đọc " + str("file_path", "path")
 	case "glob":
 		return "Tìm file " + str("pattern")
-	case "grep", "search", "search_text":
+	case "grep", "search", "search_text", "grep_search":
 		return "Tìm \"" + str("pattern") + "\""
-	case "list_dir", "ls":
+	case "list_dir", "ls", "list_directory":
 		p := str("path")
 		if p == "" {
 			p = "."
 		}
 		return "Xem thư mục " + p
-	case "bash", "command_execution":
+	case "write_file", "replace":
+		return "Sửa " + str("file_path")
+	case "task", "agent": // a subagent of Claude's own; its steps are shown under it
+		return "Giao subagent " + str("subagent_type") + ": " + str("description")
+	case "bash", "command_execution", "run_shell_command":
 		return "Chạy " + str("command")
 	}
 	return name
@@ -443,18 +477,18 @@ func transcript(history []HistoryItem, prompt string) string {
 		return prompt
 	}
 	var b strings.Builder
-	b.WriteString("Cuộc trò chuyện trước đó:\n")
+	b.WriteString("The conversation so far:\n")
 	for _, h := range history {
-		who := "Người dùng"
+		who := "The person"
 		if h.Role == "assistant" {
-			who = "Bạn"
+			who = "You"
 			if h.Author != "" { // an agent that answered before a switch
 				who = h.Author
 			}
 		}
 		fmt.Fprintf(&b, "\n[%s]\n%s\n", who, truncate(h.Content, 6000))
 	}
-	b.WriteString("\n---\nTin nhắn mới của người dùng:\n")
+	b.WriteString("\n---\nThe person's new message:\n")
 	b.WriteString(prompt)
 	return b.String()
 }
@@ -570,4 +604,18 @@ func windowOf(model string, seen int) int {
 		return seen
 	}
 	return 200_000
+}
+
+// subagentLabel names a subagent Claude Code starts on its own (the Task /
+// Agent tool): its type and what it was asked ("" = not such a call).
+func subagentLabel(name string, input json.RawMessage) string {
+	if name != "Task" && name != "Agent" {
+		return ""
+	}
+	var in struct {
+		Description string `json:"description"`
+		Type        string `json:"subagent_type"`
+	}
+	_ = json.Unmarshal(input, &in)
+	return truncate(strings.TrimSpace(cmp.Or(in.Type, "subagent")+" · "+in.Description), 60)
 }
