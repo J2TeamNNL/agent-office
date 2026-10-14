@@ -147,7 +147,7 @@ func (s *Service) finish(ctx context.Context, b storage.BurnSession, it storage.
 			return false
 		}
 	} else {
-		it.Status, it.Summary = s.failedOrAgain(it, reviewLabel["result"]+": chưa đạt. "+oneLine(note, 400))
+		it.Status, it.Summary = reviewAgain(it, reviewLabel["result"]+": chưa đạt. "+oneLine(note, 400))
 		if err := s.store.Burn().UpdateItemFrom(ctx, it, from); err != nil {
 			return false
 		}
@@ -245,7 +245,11 @@ func (s *Service) review(ctx context.Context, b storage.BurnSession, it *storage
 		return false, "", err
 	}
 	items, _ := s.store.Burn().Items(ctx, b.ID)
-	text := reviewPrompt(b, *it, stage, items...)
+	diff := ""
+	if stage == "result" {
+		diff = reviewDiff(ctx, it.Worktree)
+	}
+	text := reviewPrompt(b, *it, stage, diff, items...)
 	if r.Workflow != "" {
 		text = workflow.Call(r.Workflow, text)
 	}
@@ -300,25 +304,71 @@ func (s *Service) ensureReviewConversation(ctx context.Context, b storage.BurnSe
 	return conv.ID, nil
 }
 
+// reviewDiffMax bounds the diff put in a result review's prompt: past it the
+// reviewers get the list of files and read the rest themselves.
+const reviewDiffMax = 40000
+
+// reviewDiff is what a piece changed in its worktree since it started, for
+// its result review: given in the prompt, the reviewers (three of them in a
+// workflow) need not each go looking for it, reading a growing session at
+// every step. "" when there is none or git fails (they read it themselves).
+func reviewDiff(ctx context.Context, dir string) string {
+	if dir == "" {
+		return ""
+	}
+	base, err := gitIn(ctx, dir, "", "rev-parse", "--verify", "-q", baseRef)
+	if err != nil {
+		base = "HEAD" // started before ADR-123
+	}
+	if _, err := gitIn(ctx, dir, "", "add", "-A"); err != nil { // new files too, as finish takes them
+		return ""
+	}
+	stat, err := gitIn(ctx, dir, "", "diff", "--cached", "--stat", "--no-renames", base)
+	if err != nil || stat == "" {
+		return ""
+	}
+	diff, err := gitIn(ctx, dir, "", "diff", "--cached", "--no-renames", base)
+	if err != nil {
+		return stat
+	}
+	if len(diff) > reviewDiffMax {
+		return stat + "\n\n(the full diff is too long to give here: read the files above in the worktree)"
+	}
+	return stat + "\n\n" + diff
+}
+
 // reviewPrompt asks a stage's reviewer about a piece (burn/review.md);
-// items are the Burn's, for the run's other pieces on the same files.
-func reviewPrompt(b storage.BurnSession, it storage.BurnItem, stage string, items ...storage.BurnItem) string {
+// diff is what the piece changed (the result stage); items are the Burn's,
+// for the run's other pieces on the same files.
+func reviewPrompt(b storage.BurnSession, it storage.BurnItem, stage, diff string, items ...storage.BurnItem) string {
 	d := struct {
 		Stage, ID, Kind, Title, Detail, Focus, ReviewNote string
 		Summary, Worktree, Agree, Disagree, RunBranch     string
+		Diff                                              string
+		Round, Rounds                                     int
 		FocusChecks, Related                              []string
-	}{Stage: stage, ID: it.ID, Kind: it.Kind, Title: it.Title, Detail: it.Detail, Focus: b.Focus,
-		// a workflow runs in chats of its own, not in the piece's worktree: where it is
-		Worktree: it.Worktree, Agree: verdictAgree, Disagree: verdictDisagree,
+	}{Round: it.Attempts, Rounds: maxReviewRounds, Stage: stage, ID: it.ID, Kind: it.Kind, Title: it.Title, Detail: it.Detail, Focus: b.Focus,
+		Worktree: it.Worktree, Agree: verdictAgree, Disagree: verdictDisagree, Diff: diff,
 		RunBranch: b.RunBranch, Related: related(b, it, items)}
 	if stage == "result" {
 		d.FocusChecks = checks(b)
-		if it.ReviewNote != "" {
-			d.ReviewNote = oneLine(it.ReviewNote, 600)
+		if it.ReviewNote != "" { // whole: the next round is judged against what it asked
+			d.ReviewNote = clip(strings.TrimSpace(it.ReviewNote), reviewNoteMax)
 		}
 		d.Summary = oneLine(it.Summary, 800)
 	}
 	return prompts.Render("burn/review", d)
+}
+
+// reviewNoteMax bounds the earlier review's notes handed to the next one.
+const reviewNoteMax = 6000
+
+// clip cuts s to n runes, keeping its lines.
+func clip(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n-1]) + "…"
+	}
+	return s
 }
 
 // The first line of a reviewer's answer (verdictOf reads it).

@@ -28,15 +28,16 @@ const emit = defineEmits<{ askAgent: [text: string, files: Attachment[], send?: 
 const toast = useToast()
 const { isAdmin } = useAuth()
 const { t } = useLang()
-type Section = 'processes' | 'containers' | 'monitors'
+type Section = 'processes' | 'containers' | 'env' | 'monitors'
 // counts for the switch; monitors are cheap to list (no checks run)
 const { data: monData, refresh: refreshMon } = await useLiveFetch<{ summary: Record<string, number>, monitors: unknown[] }>('/api/monitors', { query: { project: props.projectId } })
 const navItems = computed(() => [
   { value: 'processes', label: t('ops.nav.processes'), icon: 'i-lucide-square-terminal', count: procs.value.length, alert: procs.value.some(p => p.state.status === 'crashed') },
   { value: 'containers', label: t('ops.nav.containers'), icon: 'i-lucide-container' },
+  ...(isAdmin.value ? [{ value: 'env', label: t('ops.nav.env'), icon: 'i-lucide-file-key' }] : []),
   { value: 'monitors', label: t('ops.nav.monitors'), icon: 'i-lucide-heart-pulse', count: monData.value?.monitors.length ?? 0, alert: !!monData.value?.summary.down }
 ])
-const section = ref<Section>((['processes', 'containers', 'monitors'] as const).find(v => v === useRoute().query.section) ?? 'processes')
+const section = ref<Section>((['processes', 'containers', 'env', 'monitors'] as const).find(v => v === useRoute().query.section) ?? 'processes')
 
 const { data, refresh } = await useLiveFetch<{ processes: Proc[] }>(() => `/api/projects/${props.projectId}/processes`)
 const procs = computed(() => data.value?.processes ?? [])
@@ -94,6 +95,14 @@ async function act(p: Proc, action: 'start' | 'stop' | 'restart') {
     toast.add({ title: apiError(e), color: 'error' })
   } finally {
     busy.value = null
+  }
+}
+async function toggleAutostart(p: Proc) {
+  try {
+    await $fetch(`/api/processes/${p.id}`, { method: 'PATCH', body: { autostart: !p.autostart } })
+    await refresh()
+  } catch (e) {
+    toast.add({ title: apiError(e), color: 'error' })
   }
 }
 async function remove(p: Proc) {
@@ -308,6 +317,9 @@ const mem = (b: number) => b >= 1 << 30 ? `${(b / (1 << 30)).toFixed(1)} GB` : `
         <ComposePanel v-else-if="section === 'containers'" :project-id="projectId" @ask-agent="(t, f, send) => emit('askAgent', t, f, send)">
           <template #nav><SegmentedNav v-model="section" :items="navItems" /></template>
         </ComposePanel>
+        <EnvPanel v-else-if="section === 'env' && isAdmin" :project-id="projectId">
+          <template #nav><SegmentedNav v-model="section" :items="navItems" /></template>
+        </EnvPanel>
       </KeepAlive>
       <template v-if="section === 'processes'">
       <div class="flex flex-wrap items-center gap-2">
@@ -372,7 +384,7 @@ const mem = (b: number) => b >= 1 << 30 ? `${(b / (1 << 30)).toFixed(1)} GB` : `
               />
               <UDropdownMenu
                 v-if="isAdmin"
-                :items="[[{ label: t('ops.menu.askAgent'), icon: 'i-lucide-bot', onSelect: () => askAgent(p) }, { label: t('ops.menu.edit'), icon: 'i-lucide-pencil', onSelect: () => openForm(p) }], [{ label: t('ops.menu.delete'), icon: 'i-lucide-trash-2', color: 'error', onSelect: () => remove(p) }]]"
+                :items="[[{ label: t('ops.menu.askAgent'), icon: 'i-lucide-bot', onSelect: () => askAgent(p) }, { label: t('ops.menu.edit'), icon: 'i-lucide-pencil', onSelect: () => openForm(p) }, { label: p.autostart ? t('ops.menu.autostartOff') : t('ops.menu.autostartOn'), icon: p.autostart ? 'i-lucide-power-off' : 'i-lucide-power', onSelect: () => toggleAutostart(p) }], [{ label: t('ops.menu.delete'), icon: 'i-lucide-trash-2', color: 'error', onSelect: () => remove(p) }]]"
                 :content="{ align: 'end' }"
               >
                 <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-ellipsis" :aria-label="t('ops.actionsLabel')" :loading="busy === p.id + 'delete'" :disabled="busy === p.id + 'delete'" :class="p.state.status === 'crashed' ? '' : 'ms-auto'" />

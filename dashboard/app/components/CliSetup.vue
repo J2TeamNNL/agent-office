@@ -1,6 +1,8 @@
 <script setup lang="ts">
 // Installs and signs in a local AI CLI (Claude Code, Codex, Gemini CLI, Antigravity CLI) through the office
-// server, which runs on the same machine. Emits `ready` once usable.
+// server, which runs on the same machine. Emits `ready` once usable. Once
+// signed in it shows the account with Sign in again / Sign out: a session the
+// server revoked can still read signed in to the CLI.
 interface Method { id: string, label: string, command: string, requires: string, available: boolean, recommended: boolean }
 interface JobView {
   id: string
@@ -18,6 +20,7 @@ interface ToolStatus {
   bin: string
   docs_url: string
   login_command: string
+  logout_command: string
   installed: boolean
   version?: string
   auth: { logged_in: boolean, account?: string, detail?: string }
@@ -32,6 +35,7 @@ const { t } = useLang()
 
 const status = ref<ToolStatus | null>(null)
 const disabled = ref(false) // server started with --cli-setup=false
+const loadError = ref('')
 const method = ref('')
 const job = ref<JobView | null>(null)
 const code = ref('')
@@ -43,6 +47,7 @@ watch(ready, v => emit('ready', v), { immediate: true })
 watch(disabled, (v) => { if (v) emit('ready', true) })
 
 async function load() {
+  loadError.value = ''
   try {
     status.value = await $fetch<ToolStatus>(`/api/cli-tools/${props.tool}`)
     const methods = status.value.methods
@@ -50,6 +55,7 @@ async function load() {
     if (status.value.job?.state === 'running') follow(status.value.job)
   } catch (e) {
     if ((e as { statusCode?: number }).statusCode === 404) disabled.value = true
+    else loadError.value = apiError(e)
   }
 }
 
@@ -88,6 +94,26 @@ async function start(action: 'install' | 'login') {
   }
 }
 
+async function logout(): Promise<boolean> {
+  try {
+    status.value = await $fetch<ToolStatus>(`/api/cli-tools/${props.tool}/logout`, { method: 'POST', body: {} })
+    return true
+  } catch (e) {
+    toast.add({ title: apiError(e), color: 'error' })
+    return false
+  }
+}
+
+async function confirmLogout() {
+  if (status.value && confirm(t('cli.confirmLogout', { name: status.value.name, cmd: status.value.logout_command }))) await logout()
+}
+
+// relogin signs out first: Gemini's sign-in goes straight to its chat while
+// credentials exist, and a revoked Codex session is better gone
+async function relogin() {
+  if (await logout()) await start('login')
+}
+
 async function sendCode() {
   if (!job.value) return
   try {
@@ -118,7 +144,27 @@ onBeforeUnmount(() => clearTimeout(timer))
 </script>
 
 <template>
-  <div v-if="status && !disabled && (!ready || running)" class="space-y-3 rounded-lg border border-(--ui-border) p-3">
+  <!-- the status runs the CLI (version, sign-in): it can take seconds -->
+  <div v-if="!status && !disabled" class="flex items-center gap-2 text-sm text-(--ui-text-muted)">
+    <template v-if="loadError">
+      <UIcon name="i-lucide-circle-alert" class="size-4 shrink-0 text-(--ui-error)" />
+      <span class="min-w-0 flex-1">{{ loadError }}</span>
+      <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-refresh-cw" :label="t('cli.retry')" @click="load" />
+    </template>
+    <template v-else>
+      <UIcon name="i-lucide-loader-circle" class="size-4 animate-spin" />
+      {{ t('cli.checking', { tool: props.tool }) }}
+    </template>
+  </div>
+  <div v-else-if="status && !disabled && ready && !running" class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+    <UIcon name="i-lucide-circle-check" class="size-4 shrink-0 text-(--ui-success)" />
+    <span class="min-w-0 flex-1 basis-40 truncate">
+      {{ t('cli.loggedIn', { name: status.name }) }}<span v-if="status.auth.account" class="text-(--ui-text-muted)"> · {{ status.auth.account }}</span>
+    </span>
+    <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-refresh-cw" :label="t('cli.relogin')" @click="relogin" />
+    <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-log-out" :label="t('cli.logout')" @click="confirmLogout" />
+  </div>
+  <div v-else-if="status && !disabled && (!ready || running)" class="space-y-3 rounded-lg border border-(--ui-border) p-3">
     <!-- install -->
     <template v-if="!status.installed">
       <div class="flex items-center gap-2 text-sm">
@@ -146,6 +192,7 @@ onBeforeUnmount(() => clearTimeout(timer))
         <UIcon name="i-lucide-log-in" class="size-4 text-(--ui-warning)" />
         <span><b>{{ status.name }}</b> {{ t('cli.notLoggedInSuffix') }}</span>
       </div>
+      <p v-if="status.auth.detail && !running" class="text-xs text-(--ui-text-muted)">{{ status.auth.detail }}</p>
       <UButton v-if="!running" icon="i-lucide-log-in" :label="t('cli.loginBtn', { name: status.name })" size="sm" @click="start('login')" />
       <template v-if="running && job?.action === 'login'">
         <div v-if="job.urls.length || job.codes.length" class="flex flex-wrap items-center gap-2">

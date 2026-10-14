@@ -9,10 +9,11 @@
     "postinstall": "nuxt prepare",
     "typecheck": "nuxt typecheck",
     "check:i18n": "node scripts/check-i18n.mjs",
-    "test:unit": "node --experimental-strip-types --no-warnings scripts/test-merge-draft.ts && node --experimental-strip-types --no-warnings scripts/test-audit-diff.ts && node --experimental-strip-types --no-warnings scripts/test-skill-md.ts"
+    "test:unit": "node --experimental-strip-types --no-warnings scripts/test-merge-draft.ts && node --experimental-strip-types --no-warnings scripts/test-audit-diff.ts && node --experimental-strip-types --no-warnings scripts/test-skill-md.ts && node --experimental-strip-types --no-warnings scripts/test-dotenv.ts && node --experimental-strip-types --no-warnings scripts/test-configfile.ts"
   },
   "dependencies": {
     "@iconify-json/lucide": "^1.2.0",
+    "@iconify-json/simple-icons": "^1.2.100",
     "@nuxt/ui": "^4.11.2",
     "@vue-flow/background": "^1.3.2",
     "@vue-flow/controls": "^1.1.3",
