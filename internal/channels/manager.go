@@ -39,6 +39,9 @@ type Manager struct {
 	engine  *chat.Engine
 	runner  Runner
 	factory Factory
+	// stopEngine: a test fakes stopping (stop.go) without touching engine,
+	// which every other method here still uses as the real *chat.Engine.
+	stopEngine stopEngine
 
 	mu       sync.Mutex
 	running  map[string]context.CancelFunc
@@ -73,6 +76,7 @@ type waiter struct {
 	// as the CLI does; lines are the ones of the status message shown now
 	verbose bool
 	lines   []string
+	sending bool // a status Send is in flight (status is still ""); settle must leave it to step
 	stopped bool // /stop or /push ended it: nothing more goes to the chat
 }
 

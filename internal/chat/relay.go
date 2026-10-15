@@ -1,12 +1,17 @@
 package chat
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/tung1998/agent-office/internal/actor"
+	"github.com/tung1998/agent-office/internal/perm"
+	"github.com/tung1998/agent-office/internal/prompts"
 	"github.com/tung1998/agent-office/internal/storage"
 )
 
@@ -22,44 +27,116 @@ type relayInfo struct {
 	ConversationID string `json:"relayed_from"`
 	Title          string `json:"relayed_from_title,omitempty"`
 	Agent          string `json:"relayed_by_agent,omitempty"`
+	Project        string `json:"relayed_from_project,omitempty"` // another project's chat: its name
+	// Hops: relays so far in a chain between linked projects (hand-off,
+	// report back, answer…): past maxRelayHops nothing goes on its own
+	Hops      int    `json:"relay_hops,omitempty"`
+	Report    bool   `json:"relay_report,omitempty"`            // the linked chat's agent reporting back
+	ProjectID string `json:"relayed_from_project_id,omitempty"` // its project's id (a link to its chat)
+}
+
+// Report marks a message that is a linked project's agent reporting back
+// (reportBack): the chat shows who and where, its text folded.
+type Report struct {
+	Project        string `json:"project"`
+	Agent          string `json:"agent"`
+	ProjectID      string `json:"project_id"`
+	ConversationID string `json:"conversation_id"`
+}
+
+// ReportOf is m's report back, or nil when it is not one.
+func ReportOf(m storage.Message) *Report {
+	var info relayInfo
+	if m.Role != "user" || m.Context == "" || json.Unmarshal([]byte(m.Context), &info) != nil || !info.Report {
+		return nil
+	}
+	return &Report{Project: info.Project, Agent: info.Agent, ProjectID: info.ProjectID, ConversationID: info.ConversationID}
+}
+
+// maxRelayHops caps a chain between linked projects' chats, like a group
+// chat's hand-offs with a person around (maxHopsPerson).
+const maxRelayHops = maxHopsPerson
+
+// relayOrigin is the relayed message a chat's current work answers: the last
+// message a person sent, past office's own "[office] … decided" ones; who is
+// the person it speaks for.
+func relayOrigin(msgs []storage.Message) (info relayInfo, who string, ok bool) {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if m.Role != "user" || strings.HasPrefix(m.Content, "[office] ") {
+			continue
+		}
+		if json.Unmarshal([]byte(m.Context), &info) != nil || info.ConversationID == "" {
+			return relayInfo{}, m.Author, false
+		}
+		return info, m.Author, true
+	}
+	return relayInfo{}, "", false
 }
 
 // Relay sends an approved send_message action: a.Args.Message to the chat
 // a.TargetID, as the person whose message started the run (a.JobID). Only a
 // person's run can speak for them, and only in chats they may open.
-func (e *Engine) Relay(ctx context.Context, a storage.Action) (string, error) {
+// It returns what happened and the chat it went to (a new one's id).
+func (e *Engine) Relay(ctx context.Context, a storage.Action) (string, string, error) {
 	job, err := e.store.Jobs().Get(ctx, a.JobID)
 	if err != nil {
-		return "", errors.New("không rõ lượt chat gửi tin này")
+		return "", "", errors.New("không rõ lượt chat gửi tin này")
 	}
 	as := job.CreatedBy
 	if !strings.HasPrefix(as, "human:") {
-		return "", errors.New("chỉ gửi thay được khi lượt chat do một người gửi (không phải bot hay tự động hóa)")
+		return "", "", errors.New("chỉ gửi thay được khi lượt chat do một người gửi (không phải bot hay tự động hóa)")
 	}
-	target, err := e.store.Chat().GetConversation(ctx, a.TargetID)
-	if err != nil {
-		return "", errors.New("không tìm thấy cuộc chat đích")
+	var target storage.Conversation
+	if a.TargetID == "" && a.Args.Project != "" { // a new chat in a linked project, opened by the person
+		if e.isAssistant(ctx, a.Args.Project) {
+			return "", "", errors.New("không mở chat ở trợ lý office được")
+		}
+		c, err := e.StartConversationFor(actor.With(ctx, as), a.Args.Project, "")
+		if err != nil {
+			return "", "", err
+		}
+		if target, err = e.store.Chat().CreateConversation(ctx, c); err != nil {
+			return "", "", err
+		}
+	} else if target, err = e.store.Chat().GetConversation(ctx, a.TargetID); err != nil {
+		return "", "", errors.New("không tìm thấy cuộc chat đích")
+	}
+	if target.ProjectID != a.ProjectID && target.ProjectID != a.Args.Project {
+		return "", "", errors.New("cuộc chat đích không thuộc project này hay project liên kết")
 	}
 	if target.ID == a.ConversationID {
-		return "", errors.New("đây là chính cuộc chat đang nói, không cần gửi sang")
+		return "", "", errors.New("đây là chính cuộc chat đang nói, không cần gửi sang")
 	}
 	if e.isAssistant(ctx, target.ProjectID) && target.CreatedBy != as {
-		return "", errors.New("cuộc chat trợ lý office của người khác: không gửi được")
+		return "", "", errors.New("cuộc chat trợ lý office của người khác: không gửi được")
 	}
 	from := relayInfo{ConversationID: a.ConversationID, Agent: a.ProposedBy}
+	if target.ProjectID != a.ProjectID { // a chain between linked projects: counted
+		from.Hops = 1
+		if msgs, err := e.store.Chat().ListMessages(ctx, a.ConversationID); err == nil {
+			if o, _, ok := relayOrigin(msgs); ok {
+				from.Hops = o.Hops + 1
+			}
+		}
+		if p, err := e.store.Repos().Get(ctx, a.ProjectID); err == nil {
+			from.Project = p.Name
+		}
+	}
 	if c, err := e.store.Chat().GetConversation(ctx, a.ConversationID); err == nil {
 		from.Title = c.Title
 	}
 	raw, _ := json.Marshal(from)
 	_, msg, err := e.SendWithContext(actor.With(context.Background(), as), target.ID, a.Args.Message, string(raw), nil)
+	link := "/projects/" + target.ProjectID + "?tab=chat&c=" + target.ID
 	var off *OffError
 	if errors.As(err, &off) && msg.ID != "" {
-		return "đã gửi (agent của chat đó đang tạm nghỉ, chưa trả lời)", nil
+		return "đã gửi (agent của chat đó đang tạm nghỉ, chưa trả lời): " + link, target.ID, nil
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return "đã gửi vào \"" + target.Title + "\"", nil
+	return "đã gửi vào \"" + cmp.Or(target.Title, "chat mới") + "\": " + link, target.ID, nil
 }
 
 // Relayed: the last message a person sent in the chat was relayed from
@@ -75,4 +152,174 @@ func (e *Engine) Relayed(ctx context.Context, conversationID string) bool {
 		}
 	}
 	return false
+}
+
+// RelayLimit: the chat's work comes from a chain between linked projects
+// that reached maxRelayHops — sending on waits for a person.
+func (e *Engine) RelayLimit(ctx context.Context, conversationID string) bool {
+	msgs, err := e.store.Chat().ListMessages(ctx, conversationID)
+	if err != nil {
+		return true
+	}
+	o, _, ok := relayOrigin(msgs)
+	return ok && o.Hops >= maxRelayHops
+}
+
+// reportBack: an agent answered in a chat a linked project's agent opened or
+// sent to (send_to_chat): its answer goes back to that chat in the person's
+// name, and the agent there goes on from it (answers what it can, asks the
+// person the rest). Only up to maxRelayHops in a chain.
+func (e *Engine) reportBack(conv storage.Conversation, project storage.Repo, agent storage.Agent, reply string) {
+	if strings.TrimSpace(reply) == "" {
+		return
+	}
+	ctx := context.Background()
+	msgs, err := e.store.Chat().ListMessages(ctx, conv.ID)
+	if err != nil {
+		return
+	}
+	origin, as, ok := relayOrigin(msgs)
+	// only a linked project's hand-off: never a report itself (the agent that
+	// asked answers on with send_to_chat when it has to)
+	if !ok || origin.Project == "" || origin.Report || !strings.HasPrefix(as, "human:") {
+		return
+	}
+	src, err := e.store.Chat().GetConversation(ctx, origin.ConversationID)
+	if err != nil || src.Cleaned != "" {
+		return
+	}
+	if origin.Hops >= maxRelayHops {
+		e.note(conv, fmt.Sprintf("Không tự báo lại chat %q nữa: đã quá %d lượt qua lại giữa hai project. Hãy xem và trả lời trực tiếp.", cmp.Or(src.Title, src.ID), maxRelayHops))
+		return
+	}
+	info := relayInfo{ConversationID: conv.ID, Title: conv.Title, Agent: agent.Name, Project: project.Name, ProjectID: project.ID, Hops: origin.Hops + 1, Report: true}
+	raw, _ := json.Marshal(info)
+	text := prompts.Render("chat/linked-report", map[string]any{"Project": project.Name, "Agent": agent.Name,
+		"Link": "/projects/" + conv.ProjectID + "?tab=chat&c=" + conv.ID, "Reply": truncate(reply, 8000)})
+	safeGo("report back", func() {
+		for try := 0; try < 120; try++ { // the chat answering now: after its answer (up to 10 minutes)
+			_, _, err := e.SendWithContext(actor.With(ctx, as), src.ID, text, string(raw), nil)
+			var off *OffError
+			if errors.As(err, &off) || (!errors.Is(err, ErrBusy) && !errors.Is(err, ErrAgentBusy)) {
+				if err != nil && !errors.As(err, &off) {
+					e.note(conv, "Không báo lại được chat gốc: "+err.Error())
+				}
+				return
+			}
+			time.Sleep(e.reportWait())
+		}
+	})
+}
+
+func (e *Engine) reportWait() time.Duration {
+	if e.reportEvery > 0 {
+		return e.reportEvery
+	}
+	return 5 * time.Second
+}
+
+// linkedBrief tells an agent the projects its own links to (send_to_chat
+// with project opens a chat there).
+func (e *Engine) linkedBrief(ctx context.Context, projectID, conversationID string) string {
+	type item struct{ Name, Description string }
+	var items []item
+	for _, id := range perm.LoadPolicy(ctx, e.store, projectID).LinkedProjects {
+		if p, err := e.store.Repos().Get(ctx, id); err == nil && !e.isAssistant(ctx, p.ID) {
+			items = append(items, item{p.Name, truncate(oneLine(p.Description), 200)})
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	type open struct{ Project, Title, Link string }
+	var chats []open // the work already handed over from this chat: carried on there
+	for _, c := range e.linkedChats(ctx, conversationID) {
+		chats = append(chats, open{c.project, cmp.Or(c.conv.Title, "(chưa có tiêu đề)"), "/projects/" + c.conv.ProjectID + "?tab=chat&c=" + c.conv.ID}) // i18n-ignore
+	}
+	return "\n" + prompts.Render("chat/linked", map[string]any{"Projects": items, "Chats": chats}) + "\n"
+}
+
+type linkedChat struct {
+	conv    storage.Conversation
+	project string
+}
+
+// linkedChats are the chats of other projects this chat handed work to: the
+// ones send_to_chat went to, and those that reported back here (a chat
+// opened before its target was kept on the action is found that way).
+func (e *Engine) linkedChats(ctx context.Context, conversationID string) []linkedChat {
+	var ids []string
+	if sent, err := e.store.Actions().List(ctx, conversationID, "", ""); err == nil {
+		for _, a := range sent {
+			if a.Kind == "send_message" && a.Status == "done" && a.Args.Project != "" && a.TargetID != "" {
+				ids = append(ids, a.TargetID)
+			}
+		}
+	}
+	if msgs, err := e.store.Chat().ListMessages(ctx, conversationID); err == nil {
+		for _, m := range msgs {
+			var info relayInfo
+			if m.Role == "user" && json.Unmarshal([]byte(m.Context), &info) == nil && info.Report && info.Project != "" {
+				ids = append(ids, info.ConversationID)
+			}
+		}
+	}
+	var out []linkedChat
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		c, err := e.store.Chat().GetConversation(ctx, id)
+		if err != nil || c.Cleaned != "" {
+			continue
+		}
+		lc := linkedChat{conv: c}
+		if p, err := e.store.Repos().Get(ctx, c.ProjectID); err == nil {
+			lc.project = p.Name
+		}
+		out = append(out, lc)
+	}
+	return out
+}
+
+// LinkedPending is what waits for a person in a linked project's chat this
+// chat handed work to (send_to_chat): shown here, so the person approves it
+// without opening that chat.
+type LinkedPending struct {
+	ProjectID      string      `json:"project_id"`
+	Project        string      `json:"project"`
+	ConversationID string      `json:"conversation_id"`
+	Title          string      `json:"title"`
+	Actions        []ActionDTO `json:"actions"`
+	Patches        []PatchDTO  `json:"patches"`
+}
+
+// LinkedPending lists, per linked chat this chat sent to, its pending
+// proposals and diffs (only chats with some).
+func (e *Engine) LinkedPending(ctx context.Context, conversationID string) []LinkedPending {
+	out := []LinkedPending{}
+	for _, lc := range e.linkedChats(ctx, conversationID) {
+		c := lc.conv
+		lp := LinkedPending{ProjectID: c.ProjectID, Project: lc.project, ConversationID: c.ID, Title: c.Title, Actions: []ActionDTO{}, Patches: []PatchDTO{}}
+		if acts, err := e.store.Actions().List(ctx, c.ID, "", ""); err == nil {
+			for _, x := range acts {
+				if x.Status == "pending" {
+					lp.Actions = append(lp.Actions, ToActionDTO(x))
+				}
+			}
+		}
+		if patches, err := e.store.Chat().ListPatches(ctx, c.ID); err == nil {
+			for _, p := range patches {
+				if p.Status == "pending" {
+					lp.Patches = append(lp.Patches, toPatchDTO(p))
+				}
+			}
+		}
+		if len(lp.Actions)+len(lp.Patches) > 0 {
+			out = append(out, lp)
+		}
+	}
+	return out
 }

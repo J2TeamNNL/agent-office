@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tung1998/agent-office/internal/mcpserver"
 	"github.com/tung1998/agent-office/internal/proctrack"
@@ -204,7 +205,7 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = req.WorkDir
-	cmd.Stdin = strings.NewReader(prompt)
+	cmd.Stdin = strings.NewReader(strings.ToValidUTF8(prompt, "�")) // a stray cut byte must not make the CLI refuse the whole turn
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.StdoutPipe()
@@ -508,6 +509,11 @@ func firstNonEmpty(a, b string) string {
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// Back up to a rune boundary: a cut mid-rune leaves invalid UTF-8
+	// (Vietnamese text), which some CLIs refuse to read.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "…"
 }

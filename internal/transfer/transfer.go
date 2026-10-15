@@ -228,6 +228,12 @@ func (s *Service) Import(ctx context.Context, b Bundle, dryRun bool) (Result, er
 		in := provider.Input{Name: ps.Name, Kind: storage.ProviderKind(ps.Kind), Preset: &ps.Preset, BaseURL: ps.BaseURL, APIKeyEnv: ps.APIKeyEnv,
 			TierModels: ps.TierModels, Enabled: &ps.Enabled}
 		existing, ok := byName[ps.Name]
+		if ok && ps.APIKeyEnv == "" && existing.APIKeyEnv != "" {
+			// the bundle never carries a working env-var key it doesn't know about
+			// (e.g. built on another machine, or from a provider using a stored
+			// secret there): don't let it blank out the existing one.
+			in.APIKeyEnv = existing.APIKeyEnv
+		}
 		if !ok {
 			needsKey := in.Kind == storage.ProviderAnthropic || in.Kind == storage.ProviderOpenAI
 			if needsKey && ps.APIKeyEnv == "" {
@@ -252,7 +258,7 @@ func (s *Service) Import(ctx context.Context, b Bundle, dryRun bool) (Result, er
 			}
 			continue
 		}
-		same := existing.Kind == in.Kind && existing.BaseURL == ps.BaseURL && existing.APIKeyEnv == ps.APIKeyEnv &&
+		same := existing.Kind == in.Kind && existing.BaseURL == ps.BaseURL && existing.APIKeyEnv == in.APIKeyEnv &&
 			existing.Enabled == ps.Enabled && reflect.DeepEqual(nonNil(existing.TierModels), nonNil(ps.TierModels)) &&
 			(!ps.IsDefault || existing.IsDefault)
 		if same {
@@ -408,7 +414,19 @@ func (s *Service) workflowsDiffer(ctx context.Context, projectID string, in []Pr
 }
 
 // putWorkflows installs or updates the project's workflows of the bundle.
+// It resolves every workflow (parse, roles, current record) before writing
+// any of them, so a resolve failure partway through the bundle leaves the
+// project's existing workflows untouched instead of half-applying the import.
+// Entries sharing a Key (same bundle listing a key twice) are collapsed into
+// one plan slot, last one wins — matching the pre-fix behavior where the
+// second pass's GetByKey would already see the first pass's write.
 func (s *Service) putWorkflows(ctx context.Context, projectID string, in []ProjectWorkflow) error {
+	type pending struct {
+		next     storage.Workflow
+		existing bool
+	}
+	plan := make([]pending, 0, len(in))
+	byKey := map[string]int{}
 	for _, w := range in {
 		def, err := workflow.Parse(w.Source)
 		if err != nil {
@@ -423,18 +441,32 @@ func (s *Service) putWorkflows(ctx context.Context, projectID string, in []Proje
 		if w.From != "" {
 			next.SourceKey, next.SourceHash = w.From, workflow.Hash(w.Source)
 		}
+		if idx, ok := byKey[def.Key]; ok {
+			next.ID, next.CreatedAt = plan[idx].next.ID, plan[idx].next.CreatedAt
+			plan[idx] = pending{next: next, existing: plan[idx].existing}
+			continue
+		}
 		cur, err := s.store.Workflows().GetByKey(ctx, projectID, def.Key)
 		if errors.Is(err, storage.ErrNotFound) {
-			if _, err := s.store.Workflows().Create(ctx, next); err != nil {
-				return err
-			}
+			byKey[def.Key] = len(plan)
+			plan = append(plan, pending{next: next})
 			continue
 		}
 		if err != nil {
 			return err
 		}
 		next.ID, next.CreatedAt = cur.ID, cur.CreatedAt
-		if err := s.store.Workflows().Update(ctx, next); err != nil {
+		byKey[def.Key] = len(plan)
+		plan = append(plan, pending{next: next, existing: true})
+	}
+	for _, p := range plan {
+		if p.existing {
+			if err := s.store.Workflows().Update(ctx, p.next); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := s.store.Workflows().Create(ctx, p.next); err != nil {
 			return err
 		}
 	}

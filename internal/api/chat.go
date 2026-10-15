@@ -264,7 +264,7 @@ func (s *server) getConversation(w http.ResponseWriter, r *http.Request) {
 		msgs, more = msgs[start:end], start > 0
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"conversation": s.toConvDTO(c), "messages": msgs, "has_more": more, "members": s.chatMembers(r, c.ID),
-		"running": s.cfg.Chat.Running(c.ID)})
+		"running": s.cfg.Chat.Running(c.ID), "linked_pending": s.cfg.Chat.LinkedPending(r.Context(), c.ID)})
 }
 
 // chatMembers: the agents in a chat (ADR-044), with their rights and context.
@@ -405,7 +405,7 @@ func (s *server) unqueue(w http.ResponseWriter, r *http.Request) {
 // plainMessageDTO is a message just stored (no tools or diffs yet).
 func plainMessageDTO(m storage.Message) chat.MessageDTO {
 	return chat.MessageDTO{ID: m.ID, Role: m.Role, Content: m.Content, Attachments: m.Attachments, Author: m.Author, Sender: m.Sender, CreatedAt: m.CreatedAt,
-		Tools: []storage.ToolCall{}, Patches: []chat.PatchDTO{}}
+		Tools: []storage.ToolCall{}, Patches: []chat.PatchDTO{}, Report: chat.ReportOf(m)}
 }
 
 // streamTurn sends a turn's events as Server-Sent Events, replaying from

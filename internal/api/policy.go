@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"github.com/tung1998/agent-office/internal/audit"
 	"net/http"
@@ -60,9 +61,9 @@ func (s *server) putPolicy(w http.ResponseWriter, r *http.Request) {
 		perm.Policy
 		Version string `json:"version"` // the policy as it was read (409 when changed since)
 	}
-	// a body without quick_check (an older client) keeps what is set
-	cur := perm.LoadPolicy(r.Context(), s.cfg.Store, r.PathValue("id"))
-	body.QuickCheck, body.QuickChecks = cur.QuickCheck, cur.QuickChecks
+	// a body without quick_check/linked_projects (an older client) keeps what is set
+	old, raw := perm.LoadPolicyRaw(r.Context(), s.cfg.Store, r.PathValue("id"))
+	body.QuickCheck, body.QuickChecks, body.LinkedProjects = old.QuickCheck, old.QuickChecks, old.LinkedProjects
 	if !decode(w, r, &body) {
 		return
 	}
@@ -77,7 +78,7 @@ func (s *server) putPolicy(w http.ResponseWriter, r *http.Request) {
 		s.writeDomainError(w, r, err)
 		return
 	}
-	if conflicted(w, body.Version, policyVersion(perm.LoadPolicy(r.Context(), s.cfg.Store, projectID))) {
+	if conflicted(w, body.Version, policyVersion(old)) {
 		return
 	}
 	in.MaxLevel = perm.Operate // no project cap: the chat/task mode is the limit
@@ -101,6 +102,18 @@ func (s *server) putPolicy(w http.ResponseWriter, r *http.Request) {
 		links = append(links, l)
 	}
 	in.WorktreeLinks = links
+	linked := []string{}
+	for _, id := range clean(in.LinkedProjects) {
+		if id == projectID || slices.Contains(linked, id) {
+			continue
+		}
+		if _, err := s.cfg.Store.Repos().Get(r.Context(), id); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("không có project %q để liên kết", id))
+			return
+		}
+		linked = append(linked, id)
+	}
+	in.LinkedProjects = linked
 	patterns := func(list []string) ([]string, error) {
 		out := []string{}
 		for _, x := range list {
@@ -137,8 +150,11 @@ func (s *server) putPolicy(w http.ResponseWriter, r *http.Request) {
 		packs = append(packs, p)
 	}
 	in.Packs = packs
-	old := perm.LoadPolicy(r.Context(), s.cfg.Store, projectID)
-	if err := perm.SavePolicy(r.Context(), s.cfg.Store, projectID, in); err != nil {
+	if err := perm.SavePolicyIf(r.Context(), s.cfg.Store, projectID, raw, in); err != nil {
+		if errors.Is(err, storage.ErrConflict) {
+			writeSaveConflict(w) // a write landed between this Get and Update
+			return
+		}
 		s.internal(w, r, err)
 		return
 	}

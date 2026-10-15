@@ -26,6 +26,7 @@ import (
 	"github.com/tung1998/agent-office/internal/worktree"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -72,6 +73,7 @@ type MessageDTO struct {
 	Patches     []PatchDTO           `json:"patches"`
 	Actions     []ActionDTO          `json:"actions"`
 	CostUSD     *float64             `json:"cost_usd,omitempty"`
+	Report      *Report              `json:"report,omitempty"` // a linked project's report back: shown folded
 }
 
 // PatchDTO is a proposed change.
@@ -204,23 +206,30 @@ func (t *Turn) Cancel() { t.cancel() }
 
 // Engine runs conversations.
 type Engine struct {
-	store     storage.Store
-	providers *provider.Service
-	usage     *usage.Service
-	files     attach.Store
-	onRunning func(conversationID string)                // an answer started or ended there (the dashboard's live data)
-	onRunWait func(ctx context.Context, callerID string) // a workflow's turn ended: what it waits on a person for goes to the chat that called it (a bot's)
-	decided   decisions                                  // proposals a person decided on the dashboard: the agent goes on (ADR-084)
-	deciding  sync.Map                                   // patches being decided now: one decision applies a patch
-	onLimits  func(p storage.Provider, l Limits)
-	office    *officetools.Toolbox
-	mcp       *mcpserver.Server
-	mcpURL    string
-	gateway   GatewayFor // the gateway's MCP servers a run gets (ADR-091, ADR-093)
-	trees     *worktree.Manager
-	assistant func(ctx context.Context) string
-	wf        wfState         // workflows running in chats
-	acts      actionsProposer // the workflows' gates propose through it
+	reportEvery time.Duration // how often a report back retries a busy chat (0 = 5s; tests)
+	store       storage.Store
+	providers   *provider.Service
+	usage       *usage.Service
+	files       attach.Store
+	onRunning   func(conversationID string)                // an answer started or ended there (the dashboard's live data)
+	onRunWait   func(ctx context.Context, callerID string) // a workflow's turn ended: what it waits on a person for goes to the chat that called it (a bot's)
+	decided     decisions                                  // proposals a person decided on the dashboard: the agent goes on (ADR-084)
+	deciding    sync.Map                                   // patches being decided now: one decision applies a patch
+	onLimits    func(p storage.Provider, l Limits)
+	office      *officetools.Toolbox
+	mcp         *mcpserver.Server
+	mcpURL      string
+	gateway     GatewayFor // the gateway's MCP servers a run gets (ADR-091, ADR-093)
+	trees       *worktree.Manager
+	assistant   func(ctx context.Context) string
+	wf          wfState         // workflows running in chats
+	acts        actionsProposer // the workflows' gates propose through it
+
+	// testStepPanic: a step id runSteps' per-step goroutine panics on
+	// instead of running, for a regression test to force that path
+	// deterministically (ADR: step panics must not hang runSteps forever).
+	// "" in production, never set outside tests.
+	testStepPanic string
 
 	mu     sync.Mutex
 	active map[string]*Turn        // conversation id → running turn (the one the person waits for)
@@ -401,7 +410,7 @@ func (e *Engine) SetOnRunning(fn func(conversationID string)) { e.onRunning = fn
 
 func (e *Engine) running(conversationID string) {
 	if e.onRunning != nil {
-		go e.onRunning(conversationID)
+		safeGo("onRunning", func() { e.onRunning(conversationID) })
 	}
 }
 
@@ -803,7 +812,7 @@ func (e *Engine) SendWithContext(ctx context.Context, conversationID, text, page
 			return nil, storage.Message{}, err
 		}
 	}
-	go e.run(runCtx, turn, conv, project, agent, history, prompt, files)
+	safeGo("run", func() { e.run(runCtx, turn, conv, project, agent, history, prompt, files) })
 	return turn, msg, nil
 }
 
@@ -892,7 +901,7 @@ func (e *Engine) offReply(ctx context.Context, conv storage.Conversation, text, 
 
 func (e *Engine) finish(t *Turn) {
 	if caller := e.rootCaller(t.ConversationID); caller != "" && e.onRunWait != nil {
-		go e.onRunWait(context.Background(), caller)
+		safeGo("onRunWait", func() { e.onRunWait(context.Background(), caller) })
 	}
 	e.mu.Lock()
 	freed := e.active[t.ConversationID] == t // the next agent's turn may already hold the chat
@@ -906,7 +915,7 @@ func (e *Engine) finish(t *Turn) {
 	e.mu.Unlock()
 	e.running(t.ConversationID)
 	if freed {
-		go e.SendQueued(t.ConversationID) // what the person wrote meanwhile goes now
+		safeGo("SendQueued", func() { e.SendQueued(t.ConversationID) }) // what the person wrote meanwhile goes now
 	}
 	// keep the turn for late subscribers, then forget it
 	time.AfterFunc(10*time.Minute, func() {
@@ -931,6 +940,16 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 		dto := MessageDTO{ID: m.ID, Role: "error", Content: m.Content, CreatedAt: m.CreatedAt, Tools: []storage.ToolCall{}, Attachments: []storage.Attachment{}, Patches: []PatchDTO{}}
 		turn.emit(Event{Type: "error", Text: err.Error(), Message: &dto, NextTurnID: e.nextTurn(ctx, turn, conv, project, agent, "")})
 	}
+	defer func() {
+		// a panic anywhere below (choices/policy/tools/LLM response parsing)
+		// must still close the job and tell the chat, not just vanish:
+		// turn.cancel/e.finish (deferred above, so run after this) only free
+		// the chat slot, they don't end the job or post an error message.
+		if r := recover(); r != nil {
+			slog.Error("chat: run panic", "where", "run", "panic", r, "stack", string(debug.Stack()))
+			fail(fmt.Errorf("internal error: %v", r))
+		}
+	}()
 
 	cands, err := e.choices(ctx, withTier(ctx, agent))
 	if err != nil {
@@ -1072,7 +1091,8 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 	case teamChat(conv): // the team and how to give it work
 		req.System += e.groupBrief(ctx, conv, agent)
 		if !e.isAssistant(ctx, project.ID) {
-			req.System += e.workflowsBrief(ctx, conv, level) // what it may run itself (run_workflow)
+			req.System += e.workflowsBrief(ctx, conv, level)      // what it may run itself (run_workflow)
+			req.System += e.linkedBrief(ctx, project.ID, conv.ID) // where it may hand work (send_to_chat)
 		}
 	}
 	if clash != "" {
@@ -1540,7 +1560,7 @@ func (e *Engine) History(ctx context.Context, conversationID string) ([]MessageD
 	}
 	out := make([]MessageDTO, 0, len(msgs))
 	for _, m := range msgs {
-		d := MessageDTO{ID: m.ID, Role: m.Role, Content: m.Content, Tools: m.Tools, Attachments: nonNilAtt(m.Attachments), Author: m.Author, Sender: m.Sender, CreatedAt: m.CreatedAt, Patches: byMsg[m.ID]}
+		d := MessageDTO{ID: m.ID, Role: m.Role, Content: m.Content, Tools: m.Tools, Attachments: nonNilAtt(m.Attachments), Author: m.Author, Sender: m.Sender, CreatedAt: m.CreatedAt, Patches: byMsg[m.ID], Report: ReportOf(m)}
 		if d.Patches == nil {
 			d.Patches = []PatchDTO{}
 		}

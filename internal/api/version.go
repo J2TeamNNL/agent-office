@@ -63,12 +63,13 @@ func agentVersion(d agentDTO) string {
 
 func policyVersion(p perm.Policy) string {
 	return versionOf(struct {
-		Packs         []perm.Pack
-		DenyPaths     []string
-		WorktreeLinks []string
-		QuickCheck    bool
-		QuickChecks   string
-	}{p.Packs, p.DenyPaths, p.WorktreeLinks, p.QuickCheck, p.QuickChecks})
+		Packs          []perm.Pack
+		DenyPaths      []string
+		WorktreeLinks  []string
+		QuickCheck     bool
+		QuickChecks    string
+		LinkedProjects []string
+	}{p.Packs, p.DenyPaths, p.WorktreeLinks, p.QuickCheck, p.QuickChecks, p.LinkedProjects})
 }
 
 func workflowVersion(wf storage.Workflow) string {
@@ -96,6 +97,14 @@ func monitorVersion(m storage.Monitor) string {
 		AIEnabled          bool
 		AIBudgetUSD        float64
 	}{m.Name, m.Type, m.Target, m.Config, m.IntervalS, m.AIEnabled, m.AIBudgetUSD})
+}
+
+func processVersion(p storage.Process) string {
+	return versionOf(struct {
+		Name, Command, Cwd, Kind, Source string
+		Autostart, Autorestart           bool
+		Env                              map[string]string
+	}{p.Name, p.Command, p.Cwd, p.Kind, p.Source, p.Autostart, p.Autorestart, p.Env})
 }
 
 func channelVersion(c storage.Channel) string {

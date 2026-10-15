@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // run executes bin with args, feeding stdin; stderr is kept for error messages.
@@ -30,7 +31,7 @@ func runEnv(ctx context.Context, bin string, stdin string, env []string, args ..
 		cmd.Env = append(os.Environ(), env...)
 	}
 	if stdin != "" {
-		cmd.Stdin = strings.NewReader(stdin)
+		cmd.Stdin = strings.NewReader(strings.ToValidUTF8(stdin, "�"))
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -85,7 +86,11 @@ func clip(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return "…" + s[len(s)-n:]
+	i := len(s) - n
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return "…" + s[i:]
 }
 
 // claudeLoggedIn reads `claude auth status --json`. ok is false only when the

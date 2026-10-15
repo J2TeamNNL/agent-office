@@ -17,6 +17,8 @@ interface Message {
   patches: Patch[]
   actions?: ProposedAction[]
   cost_usd?: number
+  // a linked project's agent reporting back: shown folded
+  report?: { project: string, agent: string, project_id?: string, conversation_id: string }
 }
 interface Queued { id: string, text: string, attachments: Attachment[], created_at: string }
 interface Conversation { id: string, project_id?: string, agent_id: string, agent_name: string, title: string, updated_at: string, source?: Source, purpose?: string, external_url?: string, active_turn?: string, mode?: PermLevel, edit_mode?: 'worktree' | 'direct', effort?: string, cleaned?: string, context_tokens?: number, context_window?: number, tags?: string[], queued?: Queued[] }
@@ -24,6 +26,8 @@ interface ChatEvent { seq: number, type: 'text' | 'tool' | 'status' | 'patch' | 
 // the agents in a chat and the answers in progress (ADR-044)
 interface Member { agent_id: string, agent_name: string, level: string, context_tokens: number, context_window: number }
 interface RunningTurn { turn_id: string, agent_name: string, background: boolean }
+// what waits for a person in a linked project's chat this one handed work to
+interface LinkedPending { project_id: string, project: string, conversation_id: string, title: string, actions: ProposedAction[], patches: Patch[] }
 
 // purpose "automation": the chat that builds one automation (ADR-042), made on
 // first send or opened by automationId; its answers may fill the form.
@@ -90,23 +94,33 @@ const projectTags = computed(() => (tagsData.value?.tags ?? []).map(x => x.tag))
 const current = ref<Conversation | null>(null)
 const threadsOpen = ref(false) // the chats drawer on a phone
 
-// a chat's tags, saved at each change; the pushed row updates the other pages
-async function saveTags(c: Conversation, tags: string[]) {
-  try {
-    const res = await $fetch<{ conversation: Conversation }>(`/api/conversations/${c.id}/tags`, { method: 'PUT', body: { tags } })
-    const saved = res.conversation.tags ?? []
-    if (current.value?.id === c.id) current.value = { ...current.value, tags: saved }
-    if (tagEdit.value?.id === c.id) tagEdit.value = { ...tagEdit.value, tags: saved }
-    const list = convData.value?.conversations
-    const i = list?.findIndex(x => x.id === c.id) ?? -1
-    if (list && i >= 0) {
-      if (hasTags(saved, tagFilter.value)) list[i] = { ...list[i]!, tags: saved }
-      else list.splice(i, 1) // no longer what the filter shows
+// one queued save per conversation (tagQueue.ts): each is built from the
+// previous one's confirmed result, not from a snapshot taken before it, so
+// two rapid edits (e.g. removing two different tags back to back) can't lose
+// one another
+const tagChains: TagChains = new Map()
+
+async function saveTags(c: Conversation, mutate: (tags: string[]) => string[]) {
+  await queueTagOp(tagChains, c.id, c.tags ?? [], async (base) => {
+    try {
+      const tags = mutate(base)
+      const res = await $fetch<{ conversation: Conversation }>(`/api/conversations/${c.id}/tags`, { method: 'PUT', body: { tags } })
+      const saved = res.conversation.tags ?? []
+      if (current.value?.id === c.id) current.value = { ...current.value, tags: saved }
+      if (tagEdit.value?.id === c.id) tagEdit.value = { ...tagEdit.value, tags: saved }
+      const list = convData.value?.conversations
+      const i = list?.findIndex(x => x.id === c.id) ?? -1
+      if (list && i >= 0) {
+        if (hasTags(saved, tagFilter.value)) list[i] = { ...list[i]!, tags: saved }
+        else list.splice(i, 1) // no longer what the filter shows
+      }
+      refreshTags()
+      return saved
+    } catch (e) {
+      toast.add({ title: apiError(e), color: 'error' })
+      return base
     }
-    refreshTags()
-  } catch (e) {
-    toast.add({ title: apiError(e), color: 'error' })
-  }
+  })
 }
 // "Gắn tag" from a chat's menu in the list
 const tagEdit = ref<Conversation | null>(null)
@@ -289,8 +303,9 @@ onLiveChange(async (tables) => {
   const c = current.value
   if (!c || streaming.value || sending.value || loadingMsgs.value) return
   try {
-    const res = await $fetch<{ messages: Message[], members?: Member[], running?: RunningTurn[], conversation: Conversation }>(`/api/conversations/${c.id}?limit=${PAGE}`)
+    const res = await $fetch<{ messages: Message[], members?: Member[], running?: RunningTurn[], conversation: Conversation, linked_pending?: LinkedPending[] }>(`/api/conversations/${c.id}?limit=${PAGE}`)
     if (current.value?.id !== c.id || streaming.value || sending.value) return
+    linkedPending.value = res.linked_pending ?? [] // another chat's cards: no message of this one changes
     const known = new Set(messages.value.map(m => m.id))
     const fresh = res.messages.filter(m => !known.has(m.id))
     const changed = res.messages.some(m => { const x = messages.value.find(y => y.id === m.id); return x && JSON.stringify(x) !== JSON.stringify(m) })
@@ -349,8 +364,9 @@ async function afterTurn() {
   const id = current.value?.id
   if (!id) return
   try {
-    const res = await $fetch<{ conversation: Conversation, members?: Member[], running?: RunningTurn[] }>(`/api/conversations/${id}`)
+    const res = await $fetch<{ conversation: Conversation, members?: Member[], running?: RunningTurn[], linked_pending?: LinkedPending[] }>(`/api/conversations/${id}`)
     if (current.value?.id !== id) return
+    linkedPending.value = res.linked_pending ?? []
     current.value = { ...current.value, context_tokens: res.conversation.context_tokens, context_window: res.conversation.context_window }
     applyGroup(res.members, res.running)
   } catch { /* the next open shows it */ }
@@ -360,6 +376,9 @@ async function afterTurn() {
 // answers land in the thread when done; the one who asked then reports back
 const members = ref<Member[]>([])
 const running = ref<RunningTurn[]>([])
+// a report back's text without its first line (who and where, shown above it)
+const reportBody = (text: string) => text.split('\n\n').slice(1).join('\n\n').trim() || text
+const linkedPending = ref<LinkedPending[]>([])
 const background = computed(() => running.value.filter(r => r.background))
 const bgFollows = new Map<string, () => void>()
 function applyGroup(m?: Member[], r?: RunningTurn[]) {
@@ -468,7 +487,7 @@ async function open(c: Conversation, messageId?: string) {
   stopBackground()
   // the last page (a phone over a VPN); a link to one message loads it all to find it
   loadingMsgs.value = true
-  let res: { conversation: Conversation, messages: Message[], has_more?: boolean, members?: Member[], running?: RunningTurn[] }
+  let res: { conversation: Conversation, messages: Message[], has_more?: boolean, members?: Member[], running?: RunningTurn[], linked_pending?: LinkedPending[] }
   try {
     res = await $fetch(`/api/conversations/${c.id}${messageId ? '' : `?limit=${PAGE}`}`)
   } finally {
@@ -478,6 +497,7 @@ async function open(c: Conversation, messageId?: string) {
   messages.value = res.messages
   hasOlder.value = !!res.has_more
   current.value = res.conversation
+  linkedPending.value = res.linked_pending ?? []
   applyGroup(res.members, res.running)
   if (res.conversation.active_turn && !streaming.value) follow(res.conversation.active_turn)
   if (messageId) showMessage(messageId)
@@ -498,6 +518,10 @@ async function makeConversation(agentId: string) {
     // the skill editor's chat is in the URL: back, reload or a link reopens it
     if (props.purpose === 'skill' || props.purpose === 'workflow') router.replace({ query: { ...route.query, c: res.conversation.id } })
     await open(res.conversation)
+    // a new chat is for writing: the box opens (phone) and takes the cursor
+    composeOpen.value = true
+    await nextTick()
+    prompt.value?.focus?.()
   } catch (e) {
     toast.add({ title: apiError(e), color: 'error' })
   }
@@ -893,12 +917,12 @@ onBeforeUnmount(() => {
       </div>
       <!-- this chat's tags: chips (✕ to take one off) and "Thêm tag" -->
       <div v-if="!single && current" class="flex flex-wrap items-center gap-1 border-b border-(--ui-border) px-3 py-1">
-        <ChatTags :tags="current.tags ?? []" removable @remove="(x) => saveTags(current!, (current!.tags ?? []).filter(y => y !== x))" />
+        <ChatTags :tags="current.tags ?? []" removable @remove="(x) => saveTags(current!, (tags) => tags.filter(y => y !== x))" />
         <UPopover :content="{ align: 'start' }">
           <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-tag" :label="current.tags?.length ? undefined : t('chatTag.add')" :aria-label="t('chatTag.add')" :title="t('chatTag.add')" />
           <template #content>
             <div class="w-64 p-2">
-              <TagPicker :model-value="current.tags ?? []" :suggestions="projectTags" @update:model-value="(v) => saveTags(current!, v)" />
+              <TagPicker :model-value="current.tags ?? []" :suggestions="projectTags" @update:model-value="(v) => { const c = current!; const before = c.tags ?? []; saveTags(c, (base) => applyTagDiff(base, before, v)) }" />
             </div>
           </template>
         </UPopover>
@@ -997,7 +1021,22 @@ onBeforeUnmount(() => {
                   <UIcon name="i-lucide-ellipsis" class="size-4" />
                 </button>
               </UDropdownMenu>
-              <div v-if="m.content" class="min-w-0 whitespace-pre-wrap rounded-2xl rounded-br-sm bg-(--ui-primary) px-3.5 py-2 text-sm text-white"><template v-for="(p, i) in tagged(m.content)" :key="i"><span v-if="p.tag" class="rounded bg-white/20 px-0.5 font-medium">{{ p.text }}</span><template v-else>{{ p.text }}</template></template></div>
+              <!-- a linked project's report back: who and where, its text folded -->
+              <div v-if="m.report" class="min-w-0 rounded-2xl rounded-br-sm border border-(--ui-border) bg-(--ui-bg-elevated)/60 px-3.5 py-2 text-sm">
+                <p class="flex flex-wrap items-center gap-x-1.5 text-xs text-(--ui-text-muted)">
+                  <UIcon name="i-lucide-corner-down-left" class="size-3.5 text-primary" />
+                  <span>{{ t('chat.reportFrom', { project: m.report.project, agent: m.report.agent }) }}</span>
+                  <NuxtLink v-if="m.report.project_id" :to="`/projects/${m.report.project_id}?tab=chat&c=${m.report.conversation_id}`" class="text-primary hover:underline">{{ t('chat.reportOpen') }}</NuxtLink>
+                </p>
+                <details class="group/rep mt-1">
+                  <summary class="flex cursor-pointer list-none items-center gap-1 text-xs font-medium hover:text-primary">
+                    <UIcon name="i-lucide-chevron-right" class="size-3.5 transition group-open/rep:rotate-90" />{{ t('chat.reportShow') }}
+                  </summary>
+                  <!-- eslint-disable-next-line vue/no-v-html -->
+                  <div class="markdown mt-1.5 min-w-0" @click="onMarkdownClick" v-html="renderMarkdown(reportBody(m.content))" />
+                </details>
+              </div>
+              <div v-else-if="m.content" class="min-w-0 whitespace-pre-wrap rounded-2xl rounded-br-sm bg-(--ui-primary) px-3.5 py-2 text-sm text-white"><template v-for="(p, i) in tagged(m.content)" :key="i"><span v-if="p.tag" class="rounded bg-white/20 px-0.5 font-medium">{{ p.text }}</span><template v-else>{{ p.text }}</template></template></div>
             </div>
           </div>
           <div v-else-if="m.role === 'error'" class="flex items-start gap-2 text-sm text-(--ui-error)">
@@ -1040,6 +1079,19 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <WorkflowRunCard v-for="r in runsAt.after" :key="r.id" :run="r" @updated="onRunUpdated" />
+        <!-- a linked project's chat this one handed work to waits for a person: decided here -->
+        <div v-for="lp in linkedPending" :key="lp.conversation_id" class="space-y-2 rounded-lg border border-(--ui-warning)/40 bg-(--ui-warning)/5 p-3">
+          <p class="flex items-center gap-1.5 text-xs text-(--ui-text-muted)">
+            <UIcon name="i-lucide-waypoints" class="size-3.5 text-(--ui-warning)" />
+            {{ t('chat.linkedPending', { project: lp.project }) }}
+            <NuxtLink :to="`/projects/${lp.project_id}?tab=chat&c=${lp.conversation_id}`" class="ms-auto truncate text-primary hover:underline">{{ lp.title || t('chat.linkedOpen') }}</NuxtLink>
+          </p>
+          <PatchCard v-for="p in lp.patches" :key="p.id" :patch="p" @updated="(np: Patch) => lp.patches = lp.patches.map(x => x.id === np.id ? np : x)" />
+          <ActionCard
+            v-for="a in lp.actions" :key="a.id" :action="a" :project-id="lp.project_id"
+            @updated="(na: ProposedAction) => lp.actions = lp.actions.map(x => x.id === na.id ? na : x)"
+          />
+        </div>
 
         <div v-if="streaming && !runs.some(r => r.status === 'running' && r.caller_conversation_id === current?.id)" class="space-y-2">
           <div class="flex items-center gap-2 text-xs text-(--ui-text-muted)">
@@ -1118,7 +1170,7 @@ onBeforeUnmount(() => {
     <!-- "Gắn tag" from a chat's menu in the list -->
     <UModal :open="!!tagEdit" :title="t('chatTag.title')" :description="tagEdit?.title || t('chat.newThreadTitle')" @update:open="(o) => { if (!o) tagEdit = null }">
       <template #body>
-        <TagPicker v-if="tagEdit" :model-value="tagEdit.tags ?? []" :suggestions="projectTags" @update:model-value="(v) => saveTags(tagEdit!, v)" />
+        <TagPicker v-if="tagEdit" :model-value="tagEdit.tags ?? []" :suggestions="projectTags" @update:model-value="(v) => { const c = tagEdit!; const before = c.tags ?? []; saveTags(c, (base) => applyTagDiff(base, before, v)) }" />
       </template>
     </UModal>
   </div>

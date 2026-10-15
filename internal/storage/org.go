@@ -353,6 +353,14 @@ type RunRepo interface {
 type SettingRepo interface {
 	Get(ctx context.Context, key string, dst any) (bool, error)
 	Set(ctx context.Context, key string, v any) error
+	// GetRaw returns the stored JSON for key as-is (for a later SetIf), and
+	// whether it exists.
+	GetRaw(ctx context.Context, key string) (raw string, ok bool, err error)
+	// SetIf stores v under key only if the raw JSON currently stored there
+	// still equals expected (what GetRaw last returned; "" means the key
+	// must not exist yet). Returns ErrConflict when another write landed
+	// since expected was read.
+	SetIf(ctx context.Context, key, expected string, v any) error
 }
 
 // Conversation is a chat thread with one agent of a project.
@@ -809,6 +817,9 @@ type ActionArgs struct {
 	// remember: the topic the note goes under and its index line ("" = core, ADR-134)
 	Topic   string `json:"topic,omitempty"`
 	Summary string `json:"summary,omitempty"`
+	// send_message to a linked project: its id; with no target chat, a new
+	// chat is opened there
+	Project string `json:"project,omitempty"`
 }
 
 // MCPCallArgs is a tool call waiting for a person.

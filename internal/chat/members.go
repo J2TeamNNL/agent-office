@@ -229,7 +229,7 @@ func (e *Engine) startTurn(conv storage.Conversation, project storage.Repo, s tu
 	}
 	t.setJobID(job.ID)
 	runCtx = usage.WithJob(runCtx, job.ID)
-	go e.run(runCtx, t, conv, project, s.agent, history, s.prompt, nil)
+	safeGo("run", func() { e.run(runCtx, t, conv, project, s.agent, history, s.prompt, nil) })
 	return t, ""
 }
 
@@ -305,6 +305,9 @@ func (e *Engine) nextTurn(ctx context.Context, prev *Turn, conv storage.Conversa
 			return next.ID
 		}
 		e.note(conv, why)
+	}
+	if teamChat(conv) && len(given) == 0 { // the chat's work is over: a linked project's hand-off hears back
+		e.reportBack(conv, project, agent, reply)
 	}
 	return ""
 }
