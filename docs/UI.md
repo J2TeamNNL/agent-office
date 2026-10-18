@@ -10,7 +10,7 @@ Dự án thật (`dashboard/app/pages/`) là projects-based, không phải sơ �
 |---|---|---|---|
 | `/` | Tổng quan | 3 tab qua `?tab=`: **Việc** (mặc định — cần xử lý mọi project trừ Trợ lý office, việc gần đây, badge đếm trên sidebar), **Thống kê** (chi phí/lượt chạy theo ngày · project · model, 7/30/90 ngày — ADR-060), **Máy** (admin: trạng thái máy, kết nối AI, bước thiết lập ban đầu) | |
 | `/projects` | Danh sách project | Project đang quản lý (ADR-017: có thư mục, clone git, hoặc không thư mục — toàn máy) | Thêm project (chọn gói khởi tạo — ADR-099) |
-| `/projects/:id?tab=…` | Project | Thanh tiêu đề gọn (menu `⋯` sửa tên/mô tả, thiết lập AI), 1 dòng thông tin (đường dẫn · git · mô tả rút gọn). Tab: **Chat**, **Tự động hoá** (lịch/webhook/bot), **Vận hành** (Tiến trình · Container · Giám sát), **Agent** (danh sách agent, agent mặc định, tạm dừng, lịch sử, xuất, áp gói — ADR-099), **Quy trình** (cài từ thư viện, gán vai, bật/tắt, sửa — ADR-098; mục Lần chạy — ADR-101), **Quyền** (lệnh, file cấm sửa, project liên kết — ADR-155); chỉ admin thấy thêm: **Files**, **Skill**, **MCP**, **Burn**, **Nhật ký sửa**; và **Thông tin** (budget, git, mô tả) | tuỳ tab |
+| `/projects/:id?tab=…` | Project | Thanh tiêu đề gọn (menu `⋯` sửa tên/mô tả, thiết lập AI), 1 dòng thông tin (đường dẫn · git · mô tả rút gọn). Tab: **Chat**, **Tự động hoá** (lịch/webhook/bot), **Vận hành** (Tiến trình · Container, mỗi dòng có giám sát riêng — ADR-162), **Agent** (danh sách agent, agent mặc định, tạm dừng, lịch sử, xuất, áp gói — ADR-099), **Quy trình** (cài từ thư viện, gán vai, bật/tắt, sửa — ADR-098; mục Lần chạy — ADR-101), **Quyền** (lệnh, file cấm sửa, project liên kết — ADR-155); chỉ admin thấy thêm: **Files**, **Skill**, **MCP**, **Burn**, **Nhật ký sửa**; và **Thông tin** (budget, git, mô tả, **Tính năng**: gói Lập trình và tính năng con — ADR-161). Tính năng tắt thì ẩn tab/mục của nó (Vận hành khi tắt `ops`, GitBar khi tắt `git`) | tuỳ tab |
 | `/projects/:id/setup` | Thiết lập AI | Quét project, đọc agent có sẵn, đề xuất gói khởi tạo + tinh chỉnh agent (ADR-018) | Tạo / Chỉnh / Hủy |
 | `/projects/:id/agents/:agentId` | Agent | Số liệu (lượt chạy, chi phí, tỉ lệ lỗi theo ngày/model), việc + chat gần đây, lịch sử sửa cấu hình (khôi phục được) | Sửa cấu hình, từng thẻ tự lưu |
 | `/projects/:id/automations/new`, `/automations/:aid`, `/automations/:aid/edit` | Tự động hoá | Tạo/sửa 1 automation (lịch, webhook, điều kiện, script hoặc chat); xem 1 cái: trạng thái, bật/tắt, Việc đã chạy | Chạy thử, sửa, xoá, copy URL webhook |
@@ -24,7 +24,7 @@ Dự án thật (`dashboard/app/pages/`) là projects-based, không phải sơ �
 | `/jobs` | Job | Mọi lượt chạy (chat, Việc, automation) của mọi project: trạng thái, lọc theo project, lỗi 24h, chi phí 24h | |
 | `/agents` | Thư viện agent | Duyệt mẫu agent (lọc mảng, tìm, xem hướng dẫn; ✕ hoặc bấm lại thẻ để đóng); admin chọn project rồi **Thêm vào project** (mở tab Agent với form điền sẵn) | Thêm vào project |
 | `/providers` | Kết nối AI | Danh sách kết nối (Anthropic, OpenAI, API tương thích, CLI…), gửi thử, thống kê theo kết nối | Thêm / Sửa / Xoá / Đặt mặc định |
-| `/watch` | Theo dõi | Nhiều dashboard (tối đa 5, nằm trong submenu Theo dõi ở sidebar kèm + thêm; ⚙ trên trang: tên, project mặc định); mỗi dashboard là lưới 12 cột (8/4 cột khi hẹp) các box: kéo tay nắm để di chuyển, kéo góc đổi cỡ trong giới hạn của widget; 22 widget xếp theo nhóm Agent & công việc, Chạy & giám sát, AI & chi phí, Số liệu & khác (chat, tiến trình, container, nhiều console, giám sát, con số, job, biểu đồ, sự cố, chờ duyệt, máy, ngân sách AI, hạn mức AI, kết nối AI, agent, chi phí theo nhóm, bảng đèn, git, bảng điều khiển, lịch tự động, xem trang web, ghi chú). Widget đổi cách thể hiện theo số ô (huy hiệu 1×1, dải 1 hàng, cột 1 ô rộng, thẻ, bảng). Lưu theo tài khoản trên office (`/api/me/prefs/watch`), mở ở máy nào cũng thấy; bản cũ trong trình duyệt được chuyển lên một lần (ADR-159) | Thêm box, ⚙ cài đặt box, nhân bản, đổi cỡ |
+| `/watch` | Theo dõi | Nhiều dashboard (tối đa 5, nằm trong submenu Theo dõi ở sidebar kèm + thêm; ⚙ trên trang: tên, project mặc định); mỗi dashboard là lưới 12 cột (8/4 cột khi hẹp) các box: kéo tay nắm để di chuyển, kéo góc đổi cỡ trong giới hạn của widget; 24 widget xếp theo nhóm Agent & công việc, Chạy & giám sát, AI & chi phí, Số liệu & khác (chat, tiến trình, container, nhiều console, giám sát, con số, job, biểu đồ, sự cố, chờ duyệt, máy, ngân sách AI, hạn mức AI, kết nối AI, agent, chi phí theo nhóm, bảng đèn, git, bảng điều khiển, lịch tự động, Burn, việc của Burn, xem trang web, ghi chú). Widget đổi cách thể hiện theo số ô (huy hiệu 1×1, dải 1 hàng, cột 1 ô rộng, thẻ, bảng). Lưu theo tài khoản trên office (`/api/me/prefs/watch`), mở ở máy nào cũng thấy; bản cũ trong trình duyệt được chuyển lên một lần (ADR-159) | Thêm box, ⚙ cài đặt box, nhân bản, đổi cỡ |
 | `/assistant` | Trợ lý office | Chat với trợ lý office (project ảo, không gắn thư mục, dùng để quản lý chính office) | |
 | `/account` | Tài khoản | Đổi tên/mật khẩu, ngôn ngữ, giao diện sáng/tối, cài CLI | |
 | `/admin/users` (admin) | Người dùng | Danh sách tài khoản, tạo, đặt lại mật khẩu, gắn Discord/Telegram ID (tin gửi bot từ ID đó hiện tên tài khoản; chỉ nhận diện, không cấp quyền), bật/tắt (tắt thu hồi session) | |
@@ -163,16 +163,15 @@ Gửi tin nhắn `{text, attachments:[id]}`; tạo Việc `{goal, budget_usd, at
 | GET | `/api/projects/:id/compose/logs?file=&service=` | auth | SSE log container (`--follow --tail 300`) |
 | POST | `/api/projects/:id/compose/log-attachment` | auth | `{file, service}` → log container thành file đính kèm |
 
-### Giám sát (đã làm, ADR-027)
+### Giám sát (đã làm, ADR-027; gắn vào tiến trình/container — ADR-162)
 
 | Method | Path | Quyền | Mô tả |
 |---|---|---|---|
 | GET | `/api/monitors?project=` | auth | giám sát + uptime 24h, độ trễ TB, 30 lần kiểm tra gần nhất; `summary` |
-| POST | `/api/projects/:id/monitors` | admin | `{name, type, target, config, interval_s, ai_enabled, ai_budget_usd}` |
+| POST | `/api/projects/:id/monitors` | admin | `{type: process\|container, target, config.file, interval_s, ai_enabled, ai_budget_usd}`; tên mặc định theo tiến trình/service; mỗi tiến trình/service một giám sát |
 | PATCH/DELETE | `/api/monitors/:id` | admin | sửa (tạm dừng = `enabled:false`) / xóa |
 | POST | `/api/monitors/:id/check` | admin | kiểm tra ngay |
 | GET | `/api/monitor-events?project=&limit=` | auth | sự kiện Up/Down kèm phân tích AI |
-| GET/POST | `/api/heartbeat/:token` | công khai | service báo còn sống |
 
 Dashboard mặc định chạy ở cổng **2704** (`make dev-ui`, `make ui-start`), API ở 8787.
 
@@ -248,6 +247,8 @@ Dashboard mặc định chạy ở cổng **2704** (`make dev-ui`, `make ui-star
 | GET | `/api/usage/runs?...` | Lịch sử lượt gọi AI |
 | PUT | `/api/usage/settings` | Trần chung office + giá model (trang Kết nối AI) |
 | GET/PUT | `/api/projects/:id/budget` | Ngân sách riêng của project (tab Thông tin) |
+| GET | `/api/features` | Danh sách gói tính năng |
+| GET/PUT | `/api/projects/:id/features` | Gói tính năng của project: cài đặt, tính năng bật, lý do tắt (`project` \| `no_folder`) |
 | GET | `/api/system`, `/api/system/stats`, `/api/system/summary` | Trạng thái máy |
 
 ### Burn (đã làm, admin, ADR-087)

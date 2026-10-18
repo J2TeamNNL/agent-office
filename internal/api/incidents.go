@@ -13,6 +13,8 @@ import (
 
 	"github.com/tung1998/agent-office/internal/assistant"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/deciding"
+	"github.com/tung1998/agent-office/internal/features"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/trigger"
 )
@@ -61,6 +63,7 @@ func (s *server) incidentsFor(ctx context.Context, u storage.User) ([]incident, 
 			continue
 		}
 		base := "/projects/" + p.ID
+		on, _ := features.Effective(features.LoadConfig(ctx, s.cfg.Store, p.ID), p.Path != "")
 		add := func(kind, sev, title, detail string, at *time.Time, link, id, key string) {
 			it := incident{Kind: kind, Severity: sev, ProjectID: p.ID, ProjectName: p.Name, Title: title, Detail: detail, Link: link, ID: id, Key: kind + ":" + key}
 			if at != nil {
@@ -73,14 +76,15 @@ func (s *server) incidentsFor(ctx context.Context, u storage.User) ([]incident, 
 			}
 			out = append(out, it)
 		}
-		if ms, err := s.cfg.Store.Monitors().List(ctx, p.ID); err == nil {
+		if features.Has(on, features.Ops) { // hidden: no badge either
+			ms, _ := s.cfg.Store.Monitors().List(ctx, p.ID)
 			for _, m := range ms {
 				if m.Enabled && m.Status == "down" {
 					add("monitor", "error", m.Name, m.LastMessage, m.LastChangeAt, base+"?tab=ops", m.ID, m.ID)
 				}
 			}
 		}
-		if s.cfg.Ops != nil {
+		if s.cfg.Ops != nil && features.Has(on, features.Ops) {
 			if ps, err := s.cfg.Store.Processes().List(ctx, p.ID); err == nil {
 				for _, x := range ps {
 					if st := s.cfg.Ops.State(x.ID); st.Status == "crashed" {
@@ -129,6 +133,9 @@ func (s *server) incidentsFor(ctx context.Context, u storage.User) ([]incident, 
 	if u.Role == storage.RoleAdmin { // cards waiting for a person
 		if acts, err := s.cfg.Store.Actions().Pending(ctx, 100); err == nil {
 			for _, a := range acts {
+				if _, busy := deciding.Is(a.ID); busy { // approved (on its own, or elsewhere), running: nobody need act
+					continue
+				}
 				name := a.ProjectID
 				for _, p := range projects {
 					if p.ID == a.ProjectID {
@@ -149,6 +156,9 @@ func (s *server) incidentsFor(ctx context.Context, u storage.User) ([]incident, 
 	if u.Role == storage.RoleAdmin { // chats' diffs waiting for a person
 		if ps, err := s.cfg.Store.Chat().PendingPatches(ctx, 100); err == nil {
 			for _, p := range ps {
+				if _, busy := deciding.Is(p.ID); busy {
+					continue
+				}
 				c, err := s.cfg.Store.Chat().GetConversation(ctx, p.ConversationID)
 				if err != nil || c.ProjectID == hidden {
 					continue

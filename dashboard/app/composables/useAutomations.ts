@@ -177,19 +177,143 @@ export const isChannelSource = (s: string) => s === 'telegram' || s === 'discord
 // ---- the draft the builder page edits (ADR-042) ----
 export type AutomationDraft = Omit<Automation, 'id' | 'project_id' | 'failures' | 'disabled_code' | 'disabled_reason' | 'last_run_at' | 'next_run_at' | 'last_job' | 'created_at' | 'webhook_url' | 'bot' | 'bot_status'> & { bot: BotDraft }
 
-// prReviewDraft: a GitHub/Bitbucket PR webhook, the agent reviews the diff and the chat hears it
-export function prReviewDraft(t: (k: 'auto.prName' | 'auto.prPrompt') => string): AutomationDraft {
+// AutomationTemplate is the starter library shown when a person creates an
+// automation. Templates deliberately produce a draft, rather than an API
+// object: the person can review and change every trigger, prompt and limit
+// before saving it.
+export interface AutomationTemplate {
+  key: string
+  name: string
+  description: string
+  category: string
+  icon: string
+  custom?: boolean
+  make: () => AutomationDraft
+}
+
+export interface SavedAutomationTemplate {
+  key: string
+  name: string
+  description: string
+  category: string
+  prompt: string
+  source: 'schedule' | 'webhook'
+}
+
+type TemplatePatch = Partial<Pick<AutomationDraft, 'name' | 'source' | 'action' | 'prompt' | 'keep_context'>> & {
+  config?: Partial<AutomationConfig>
+  script?: Partial<AutomationScript>
+  limits?: Partial<AutomationLimits>
+}
+
+function templateDraft(patch: TemplatePatch): AutomationDraft {
   const d = emptyDraft()
-  d.name = t('auto.prName')
-  d.source = 'webhook'
-  d.action = 'chat'
-  d.config.pull_request = true
-  d.config.auth = 'query'
-  d.config.auth_name = 'token'
-  d.prompt = t('auto.prPrompt')
-  d.limits.max_runs_per_hour = 20
+  Object.assign(d, patch)
+  d.config = { ...d.config, ...(patch.config ?? {}) }
+  d.script = { ...d.script, ...(patch.script ?? {}) }
+  d.limits = { ...d.limits, ...(patch.limits ?? {}) }
   return d
 }
+
+// Process templates deliberately describe a bounded operating procedure, not
+// a one-shot summary prompt. Keeping context lets the automation continue a
+// review across turns when the goal check says that evidence or follow-up is
+// still missing.
+const processBrief = (task: string) => `${task}
+
+OPERATING BRIEF
+
+You are the accountable operator for this process, not a generic summarizer. The incoming event or report is the source material; do not fill gaps with plausible-sounding assumptions. Your job is to turn incomplete input into a decision-ready work packet that another person or system can safely act on.
+
+1. Establish scope. State the event identity, time window, system or customer affected, requested outcome, and any context carried over from an earlier turn. If the payload does not establish one of these, mark it UNKNOWN and say what would resolve it.
+2. Normalize before interpreting. Deduplicate records, preserve identifiers, reconcile dates and units, and call out conflicting fields. Quote or point to the evidence used for every material conclusion. Never treat a missing field as a negative result.
+3. Separate certainty levels. Label each important statement as CONFIRMED, SUPPORTED, HYPOTHESIS, or UNKNOWN. A hypothesis may guide the next check but must not be presented as a root cause, approval, recovery, or customer commitment.
+4. Work in order: understand the desired outcome; inspect the available evidence; identify impact and risk; propose the smallest safe next actions; assign owners and deadlines; define how each action will be verified; then prepare communication for the appropriate audience.
+5. Prefer reversible actions and human checkpoints. Do not approve payment, deploy code, change permissions, delete data, contact a customer, promise a deadline, or close an incident solely from an inference. Clearly mark anything requiring a person, a privileged tool, or a separate approval.
+6. When information is insufficient, do not stop at “need more information.” Return a prioritized request list with the exact field or artifact needed, why it matters, who should provide it, and the decision it unlocks. Continue all safe analysis that is possible with the current evidence.
+7. Check your own work before finishing: identifiers are consistent; arithmetic and dates reconcile; owners are real or explicitly unassigned; every high-risk item has a next action; recommendations have a success signal; and uncertainty is visible.
+
+REQUIRED OUTPUT
+
+Use these headings in this order:
+- Executive decision: one sentence and confidence.
+- Scope and evidence: inputs used, time window, identifiers, and missing or conflicting data.
+- Findings: a table with finding, certainty, evidence, impact, and risk.
+- Actions: a table with action, owner, priority, deadline, dependency, and verification signal.
+- Human decisions: what must be approved, by whom, and before what action.
+- Communication draft: concise wording suitable for the affected audience; do not hide uncertainty.
+- Open questions and next checkpoint.
+
+Do not claim that the process is complete unless the completion criteria are demonstrably met. If this is a follow-up turn, preserve unresolved items from the previous turn and show what changed. End with either DONE plus the evidence that satisfies the goal, or CONTINUE plus the smallest next evidence request.`
+const processSchedule = (name: string, prompt: string, cron: string, goal: AutomationGoal, config: Partial<AutomationConfig> = {}, limits: Partial<AutomationLimits> = {}) =>
+  templateDraft({ name, source: 'schedule', action: 'chat', keep_context: true, prompt: processBrief(prompt), config: { cron, every_minutes: 0, goal, ...config }, limits: { max_parallel: 1, max_minutes: 20, max_runs_per_hour: 24, ...limits } })
+const processWebhook = (name: string, prompt: string, goal: AutomationGoal, config: Partial<AutomationConfig> = {}, limits: Partial<AutomationLimits> = {}) =>
+  templateDraft({ name, source: 'webhook', action: 'chat', keep_context: true, prompt: processBrief(prompt), config: { auth: 'bearer', goal, ...config }, limits: { max_parallel: 2, max_minutes: 15, max_runs_per_hour: 60, debounce_seconds: 15, debounce_max_seconds: 180, ...limits } })
+
+// Keep this list intentionally focused: each starter is a bounded operating
+// procedure with a completion condition, not just a different prompt.
+export const automationTemplates: AutomationTemplate[] = [
+  { key: 'incident-response', name: 'Incident response coordinator', description: 'Correlate an alert, assess impact, produce a response plan and keep escalating until the incident is owned.', category: 'Engineering', icon: 'i-lucide-siren', make: () => processWebhook('Incident response coordinator', `Run this incident procedure on {{payload}}.
+
+Phase 1 — normalize: extract service, environment, timestamp, alert identity and affected customer surface. If facts conflict, list the conflict.
+Phase 2 — assess: classify severity and confidence; distinguish observed facts from hypotheses; identify blast radius and what is still unknown.
+Phase 3 — act: propose only reversible, evidence-backed checks. Assign an owner and a deadline to every action. Never claim mitigation or recovery without a confirming signal.
+Phase 4 — communicate: draft an internal update with impact, timeline, current owner, next checkpoint and explicit customer-risk wording.
+Phase 5 — close: produce a follow-up list for root cause, prevention and post-incident review. If any required evidence is missing, say exactly what is missing and continue the next turn rather than declaring success.
+
+Output: severity, confidence, facts, hypotheses, action table, communication draft, open questions and closure criteria.`, { text: 'Incident has an owner, evidence-backed next actions and explicit closure criteria', max_rounds: 3 }, {}, { debounce_key: 'alert_id', max_parallel: 1, max_runs_per_hour: 30 }) },
+  { key: 'pr-review-gate', name: 'Pull request review gate', description: 'Run security, correctness, test and maintainability review with a merge decision.', category: 'Engineering', icon: 'i-lucide-git-pull-request', make: () => processWebhook('Pull request review gate', `Review this pull request: {{payload}}.
+
+Work in passes: (1) understand the intended behavior and changed surface, (2) inspect correctness and edge cases, (3) inspect security, permissions and data exposure, (4) inspect tests and failure paths, (5) inspect maintainability and rollout risk. For every finding include file:line, severity, evidence, impact and a concrete fix. Separate confirmed findings from questions. Check whether the proposed tests actually fail before the change and cover the risky branch. End with one verdict: ready, ready with follow-up, or changes required, plus a minimum merge checklist.`, { text: 'Every review pass is complete and the verdict has file:line evidence', max_rounds: 2 }, { pull_request: true, auth: 'query', auth_name: 'token' }, { debounce_key: 'pull_request.number', max_parallel: 1, max_runs_per_hour: 20 }) },
+  { key: 'release-readiness', name: 'Release readiness review', description: 'Turn release data into a go/no-go decision, rollback plan and owner checklist.', category: 'Engineering', icon: 'i-lucide-rocket', make: () => processSchedule('Release readiness review', `Prepare a release decision from {{payload}}.
+
+Reconcile version, commits, migrations, feature flags, dependency changes, test results, monitoring coverage and open incidents. Identify blockers and distinguish missing evidence from a failed check. Build a go/no-go table with owner, evidence, deadline and rollback trigger. Draft the rollout sequence in small reversible stages, the success metrics to watch, and the rollback procedure. If the release is not ready, state the exact evidence required to re-evaluate it; do not soften a blocker into a recommendation.`, '0 8 * * 1-5', { text: 'All release checks have evidence or an explicitly owned blocker', max_rounds: 2 }, {}, { max_runs_per_hour: 10 }) },
+  { key: 'security-findings-remediation', name: 'Security findings remediation', description: 'Prioritize findings, validate exploitability and produce a tracked remediation plan.', category: 'Security', icon: 'i-lucide-shield-check', make: () => processSchedule('Security findings remediation', `Process this security export: {{payload}}.
+
+Deduplicate findings and map each to asset, owner, exposure, exploitability, affected version and evidence. Re-rank by real risk, not scanner severity alone. For each critical or high item, state the safe verification step, remediation options, compensating control, due date and verification evidence. Separate false positives that need proof from accepted risks that need an accountable approver. Finish with a small executive summary and a machine-friendly remediation table.`, '0 9 * * 1-5', { text: 'Each high-risk finding has an owner, due date and verification evidence', max_rounds: 2 }, {}, { max_runs_per_hour: 5 }) },
+  { key: 'data-quality-recovery', name: 'Data quality recovery', description: 'Diagnose feed failures, find downstream impact and drive a recovery checklist.', category: 'Data', icon: 'i-lucide-table-properties', make: () => processWebhook('Data quality recovery', `Handle this data-quality event: {{payload}}.
+
+First classify freshness, completeness, schema, validity and duplication failures. Map the affected dataset to downstream reports, jobs and decisions. Identify the earliest bad partition or change, state the evidence, and propose a safe quarantine or backfill plan. Do not silently repair or discard data. Define validation queries and a clear recovery/rollback checkpoint. End with owner assignments, customer or business impact, and the exact signal that proves the pipeline is healthy again.`, { text: 'Root cause, downstream impact and a validated recovery plan are documented', max_rounds: 3 }, {}, { debounce_key: 'dataset.id', max_parallel: 1, max_runs_per_hour: 30 }) },
+  { key: 'lead-to-opportunity', name: 'Lead qualification and routing', description: 'Qualify an inbound lead, detect missing information, choose a route and draft the next touch.', category: 'Sales', icon: 'i-lucide-user-round-check', make: () => processWebhook('Lead qualification and routing', `Process this inbound lead: {{payload}}.
+
+Extract facts without inventing them. Score fit, intent, urgency and confidence with reasons. Detect duplicates, conflicts, missing qualification fields and disallowed claims. Choose one route with a reason: sales, nurture, support, partner or reject. Draft the next message in the right tone, list the questions it must answer, and define a follow-up deadline. Never promise pricing, availability or compliance without evidence. Return a CRM-ready record plus a human-review queue for low-confidence decisions.`, { text: 'Lead has a justified route, next action, owner and confidence score', max_rounds: 2 }, {}, { debounce_key: 'lead.email', max_parallel: 2, max_runs_per_hour: 60 }) },
+  { key: 'support-escalation', name: 'Support case resolution coordinator', description: 'Summarize a case, search for a safe resolution path and escalate with complete context.', category: 'Customer Service', icon: 'i-lucide-headphones', make: () => processWebhook('Support case resolution coordinator', `Coordinate this support case: {{payload}}.
+
+Build a timeline and state the customer's actual goal. Separate reported symptoms, confirmed facts and assumptions. Check known resolution paths and cite which evidence supports each one. Draft a response that is accurate, empathetic and does not expose private data or make an unsupported promise. Decide whether to resolve, request information, or escalate; if escalating, include impact, reproduction, logs/evidence, attempted fixes and the exact receiving team. Define a follow-up time and closure condition.`, { text: 'Case has a safe next action, accountable queue and closure condition', max_rounds: 3 }, {}, { debounce_key: 'case.id', max_parallel: 2, max_runs_per_hour: 60 }) },
+  { key: 'invoice-exception-control', name: 'Invoice exception control', description: 'Validate invoice fields, detect fraud or duplicate signals and prepare a human approval packet.', category: 'Finance & Risk', icon: 'i-lucide-receipt-text', make: () => processWebhook('Invoice exception control', `Review this invoice event: {{payload}}.
+
+Extract vendor, invoice number, dates, currency, subtotal, tax, total, purchase order and payment terms. Reconcile arithmetic and compare available purchase-order, vendor and duplicate signals. Classify each mismatch as confirmed, likely or unresolved. Recommend approve, hold for clarification, or escalate for fraud review, but never approve or pay automatically. Produce the evidence packet, missing documents, accountable reviewer and a time-bounded next step.`, { text: 'Invoice has reconciled fields, risk classification and a named human decision owner', max_rounds: 2 }, {}, { debounce_key: 'invoice.id', max_parallel: 1, max_runs_per_hour: 60 }) },
+  { key: 'customer-health-intervention', name: 'Customer health intervention', description: 'Diagnose churn risk, verify the evidence and create an owner-specific intervention plan.', category: 'Customer', icon: 'i-lucide-user-minus', make: () => processSchedule('Customer health intervention', `Review this customer-health export: {{payload}}.
+
+Segment accounts by risk and confidence. For each high-risk account, connect product usage, unresolved support issues, commercial value, stakeholder changes and recent sentiment without inferring facts that are not present. Identify the smallest useful intervention, owner, deadline and success signal. Draft a respectful outreach plan and a save-risk summary. Separate accounts needing data cleanup from accounts needing a human conversation.`, '0 8 * * 1', { text: 'Every high-risk account has evidence, owner, intervention and success signal', max_rounds: 2 }, {}, { max_runs_per_hour: 5 }) },
+  { key: 'campaign-experiment-loop', name: 'Campaign experiment loop', description: 'Diagnose campaign performance, separate signal from noise and propose the next measurable experiment.', category: 'Marketing', icon: 'i-lucide-megaphone', make: () => processSchedule('Campaign experiment loop', `Analyze this campaign snapshot: {{payload}}.
+
+Validate metric definitions, attribution window, sample size and comparison baseline before interpreting changes. Segment performance by audience, channel, creative and funnel stage. Separate observed results from causal hypotheses. Identify wasted spend and promising signals, then propose no more than three experiments with hypothesis, change, guardrail, owner, duration and success threshold. End with what should not be changed yet because evidence is insufficient.`, '0 9 * * 1', { text: 'Recommendations are tied to validated metrics and measurable experiments', max_rounds: 2 }, {}, { max_runs_per_hour: 5 }) },
+  { key: 'vendor-risk-control', name: 'Vendor risk control', description: 'Monitor supplier changes, evidence expiry and concentration risk with accountable follow-up.', category: 'Procurement', icon: 'i-lucide-building-2', make: () => processSchedule('Vendor risk control', `Review this vendor risk export: {{payload}}.
+
+Normalize each vendor and evidence date. Flag incidents, expired certifications, SLA deterioration, concentration, access risk and missing owners. Rank by business impact and evidence confidence. For each material risk, propose a verification request, interim control, accountable owner and due date. Do not mark a vendor safe because a field is blank; treat unknown as unknown and state the decision needed.`, '0 9 * * 1', { text: 'Material vendor risks have evidence, owner, due date and interim control', max_rounds: 2 }, {}, { max_runs_per_hour: 5 }) },
+  { key: 'knowledge-maintenance', name: 'Knowledge base maintenance', description: 'Find stale knowledge, verify sources and prepare prioritized updates.', category: 'Knowledge', icon: 'i-lucide-book-open-check', make: () => processSchedule('Knowledge base maintenance', `Review this knowledge-base report: {{payload}}.
+
+Find stale, duplicated, contradictory and unanswered content. Verify each proposed change against the cited source date and product context. Rank by user impact and confidence. For the highest-value items, draft the replacement outline, owner, source links, review deadline and deprecation plan for the old page. Keep uncertain claims in a review queue rather than presenting them as fact.`, '0 10 * * 1', { text: 'High-impact knowledge gaps have verified sources and assigned updates', max_rounds: 2 }, {}, { max_runs_per_hour: 5 }) },
+  { key: 'compliance-evidence-pack', name: 'Compliance evidence pack', description: 'Map controls to evidence, identify gaps and prepare an audit-ready request list.', category: 'Compliance', icon: 'i-lucide-clipboard-check', make: () => processSchedule('Compliance evidence pack', `Prepare an evidence review from {{payload}}.
+
+Map every control to its owner, evidence type, period, expiry and reviewer. Distinguish missing, stale, incomplete, contradictory and valid evidence. Never mark a control compliant from a claim alone. Build a prioritized gap register with requested artifact, accountable owner, deadline, compensating control and verification step. Finish with an audit-ready executive summary and a list of items requiring human sign-off.`, '0 9 * * 1', { text: 'Every control is mapped to valid evidence or an explicitly owned gap', max_rounds: 2 }, {}, { max_runs_per_hour: 5 }) },
+  { key: 'weekly-operating-review', name: 'Weekly operating review', description: 'Turn cross-functional metrics into decisions, risks and accountable actions.', category: 'Operations', icon: 'i-lucide-layout-dashboard', make: () => processSchedule('Weekly operating review', `Run the weekly operating review from {{payload}}.
+
+Validate period, definitions and missing data. Compare actuals with targets and prior period, then explain only changes supported by evidence. Group issues by customer impact, revenue, delivery, reliability and people capacity. For each material issue create a decision or action with owner, deadline, dependency, risk and success metric. End with decisions needed from leadership and explicitly state what the data cannot tell us.`, '0 16 * * 5', { text: 'Material variances have decisions, owners, deadlines and success metrics', max_rounds: 2 }, {}, { max_runs_per_hour: 5 }) },
+  { key: 'agent-quality-review', name: 'Agent quality and cost review', description: 'Inspect agent outcomes, failure modes, cost and human overrides, then propose one controlled improvement.', category: 'AI Governance', icon: 'i-lucide-gauge', make: () => processSchedule('Agent quality and cost review', `Evaluate this agent run report: {{payload}}.
+
+Check whether the success criteria are measurable. Segment failures by prompt, tool, model, permissions, data quality and human handoff. Compare quality, latency, cost, retries and override rate with the previous period. Identify regressions and confounders. Recommend exactly one improvement with a test design, rollback trigger, owner and metric; do not recommend shipping a change without a before/after measurement plan.`, '0 11 * * 1', { text: 'One measurable improvement is proposed with baseline, guardrail and rollback trigger', max_rounds: 2 }, {}, { max_runs_per_hour: 5 }) }
+]
+
+// Featured means “recommended starting point based on current demand signals”
+// (not a fabricated user rating). The UI renders these with a star.
+export const featuredTemplateKeys = new Set([
+  'incident-response', 'pr-review-gate', 'release-readiness', 'security-findings-remediation',
+  'data-quality-recovery', 'lead-to-opportunity', 'support-escalation', 'invoice-exception-control',
+  'customer-health-intervention', 'campaign-experiment-loop', 'compliance-evidence-pack',
+  'weekly-operating-review', 'agent-quality-review'
+])
 
 export function emptyDraft(): AutomationDraft {
   return {
@@ -202,6 +326,22 @@ export function emptyDraft(): AutomationDraft {
     limits: { max_parallel: 1, max_minutes: 0, max_runs_per_hour: 0, daily_cost_usd: 0, disable_after_failures: 5, debounce_seconds: 0, debounce_key: '', debounce_max_seconds: 0 },
     // ADR-074: "agent" follows the agent's own permissions; only "override" needs these
     permission_mode: 'agent', override_full_access: false, override_admin_by: '', override_extra_dirs: []
+  }
+}
+
+export function automationTemplateFromLibrary(template: SavedAutomationTemplate): AutomationTemplate {
+  return {
+    ...template,
+    icon: 'i-lucide-zap',
+    custom: true,
+    make: () => {
+      const draft = emptyDraft()
+      draft.name = template.name
+      draft.prompt = template.prompt
+      draft.source = template.source
+      draft.action = 'chat'
+      return draft
+    }
   }
 }
 

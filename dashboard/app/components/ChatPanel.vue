@@ -47,7 +47,7 @@ const page = computed(() => !props.compact && !single.value)
 const composeOpen = ref(false)
 // the pickers by the send button: on a phone just their icon (as the mode
 // picker), the same square as the other buttons (the agent's name is in the placeholder)
-const iconOnPhone = { base: 'max-sm:!w-7 max-sm:!px-0', leading: 'max-sm:!ps-1.5', value: 'max-sm:hidden', trailing: 'max-sm:hidden' }
+const iconOnPhone = { base: '@max-sm/chat:!w-7 @max-sm/chat:!px-0', leading: '@max-sm/chat:!ps-1.5', value: '@max-sm/chat:hidden', trailing: '@max-sm/chat:hidden' }
 const toast = useToast()
 const { t, when } = useLang()
 const { user: me, isAdmin } = useAuth()
@@ -924,11 +924,11 @@ onBeforeUnmount(() => {
 
 <template>
   <div
-    class="flex overflow-hidden rounded-lg border border-(--ui-border)"
-    :class="compact || purpose ? 'h-full min-h-0' : 'min-h-[24rem] flex-1 max-sm:-m-3 max-sm:rounded-none max-sm:border-0'"
+    class="@container/chat flex overflow-hidden rounded-lg border border-(--ui-border)"
+    :class="compact || purpose ? 'h-full min-h-0' : 'min-h-[24rem] flex-1 @max-sm/chat:-m-3 @max-sm/chat:rounded-none @max-sm/chat:border-0'"
   >
     <!-- threads -->
-    <aside v-if="!single && !compact" class="hidden w-60 shrink-0 flex-col border-e border-(--ui-border) md:flex">
+    <aside v-if="!single && !compact" class="hidden w-60 shrink-0 flex-col border-e border-(--ui-border) @md/chat:flex">
       <ThreadList :loading="convsLoading" v-model:origin="origin" v-model:tag-filter="tagFilter" :tags="projectTags" :conversations="conversations" :agents="agents" :current-id="current?.id" :unread="unread.ids.value" :has-more="moreConvs" :loading-more="loadingMore" :menu="threadMenu" @open="open" @new="newConversation(pick)" @more="loadMoreConvs" />
     </aside>
     <!-- a phone: the chats in a drawer -->
@@ -943,19 +943,22 @@ onBeforeUnmount(() => {
 
     <!-- thread -->
     <section class="relative flex min-w-0 flex-1 flex-col">
-      <!-- a phone: which chat this is, the drawer of chats, a new one -->
-      <div v-if="!single && !compact" class="flex items-center gap-1 border-b border-(--ui-border) p-2 md:hidden">
+      <!-- a phone: which chat this is (tap: the drawer of chats), a new one -->
+      <div v-if="!single && !compact" class="flex items-center gap-1 border-b border-(--ui-border) p-2 @md/chat:hidden">
         <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-panel-left" :aria-label="t('chat.threads')" @click="threadsOpen = true" />
-        <p class="min-w-0 flex-1 truncate text-sm font-medium">{{ current?.title || t('chat.newThreadTitle') }}</p>
+        <button type="button" class="flex min-w-0 flex-1 items-center gap-1 rounded-md px-1 py-1 text-left text-sm font-medium hover:bg-(--ui-bg-elevated)" :aria-label="t('chat.threads')" @click="threadsOpen = true">
+          <span class="truncate">{{ current?.title || t('chat.newThreadTitle') }}</span>
+          <UIcon name="i-lucide-chevron-down" class="size-4 shrink-0 text-(--ui-text-muted)" />
+        </button>
         <UButton v-if="isAdmin && waitingCards.length" size="sm" color="primary" variant="soft" icon="i-lucide-check-check" :label="t('chat.approveAll', { n: waitingCards.length })" :loading="approvingAll" :disabled="approvingAll" @click="approveAll" />
         <UButton size="sm" color="neutral" variant="ghost" icon="i-lucide-square-pen" :aria-label="t('chat.newThread')" @click="newConversation(pick)" />
       </div>
       <!-- compact (the corner chat): back, this chat's title (click to switch), a new one -->
-      <div v-if="compact && !single" class="flex items-center gap-1 border-b border-(--ui-border) p-2">
+      <div v-if="compact && !single" class="flex items-center gap-1 border-b border-(--ui-border) p-2 @max-[420px]/chat:gap-0.5 @max-[420px]/chat:p-1">
         <slot v-if="pane" name="lead" />
         <UButton v-else size="sm" color="neutral" variant="ghost" icon="i-lucide-arrow-left" :aria-label="t('common.close')" @click="emit('back')" />
         <UDropdownMenu :items="threadMenuItems" :content="{ align: 'start' }" :ui="{ content: 'max-h-80 w-72' }" class="min-w-0 flex-1">
-          <button type="button" class="flex min-w-0 flex-1 items-center gap-1 rounded-md px-2 py-1 text-left hover:bg-(--ui-bg-elevated)">
+          <button type="button" class="flex min-w-0 flex-1 items-center gap-1 rounded-md px-2 py-1 text-left hover:bg-(--ui-bg-elevated) @max-[420px]/chat:px-1 @max-[420px]/chat:text-xs">
             <span class="truncate font-semibold">{{ current?.title || t('chat.newThreadTitle') }}</span>
             <UIcon name="i-lucide-chevron-down" class="size-4 shrink-0 text-(--ui-text-muted)" />
           </button>
@@ -965,7 +968,7 @@ onBeforeUnmount(() => {
         <slot v-if="pane" name="actions" />
       </div>
       <!-- this chat's tags: chips (✕ to take one off) and "Thêm tag" -->
-      <div v-if="!single && current" class="flex flex-wrap items-center gap-1 border-b border-(--ui-border) px-3 py-1">
+      <div v-if="!single && current" class="flex flex-wrap items-center gap-1 border-b border-(--ui-border) px-3 py-1 @max-[420px]/chat:px-2 @max-[420px]/chat:py-0.5">
         <ChatTags :tags="current.tags ?? []" removable @remove="(x) => saveTags(current!, (tags) => tags.filter(y => y !== x))" />
         <UPopover :content="{ align: 'start' }">
           <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-tag" :label="current.tags?.length ? undefined : t('chatTag.add')" :aria-label="t('chatTag.add')" :title="t('chatTag.add')" />
@@ -976,7 +979,7 @@ onBeforeUnmount(() => {
           </template>
         </UPopover>
       </div>
-      <div v-if="!single && (members.length > 1 || background.length)" class="flex flex-wrap items-center gap-2 border-b border-(--ui-border) px-3 py-1.5 text-xs">
+      <div v-if="!single && (members.length > 1 || background.length)" class="flex flex-wrap items-center gap-2 border-b border-(--ui-border) px-3 py-1.5 text-xs @max-[420px]/chat:gap-1 @max-[420px]/chat:px-2 @max-[420px]/chat:py-1">
         <span class="text-(--ui-text-muted)">{{ t('chat.members') }}</span>
         <div class="flex -space-x-1.5">
           <span
@@ -994,7 +997,7 @@ onBeforeUnmount(() => {
         </span>
       </div>
       <div class="relative flex min-h-0 flex-1 flex-col">
-      <div ref="listEl" class="min-w-0 space-y-4" :class="['flex-1 overflow-y-auto overflow-x-hidden p-4 max-md:px-3', page && 'max-sm:pb-32' /* room for the floating input, open or not: nothing jumps */]" @scroll.passive="onListScroll">
+      <div ref="listEl" class="min-w-0 space-y-3" :class="['flex-1 overflow-y-auto overflow-x-hidden p-3 @max-md/chat:space-y-2 @max-md/chat:p-2 @max-[420px]/chat:space-y-1.5 @max-[420px]/chat:p-1.5', page && '@max-sm/chat:pb-32' /* room for the floating input, open or not: nothing jumps */]" @scroll.passive="onListScroll">
         <!-- a skill editor's chat, followed from the chat list: back to its editor -->
         <div v-if="!single && current?.purpose === 'skill'" class="flex items-center gap-2 rounded-lg border border-(--ui-border) px-3 py-2 text-sm">
           <UIcon name="i-lucide-sparkles" class="size-4 shrink-0 text-(--ui-primary)" />
@@ -1093,7 +1096,7 @@ onBeforeUnmount(() => {
                   <div class="markdown mt-1.5 min-w-0" @click="onMarkdownClick" v-html="renderMarkdown(reportBody(m.content))" />
                 </details>
               </div>
-              <div v-else-if="m.content" class="min-w-0 whitespace-pre-wrap rounded-2xl rounded-br-sm bg-(--ui-primary) px-3.5 py-2 text-sm text-white"><template v-for="(p, i) in tagged(m.content)" :key="i"><span v-if="p.tag" class="rounded bg-white/20 px-0.5 font-medium">{{ p.text }}</span><template v-else>{{ p.text }}</template></template></div>
+              <div v-else-if="m.content" class="min-w-0 whitespace-pre-wrap rounded-2xl rounded-br-sm bg-(--ui-primary) px-3.5 py-2 text-sm text-white @max-[420px]/chat:px-2 @max-[420px]/chat:py-1 @max-[420px]/chat:text-xs"><template v-for="(p, i) in tagged(m.content)" :key="i"><span v-if="p.tag" class="rounded bg-white/20 px-0.5 font-medium">{{ p.text }}</span><template v-else>{{ p.text }}</template></template></div>
             </div>
           </div>
           <div v-else-if="m.role === 'error'" class="flex items-start gap-2 text-sm text-(--ui-error)">
@@ -1122,7 +1125,7 @@ onBeforeUnmount(() => {
               </ul>
             </details>
             <!-- eslint-disable-next-line vue/no-v-html -->
-            <div class="markdown min-w-0 text-sm" :class="purpose && `md-apply-${purpose}`" @click="onMarkdownClick" v-html="renderMarkdown(m.content)" />
+            <div class="markdown min-w-0 text-sm @max-[420px]/chat:text-xs" :class="purpose && `md-apply-${purpose}`" @click="onMarkdownClick" v-html="renderMarkdown(m.content)" />
             <UButton
               v-for="(d, i) in (purpose || current?.purpose === 'skill' || current?.purpose === 'workflow' ? [] : skillDrafts(m.content))" :key="`sk${i}`"
               icon="i-lucide-sparkles" size="sm" color="neutral" variant="outline" :label="t('chat.openSkillEditor', { name: String(d.name) })"
@@ -1182,20 +1185,20 @@ onBeforeUnmount(() => {
         <UButton
           v-if="!pinned && messages.length" size="sm" :color="unseen ? 'primary' : 'neutral'" :variant="unseen ? 'solid' : 'outline'" icon="i-lucide-arrow-down"
           :label="unseen ? t('chat.newMessages') : undefined" :aria-label="t('chat.toLatest')" :title="t('chat.toLatest')"
-          :class="['absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full shadow-lg', !unseen && 'bg-(--ui-bg)', page && 'max-sm:bottom-20']"
+          :class="['absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full shadow-lg', !unseen && 'bg-(--ui-bg)', page && '@max-sm/chat:bottom-20']"
           @click="toEnd"
         />
       </Transition>
       </div>
 
-      <p v-if="current?.cleaned" class="flex items-center gap-2 border-t border-(--ui-border) p-3 text-sm text-(--ui-text-muted) max-md:p-2">
+      <p v-if="current?.cleaned" class="flex items-center gap-2 border-t border-(--ui-border) p-3 text-sm text-(--ui-text-muted) @max-md/chat:p-2">
         <UIcon name="i-lucide-archive" class="size-4 shrink-0" />{{ t('chat.cleaned') }}
       </p>
       <form
         v-else
-        :class="['border-t border-(--ui-border) p-3 max-md:p-2', page && (composeOpen
-          ? 'max-sm:absolute max-sm:inset-x-3 max-sm:bottom-3 max-sm:z-10 max-sm:border-0 max-sm:p-0 max-sm:[&>*]:shadow-lg'
-          : 'max-sm:hidden')]"
+        :class="['border-t border-(--ui-border) p-2 @max-md/chat:p-1.5', page && (composeOpen
+          ? '@max-sm/chat:absolute @max-sm/chat:inset-x-2 @max-sm/chat:bottom-2 @max-sm/chat:z-10 @max-sm/chat:border-0 @max-sm/chat:p-0 @max-sm/chat:[&>*]:shadow-lg'
+          : '@max-sm/chat:hidden')]"
         @submit.prevent="send"
       >
         <PromptInput
@@ -1215,12 +1218,12 @@ onBeforeUnmount(() => {
             <UButton v-if="streaming" size="sm" icon="i-lucide-square" color="neutral" variant="outline" :label="t('chat.stop')" @click="cancel" />
             <!-- while it answers: queued, sent next -->
             <UButton size="sm" type="submit" icon="i-lucide-send" class="shrink-0" :loading="sending && !streaming" :disabled="!draft.trim() && !draftFiles.length" :title="streaming || sending ? t('chat.queued') : undefined" />
-            <UButton v-if="page" size="sm" color="neutral" variant="ghost" icon="i-lucide-x" :class="'shrink-0 sm:hidden'" :aria-label="t('common.close')" @click="composeOpen = false" />
+            <UButton v-if="page" size="sm" color="neutral" variant="ghost" icon="i-lucide-x" :class="'shrink-0 @sm/chat:hidden'" :aria-label="t('common.close')" @click="composeOpen = false" />
           </template>
         </PromptInput>
       </form>
       <UButton
-        v-if="page && !composeOpen && !current?.cleaned" class="absolute bottom-3 end-3 z-10 rounded-full shadow-lg sm:hidden" size="lg" icon="i-lucide-message-circle"
+        v-if="page && !composeOpen && !current?.cleaned" class="absolute bottom-3 end-3 z-10 rounded-full shadow-lg @sm/chat:hidden" size="lg" icon="i-lucide-message-circle"
         :aria-label="t('chat.write')" @click="composeOpen = true; nextTick(() => prompt?.focus?.())"
       />
     </section>

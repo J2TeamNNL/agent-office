@@ -1,13 +1,14 @@
 // Workflows (ADR-098): how a project's agents work together, from a library
 // of files; each project keeps its own copy with the agent of each role.
 
-export type WorkflowAccess = 'analyze' | 'propose' | 'edit'
+// '' = its agent's own permission (the default); a value caps the role
+export type WorkflowAccess = '' | 'analyze' | 'propose' | 'edit'
 
 export interface WorkflowRole {
   key: string
   name: string
   hint?: string
-  access: WorkflowAccess
+  access?: WorkflowAccess
   differ_from?: string[]
   workflow?: string // a sub-workflow fills it (ADR-102)
   prefer?: { tier?: string, family?: string } // the agent it wants (ADR-103)
@@ -51,6 +52,7 @@ export interface WorkflowDef {
   key: string
   name: string
   description: string
+  category?: string
   input?: string
   roles: WorkflowRole[]
   parallel?: string[][]
@@ -257,7 +259,6 @@ export interface LibraryWorkflow {
   def: WorkflowDef
   source?: string
   builtin: boolean // shipped with the office
-  modified: boolean // a shipped one, changed here
   error?: string
   updated_at: string
   version: string
@@ -346,7 +347,11 @@ export interface ProjectWorkflow {
   version: string // ADR-072: send back on PATCH so a stale save 409s instead of overwriting
 }
 
-export const accessIcon: Record<WorkflowAccess, string> = {
+export type AccessKey = 'agent' | 'analyze' | 'propose' | 'edit'
+export const accessKey = (a?: string): AccessKey => (a || 'agent') as AccessKey
+
+export const accessIcon: Record<AccessKey, string> = {
+  agent: 'i-lucide-user-check',
   analyze: 'i-lucide-eye',
   propose: 'i-lucide-message-square-diff',
   edit: 'i-lucide-pencil'

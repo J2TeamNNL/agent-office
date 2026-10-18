@@ -35,9 +35,6 @@ func newWFGroup(t *testing.T) wfGroup {
 		t.Fatal(err)
 	}
 	lib := workflow.Library{Dir: filepath.Join(t.TempDir(), "workflows")}
-	if _, err := lib.Seed(); err != nil {
-		t.Fatal(err)
-	}
 	return wfGroup{group: g, qa: qa, svc: &workflow.Service{Store: g.f.st, Lib: lib}}
 }
 
@@ -164,7 +161,7 @@ func TestWorkflowCommitteeRunsInParallelAndCallsBack(t *testing.T) {
 			back = in
 		}
 	}
-	if !strings.Contains(devIn, "Vì sao test chập chờn?") || !strings.Contains(devIn, "Analyze only") {
+	if !strings.Contains(devIn, "Vì sao test chập chờn?") || !strings.Contains(devIn, "Work with your own permission") {
 		t.Fatalf("Dev's brief:\n%s", devIn)
 	}
 	if !strings.Contains(back, "Thành viên A") || !strings.Contains(back, "Thành viên B") {
@@ -748,10 +745,43 @@ func TestAgentStartsWorkflowItself(t *testing.T) {
 	if runs, _ := g.f.st.WorkflowRuns().List(g.context, g.f.project.ID, g.conv.ID, 1); len(runs) != 0 {
 		t.Fatal("the run started before the answer ended")
 	}
+	if !g.engine.QueuedWorkflow(g.context, g.conv.ID) { // an automation waits for it before it notifies
+		t.Fatal("the call does not wait in the chat")
+	}
 	os.Remove(filepath.Join(g.dir, "sleep-lead"))
 	g.own(t)
 	if r := g.run(t); r.WorkflowKey != "council" || r.Input != "vì sao test chập chờn" {
 		t.Fatalf("run = %+v", r)
 	}
 	g.engine.StopAll(g.conv.ID)
+}
+
+// A run that ends while a role still answers leaves no role "working".
+func TestWorkflowEndsItsWorkingRoles(t *testing.T) {
+	g := newWFGroup(t)
+	g.install(t, "feature", map[string]string{"ke-hoach": g.dev.ID, "phan-bien": g.qa.ID, "thuc-thi": g.dev.ID, "review": g.qa.ID})
+	os.WriteFile(filepath.Join(g.dir, "sleep-lead"), []byte("2"), 0o644)
+	os.WriteFile(filepath.Join(g.dir, "sleep-dev"), []byte("30"), 0o644)
+	call, _, err := g.engine.Send(g.context, g.conv.ID, "/feature đăng nhập bằng Google", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := map[string]string{"outcome": "Đăng nhập Google", "constraints": "giữ API cũ", "done_when": "test xanh"}
+	if _, err := g.during(t, "workflow_delegate", map[string]any{"role": "ke-hoach", "brief": full}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for !slices.ContainsFunc(g.run(t).Roles, func(r storage.RunRole) bool { return r.Status == "working" }) {
+		if time.Now().After(deadline) {
+			t.Fatal("the role never started")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	g.engine.StopAll(g.conv.ID)
+	collect(t, call)
+	for _, r := range g.run(t).Roles {
+		if r.Status == "working" {
+			t.Fatalf("role %s still working after the run ended", r.Name)
+		}
+	}
 }

@@ -35,6 +35,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/tung1998/agent-office/internal/actor"
+	"github.com/tung1998/agent-office/internal/deciding"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/usage"
@@ -94,6 +95,8 @@ type PatchDTO struct {
 	Size      int  `json:"size"`
 	Add       int  `json:"add"`
 	Del       int  `json:"del"`
+	// Deciding: who is deciding it right now (it says pending until done)
+	Deciding string `json:"deciding,omitempty"`
 }
 
 // PatchPreview is how much of a diff a chat loads with its messages.
@@ -114,6 +117,7 @@ func toPatchDTO(p storage.Patch) PatchDTO {
 // FullPatchDTO is a diff with all of its text.
 func FullPatchDTO(p storage.Patch) PatchDTO {
 	d := PatchDTO{ID: p.ID, MessageID: p.MessageID, Diff: p.Diff, Files: p.Files, Status: p.Status, Detail: p.Detail, DecidedBy: p.DecidedBy, DecidedAt: p.DecidedAt, Origin: p.Origin, Size: len(p.Diff)}
+	d.Deciding, _ = deciding.Is(p.ID)
 	for line := range strings.SplitSeq(p.Diff, "\n") {
 		switch {
 		case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
@@ -217,7 +221,6 @@ type Engine struct {
 	decided     decisions                                  // proposals a person decided on the dashboard: the agent goes on (ADR-084)
 	queueRun    QueueRunner                                // carries out a queued proposal (Drain)
 	draining    sync.Map                                   // conversation id → *sync.Mutex: one Drain at a time
-	deciding    sync.Map                                   // patches being decided now: one decision applies a patch
 	onLimits    func(p storage.Provider, l Limits)
 	office      *officetools.Toolbox
 	mcp         *mcpserver.Server
@@ -393,6 +396,8 @@ type ActionDTO struct {
 	// Always: run_command, the pattern "luôn cho phép" would add ("" = it can't)
 	Always string `json:"always,omitempty"`
 	Seq    int    `json:"seq,omitempty"` // its number among the chat's proposals (numberCards)
+	// Deciding: who is deciding it right now (it says pending until done)
+	Deciding string `json:"deciding,omitempty"`
 }
 
 // ToActionDTO converts a stored action.
@@ -401,9 +406,10 @@ func ToActionDTO(a storage.Action) ActionDTO {
 	if a.Kind == "run_command" {
 		always, _ = perm.SuggestPattern(a.Target)
 	}
+	by, _ := deciding.Is(a.ID)
 	return ActionDTO{ID: a.ID, MessageID: a.MessageID, TaskID: a.TaskID, Kind: a.Kind, Label: actions.Kinds[a.Kind], Target: a.Target, TargetID: a.TargetID,
 		Reason: a.Reason, Message: a.Args.Message, Files: a.Args.Files, Automation: a.Args.Automation, Change: a.Args.Change, Status: a.Status, Detail: a.Detail, By: a.ProposedBy, DecidedBy: a.DecidedBy, DecidedAt: a.DecidedAt,
-		Always: always}
+		Always: always, Deciding: by}
 }
 
 // SetAttachments sets where attached files are stored.
@@ -1056,7 +1062,7 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 	}
 	req := RunRequest{
 		WorkDir: pl.dir, Prompt: text,
-		System: systemPrompt(project, agent, e.office != nil, acc, pl, LoadLanguage(ctx, e.store)), History: hist, Attachments: files,
+		System: systemPrompt(project, agent, e.office != nil, promptKeywords(ctx, e.store, project.ID, policy), acc, pl, LoadLanguage(ctx, e.store)), History: hist, Attachments: files,
 		Write: pl.write, DenyPaths: policy.DenyPaths, ExtraDirs: agentExtraDirs, UserMCP: acc.Can(perm.CapUserMCP), QuickCheck: policy.QuickCheck, QuickChecks: policy.QuickChecks,
 		Effort: cmp.Or(conv.Effort, agent.Effort), // the chat's own choice, else its agent's
 	}
@@ -1376,7 +1382,10 @@ func HistoryFor(msgs []storage.Message, self string) []HistoryItem {
 	return out
 }
 
-func systemPrompt(project storage.Repo, agent storage.Agent, officeTools bool, acc perm.Access, pl place, lang Language) string {
+// on: the prompt keywords (promptKeywords): lines about git, operations or
+// build/test are there only for a project that has them; the tools stay for
+// when the person asks.
+func systemPrompt(project storage.Repo, agent storage.Agent, officeTools bool, on map[string]bool, acc perm.Access, pl place, lang Language) string {
 	level := acc.Level
 	var b strings.Builder
 	b.WriteString(prompts.Render("chat/intro", map[string]any{"Name": agent.Name, "Role": agent.Role}) + "\n\n")
@@ -1397,13 +1406,13 @@ func systemPrompt(project storage.Repo, agent storage.Agent, officeTools bool, a
 	b.WriteString("\n" + prompts.Text("chat/rules") + "\n")
 	b.WriteString(lang.Rule())
 	if officeTools {
-		b.WriteString(prompts.Text("chat/office-tools") + "\n")
+		b.WriteString(prompts.Render("chat/office-tools", map[string]any{"On": on}) + "\n")
 	}
 	fmt.Fprintf(&b, "- Your permission this turn: %s (%s).\n", perm.Label(level), perm.All[perm.Rank(level)].Description)
 	auto := acc.Can(perm.CapApply)
 	if pl.write {
 		if pl.tree != "" {
-			b.WriteString(prompts.Render("chat/edit-worktree", map[string]any{"AutoApply": auto, "OfficeTools": officeTools, "Commands": acc.Commands}) + "\n")
+			b.WriteString(prompts.Render("chat/edit-worktree", map[string]any{"AutoApply": auto, "OfficeTools": officeTools, "On": on, "Commands": acc.Commands}) + "\n")
 		} else {
 			b.WriteString(prompts.Text("chat/edit-direct") + "\n")
 		}
@@ -1416,7 +1425,7 @@ func systemPrompt(project storage.Repo, agent storage.Agent, officeTools bool, a
 				may = append(may, c.Label)
 			}
 		}
-		b.WriteString(prompts.Render("chat/diff", map[string]any{"AutoApply": auto, "OfficeTools": officeTools, "Commands": acc.Commands, "May": may}) + "\n")
+		b.WriteString(prompts.Render("chat/diff", map[string]any{"AutoApply": auto, "OfficeTools": officeTools, "On": on, "Commands": acc.Commands, "May": may}) + "\n")
 	} else {
 		var safe []string
 		if officeTools {
@@ -1463,7 +1472,7 @@ func (e *Engine) Invoke(ctx context.Context, project storage.Repo, agent storage
 	}
 	req := RunRequest{WorkDir: pl.dir, Prompt: prompt, Effort: agent.Effort,
 		Attachments: files, Write: pl.write, DenyPaths: policy.DenyPaths, UserMCP: acc.Can(perm.CapUserMCP), QuickCheck: policy.QuickCheck, QuickChecks: policy.QuickChecks}
-	req.System = systemPrompt(project, agent, e.office != nil, acc, pl, LoadLanguage(ctx, e.store))
+	req.System = systemPrompt(project, agent, e.office != nil, promptKeywords(ctx, e.store, project.ID, policy), acc, pl, LoadLanguage(ctx, e.store))
 	if noTools(ctx) { // untrusted text (a channel's scope filter): a plain answer
 		req.NoTools, req.UserMCP, req.Write, req.Effort = true, false, false, "" // a YES/NO needs no deep thought
 	} else {
@@ -1584,14 +1593,14 @@ func (e *Engine) History(ctx context.Context, conversationID string) ([]MessageD
 
 // DecidePatch applies (approve) or rejects a proposed change.
 func (e *Engine) DecidePatch(ctx context.Context, patchID string, approve bool) (PatchDTO, error) {
-	if _, busy := e.deciding.LoadOrStore(patchID, struct{}{}); busy { // the dashboard and a bot at once
+	if !deciding.Begin("patches", patchID, actor.From(ctx)) { // the dashboard and a bot at once
 		p, err := e.store.Chat().GetPatch(ctx, patchID)
 		if err != nil {
 			return PatchDTO{}, err
 		}
 		return toPatchDTO(p), ErrDecided
 	}
-	defer e.deciding.Delete(patchID)
+	defer deciding.End("patches", patchID)
 	p, err := e.store.Chat().GetPatch(ctx, patchID)
 	if err != nil {
 		return PatchDTO{}, err

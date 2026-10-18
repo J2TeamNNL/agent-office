@@ -199,6 +199,33 @@ func TestRender(t *testing.T) {
 	}
 }
 
+func TestSeedBuiltinSkillsDoesNotOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	l := Library{Dir: dir, Trash: filepath.Join(dir, "trash")}
+	n, err := l.SeedBuiltinSkills()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("seeded %d skills, want 5", n)
+	}
+	items, err := l.List("skill")
+	if err != nil || len(items) != 5 {
+		t.Fatalf("library skills: %d, %v", len(items), err)
+	}
+	custom := filepath.Join(dir, "skills", "research-brief", "SKILL.md")
+	if err := os.WriteFile(custom, []byte("custom\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := l.SeedBuiltinSkills(); err != nil || n != 0 {
+		t.Fatalf("second seed: n=%d err=%v", n, err)
+	}
+	raw, err := os.ReadFile(custom)
+	if err != nil || string(raw) != "custom\n" {
+		t.Fatalf("custom skill overwritten: %q, %v", raw, err)
+	}
+}
+
 func TestRegistrySearch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("search") != "git" {
@@ -259,6 +286,78 @@ func TestSkillCall(t *testing.T) {
 	}
 	if p, s, _ := ExpandSkillCall(home, proj, "plain text"); s != nil || p != "plain text" {
 		t.Fatal(p)
+	}
+}
+
+// Custom commands (.claude/commands/**/*.md) are called with "/" like skills;
+// a skill of the same name wins.
+func TestCommandCall(t *testing.T) {
+	home, proj := fixture(t)
+	write(t, filepath.Join(proj, ".claude/commands/fix.md"), "---\ndescription: Fix an issue\n---\nFix issue $1 then $ARGUMENTS")
+	write(t, filepath.Join(proj, ".claude/commands/fe/build.md"), "# Build the frontend\nrun it")
+	write(t, filepath.Join(home, ".claude/commands/review.md"), "shadowed by the skill")
+	write(t, filepath.Join(home, ".claude/plugins/cache/mk/plug/1.0/commands/go.md"), "go")
+	got := map[string]SkillRef{}
+	for _, s := range ProjectSkills(home, proj) {
+		got[s.Name] = s
+	}
+	if c := got["fix"]; c.Kind != "command" || c.Source != "project" || c.Description != "Fix an issue" {
+		t.Fatal(c)
+	}
+	if c := got["fe:build"]; c.Description != "Build the frontend" {
+		t.Fatal(c)
+	}
+	write(t, filepath.Join(home, ".claude/skills/synced/bucket/pdf/SKILL.md"), "---\ndescription: org skill\n---\n")
+	write(t, filepath.Join(home, ".claude/plugins/synced/bucket/cowork~g2/skills/make/SKILL.md"), "---\ndescription: synced plugin\n---\n")
+	got = map[string]SkillRef{}
+	for _, s := range ProjectSkills(home, proj) {
+		got[s.Name] = s
+	}
+	if got["anthropic-skills:pdf"].Description != "org skill" || got["cowork:make"].Source != "plugin" {
+		t.Fatal(got)
+	}
+	if got["review"].Kind != "skill" || got["plug:go"].Source != "plugin" {
+		t.Fatal(got)
+	}
+	p, s, err := ExpandSkillCall(home, proj, "/fix 42 fast")
+	if err != nil || s.Kind != "command" || s.Tool != "claude" || !strings.Contains(p, "Fix issue 42 then 42 fast") {
+		t.Fatal(p, err)
+	}
+}
+
+// Skills and commands of the other CLIs office runs: Codex, Gemini CLI,
+// Antigravity.
+func TestOtherToolsSkills(t *testing.T) {
+	home, proj := fixture(t)
+	write(t, filepath.Join(home, ".codex/skills/cx/SKILL.md"), "---\ndescription: codex skill\n---\n")
+	write(t, filepath.Join(home, ".codex/skills/.system/imagegen/SKILL.md"), "---\ndescription: sys\n---\n")
+	write(t, filepath.Join(home, ".codex/prompts/draft.md"), "Draft $1")
+	write(t, filepath.Join(home, ".codex/plugins/cache/oa/sites/1.0/skills/site/SKILL.md"), "---\ndescription: p\n---\n")
+	write(t, filepath.Join(proj, ".agents/skills/shared/SKILL.md"), "---\ndescription: agents\n---\n")
+	write(t, filepath.Join(proj, ".gemini/commands/git/msg.toml"), "description = \"Write a \\\"commit\\\" message\"\nprompt = \"\"\"\nWrite one for {{args}}\n\"\"\"\n")
+	write(t, filepath.Join(home, ".gemini/extensions/ext/commands/hi.toml"), "prompt = 'Say hi'")
+	write(t, filepath.Join(proj, ".agent/workflows/ship.md"), "---\ndescription: ship it\n---\nShip")
+	got := map[string]SkillRef{}
+	for _, s := range ProjectSkills(home, proj) {
+		got[s.Name] = s
+	}
+	for name, want := range map[string]string{
+		"cx": "codex/user/skill", "imagegen": "codex/user/skill", "prompts:draft": "codex/user/command", "sites:site": "codex/plugin/skill",
+		"shared": "codex/project/skill", "git:msg": "gemini/project/command", "hi": "gemini/plugin/command", "ship": "antigravity/project/command",
+	} {
+		if g := got[name]; g.Tool+"/"+g.Source+"/"+g.Kind != want {
+			t.Errorf("%s: %+v, want %s", name, g, want)
+		}
+	}
+	if d := got["git:msg"].Description; d != `Write a "commit" message` {
+		t.Errorf("toml description %q", d)
+	}
+	if d := got["hi"].Description; d != "Say hi" {
+		t.Errorf("toml prompt as description %q", d)
+	}
+	p, _, err := ExpandSkillCall(home, proj, "/git:msg the fix")
+	if err != nil || !strings.Contains(p, "Write one for the fix") {
+		t.Fatal(p, err)
 	}
 }
 
@@ -426,5 +525,39 @@ func TestRemoveMCPBacksUpClaudeJSON(t *testing.T) {
 				t.Fatalf("calls = %v, want a single remove", lines)
 			}
 		})
+	}
+}
+
+func TestAutomationPresetLibrary(t *testing.T) {
+	dir := t.TempDir()
+	library := Library{Dir: filepath.Join(dir, "library"), Trash: filepath.Join(dir, "trash")}
+	preset := AutomationPreset{
+		Name: "Weekly report", Description: "Summarize project status", Category: "Operations",
+		Prompt: "Review {{payload}} and prepare a detailed report.", Source: "schedule",
+	}
+	if err := library.SaveAutomationPreset("weekly-report", preset); err != nil {
+		t.Fatal(err)
+	}
+	got, err := library.Get("template", "weekly-report")
+	if err != nil || got.Automation == nil || got.Automation.Key != "weekly-report" || got.Automation.Prompt != preset.Prompt {
+		t.Fatalf("Get = %#v, %v", got, err)
+	}
+	items, err := library.List("template")
+	if err != nil || len(items) != 1 || items[0].Automation == nil {
+		t.Fatalf("List = %#v, %v", items, err)
+	}
+	if err := library.SaveAutomationPreset("bad key", preset); !errors.Is(err, ErrBadName) {
+		t.Fatalf("invalid key error = %v", err)
+	}
+	invalid := preset
+	invalid.Prompt = "  "
+	if err := library.SaveAutomationPreset("empty-prompt", invalid); err == nil {
+		t.Fatal("empty prompt should be rejected")
+	}
+	if err := library.Delete("template", "weekly-report"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := library.Get("template", "weekly-report"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after delete = %v", err)
 	}
 }

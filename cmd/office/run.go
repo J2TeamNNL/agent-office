@@ -11,6 +11,7 @@ import (
 	"github.com/tung1998/agent-office/internal/burn"
 	"github.com/tung1998/agent-office/internal/channels"
 	"github.com/tung1998/agent-office/internal/cleanup"
+	"github.com/tung1998/agent-office/internal/deciding"
 	"github.com/tung1998/agent-office/internal/events"
 	"github.com/tung1998/agent-office/internal/home"
 	"github.com/tung1998/agent-office/internal/limitalert"
@@ -94,6 +95,8 @@ func serveCmd() *cobra.Command {
 				sq.OnWrite(liveBus.Wrote)
 				sq.OnChat(liveBus.Chat) // a message or chat, pushed with its data (ADR-078)
 			}
+			// a proposal starting or ending its decision: cards and "Cần xử lý" show it at once
+			deciding.OnChange(liveBus.Wrote)
 
 			proxies, err := parsePrefixes(trustedProxies)
 			if err != nil {
@@ -356,10 +359,14 @@ func newAutomation(a *app, h home.Home) *automation.Service {
 	}
 	trash := filepath.Join(h.Dir, "trash")
 	claude := func() string { return a.cli.LookPath("claude") }
+	lib := automation.Library{Dir: filepath.Join(h.Dir, "library"), Trash: trash}
+	if _, err := lib.SeedBuiltinSkills(); err != nil {
+		fmt.Fprintf(os.Stderr, "office: không chép được skill có sẵn vào thư viện: %v\n", err)
+	}
 	return &automation.Service{
 		Health:    &automation.MCPHealth{Home: userHome, Claude: claude},
 		Home:      userHome,
-		Library:   automation.Library{Dir: filepath.Join(h.Dir, "library"), Trash: trash},
+		Library:   lib,
 		Installer: automation.Installer{Home: userHome, Trash: trash, Claude: claude},
 		Projects: func(ctx context.Context) map[string]string {
 			out := map[string]string{}

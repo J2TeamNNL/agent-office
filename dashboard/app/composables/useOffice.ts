@@ -189,8 +189,16 @@ export interface Project {
   exists: boolean
   agent_count: number // 0: no agent yet (pick a starter pack)
   default_agent_id: string // answers when nobody is named
+  features?: FeatureId[] // features on (feature packs)
   agents?: Agent[]
   created_at: string
+}
+
+// the features of the packs (internal/features): a typo in a gate fails typecheck
+export type FeatureId = 'git' | 'ops'
+// hasFeature: a feature of the project's packs is on (unknown: on)
+export function hasFeature(p: Pick<Project, 'features'> | undefined, f: FeatureId): boolean {
+  return !p?.features || p.features.includes(f)
 }
 
 // Getter-backed records re-evaluate the translation at every access.
