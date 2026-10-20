@@ -17,6 +17,7 @@ import (
 
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/mcpserver"
+	"github.com/tung1998/agent-office/internal/officetools"
 	"github.com/tung1998/agent-office/internal/proctrack"
 	"github.com/tung1998/agent-office/internal/storage"
 )
@@ -47,6 +48,9 @@ func codexMCPArgs(req RunRequest) []string {
 		}
 	}
 	add(mcpserver.ServerName, req.Office.MCPURL, false)
+	if req.Office.Other {
+		add(officetools.OtherServer, req.Office.MCPURL+mcpserver.OtherPath, false)
+	}
 	for _, n := range req.Office.Gateway {
 		add(n, req.Office.MCPURL+"/s/"+n, true)
 	}
