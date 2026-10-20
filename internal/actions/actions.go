@@ -19,6 +19,7 @@ import (
 	"github.com/tung1998/agent-office/internal/deciding"
 	"github.com/tung1998/agent-office/internal/gitops"
 	"github.com/tung1998/agent-office/internal/ops"
+	"github.com/tung1998/agent-office/internal/peer"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/storage"
 )
@@ -144,7 +145,11 @@ type Service struct {
 	direct AutoApprover
 	mcp    MCPCaller
 	sender Sender
+	peers  *peer.Service // other offices' linked projects (ADR-167; nil = none)
 }
+
+// SetPeers lets send_message reach linked projects in other offices.
+func (s *Service) SetPeers(p *peer.Service) { s.peers = p }
 
 // AutoApprover says whether the chat an action comes from approves it at once
 // (a bot's chat in direct mode), and in whose name.
@@ -733,6 +738,18 @@ func (s *Service) checkSend(ctx context.Context, sc Scope, a *storage.Action) er
 	if strings.TrimSpace(a.Args.Message) == "" {
 		return errors.New("thiếu nội dung tin nhắn")
 	}
+	if l, ok := s.peerLink(ctx, a); ok { // a linked project in another office (ADR-167): it checks the chat
+		a.Args.Peer, a.Args.Project = l.Peer.ID, l.Project.ID
+		id := chatRef(a.Target)
+		if strings.Contains(id, "/") { // a link to the project, not one of its chats: a new chat
+			id = ""
+		}
+		a.Target, a.TargetID = l.Label()+" · chat mới", ""
+		if id != "" {
+			a.Target, a.TargetID = l.Label()+" · "+id, id
+		}
+		return nil
+	}
 	if a.Args.Project != "" { // a linked project's: id or name
 		p, err := perm.LinkedProject(ctx, s.store, a.ProjectID, a.Args.Project)
 		if err != nil {
@@ -744,10 +761,7 @@ func (s *Service) checkSend(ctx context.Context, sc Scope, a *storage.Action) er
 			return nil
 		}
 	}
-	id := a.Target
-	if _, q, ok := strings.Cut(id, "c="); ok { // a link: …?tab=chat&c=<id>&m=…
-		id, _, _ = strings.Cut(q, "&")
-	}
+	id := chatRef(a.Target)
 	c, err := s.store.Chat().GetConversation(ctx, id)
 	if err != nil {
 		return fmt.Errorf("%w: cuộc chat %q", ErrTarget, a.Target)
@@ -770,6 +784,31 @@ func (s *Service) checkSend(ctx context.Context, sc Scope, a *storage.Action) er
 	}
 	a.Target, a.TargetID = firstNonEmpty(c.Title, c.ID), c.ID
 	return nil
+}
+
+// chatRef is the chat id in a target: the id, or a link …?tab=chat&c=<id>&m=….
+func chatRef(target string) string {
+	if _, q, ok := strings.Cut(target, "c="); ok {
+		target, _, _ = strings.Cut(q, "&")
+	}
+	return strings.TrimSpace(target)
+}
+
+// peerLink: the send goes to a linked project in another office, named by
+// Project (when no project of this office matches) or by a link to one of
+// its chats in Target.
+func (s *Service) peerLink(ctx context.Context, a *storage.Action) (peer.Link, bool) {
+	if s.peers == nil {
+		return peer.Link{}, false
+	}
+	if a.Args.Project != "" {
+		if _, err := perm.LinkedProject(ctx, s.store, a.ProjectID, a.Args.Project); err == nil {
+			return peer.Link{}, false
+		}
+		p, rp, err := peer.Resolve(ctx, s.store, s.peers, a.ProjectID, a.Args.Project)
+		return peer.Link{Peer: p, Project: rp}, err == nil
+	}
+	return s.peers.LinkOf(ctx, a.ProjectID, a.Target)
 }
 
 // checkRun checks a run_automation proposal (Target = its id).

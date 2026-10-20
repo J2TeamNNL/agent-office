@@ -29,6 +29,7 @@ import (
 	"github.com/tung1998/agent-office/internal/monitor"
 	"github.com/tung1998/agent-office/internal/officetools"
 	"github.com/tung1998/agent-office/internal/ops"
+	"github.com/tung1998/agent-office/internal/peer"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
@@ -43,12 +44,14 @@ import (
 )
 
 type env struct {
-	srv   *httptest.Server
-	auth  *auth.Service
-	st    storage.Store
-	acts  *actions.Service
-	provs *provider.Service
-	chat  *chat.Engine
+	srv    *httptest.Server
+	auth   *auth.Service
+	st     storage.Store
+	acts   *actions.Service
+	provs  *provider.Service
+	chat   *chat.Engine
+	peers  *peer.Service
+	office *officetools.Toolbox
 }
 
 // idleExec is an automation executor that does nothing (API tests only queue).
@@ -109,7 +112,11 @@ func setupWithStore(t *testing.T, proxies []netip.Prefix, wrap func(storage.Stor
 	office := officetools.New(st, nil, acts)
 	office.SetOffice(func(ctx context.Context) string { return assistant.ID(ctx, st) })
 	mcp := mcpserver.New(office, "test")
-	h := api.New(api.Config{Store: st, Auth: svc, AllowedOrigins: []string{"http://localhost:3000"}, TrustedProxies: proxies,
+	peers := peer.New(st, box)
+	acts.SetPeers(peers)
+	chatEng.SetPeers(peers)
+	office.SetPeers(peers)
+	h := api.New(api.Config{Peers: peers, Store: st, Auth: svc, AllowedOrigins: []string{"http://localhost:3000"}, TrustedProxies: proxies,
 		Providers: provs, Team: org, Setup: officesetup.New(st, provs, org), Transfer: transfer.New(st, provs, org, wfs.Lib), Workflows: wfs, Usage: u, CLITools: cliManager(), Chat: chatEng,
 		Trigger: trigger.New(st, idleExec{}), Actions: acts, Office: office, MCP: mcp, Memory: mem, Events: bus, Automation: testAutomation(t, st),
 		Monitors: monitor.New(st, nil, chatEng), Ops: ops.NewManager(st, t.TempDir(), []string{}),
@@ -123,7 +130,7 @@ func setupWithStore(t *testing.T, proxies []netip.Prefix, wrap func(storage.Stor
 	if _, err := svc.CreateUser(ctx, auth.NewUser{Email: "member@x.io", Role: storage.RoleMember, Password: "member-password"}, "system"); err != nil {
 		t.Fatal(err)
 	}
-	return &env{srv: srv, auth: svc, st: st, acts: acts, provs: provs, chat: chatEng}
+	return &env{srv: srv, auth: svc, st: st, acts: acts, provs: provs, chat: chatEng, peers: peers, office: office}
 }
 
 // testIdentify says who calls the gateway from the token's scope, the way
