@@ -27,6 +27,7 @@ import (
 
 	"github.com/tung1998/agent-office/internal/ids"
 	"github.com/tung1998/agent-office/internal/perm"
+	"github.com/tung1998/agent-office/internal/repos"
 	"github.com/tung1998/agent-office/internal/secrets"
 	"github.com/tung1998/agent-office/internal/storage"
 )
@@ -45,6 +46,7 @@ type RemoteProject struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	Repo        string `json:"repo,omitempty"` // its git remote, with no credentials
 }
 
 // Peer is another office this one is paired with.
@@ -232,7 +234,7 @@ func (s *Service) SharedProjects(ctx context.Context, p Peer) []RemoteProject {
 	out := []RemoteProject{}
 	for _, id := range p.Shared {
 		if r, err := s.st.Repos().Get(ctx, id); err == nil {
-			out = append(out, RemoteProject{ID: r.ID, Name: r.Name, Description: oneLine(r.Description, 300)})
+			out = append(out, RemoteProject{ID: r.ID, Name: r.Name, Description: oneLine(r.Description, 300), Repo: PublicRemote(repos.Remote(r.Path, r.GitRemote))})
 		}
 	}
 	return out
@@ -258,7 +260,7 @@ func cleanRemote(projects []RemoteProject) []RemoteProject {
 	out := []RemoteProject{}
 	for _, r := range projects[:min(len(projects), 200)] {
 		if r.ID = strings.TrimSpace(r.ID); r.ID != "" && !strings.ContainsAny(r.ID, "/?#& ") {
-			out = append(out, RemoteProject{ID: r.ID, Name: oneLine(cmp.Or(r.Name, r.ID), 80), Description: oneLine(r.Description, 300)})
+			out = append(out, RemoteProject{ID: r.ID, Name: oneLine(cmp.Or(r.Name, r.ID), 80), Description: oneLine(r.Description, 300), Repo: PublicRemote(r.Repo)})
 		}
 	}
 	return out
@@ -525,6 +527,48 @@ func (s *Service) ReadChat(ctx context.Context, id, project, chat, message strin
 	return out.Text, out.Project, err
 }
 
+// FetchPack asks office id for a pack (.zip, ADR-170) of its project, with
+// include; at most max bytes.
+func (s *Service) FetchPack(ctx context.Context, id, project string, include []string, max int64) ([]byte, error) {
+	p, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, errors.New("office liên kết không còn (đã gỡ ghép nối?)")
+	}
+	key, err := s.box.Open(p.OutKeyEnc)
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{"include": {strings.Join(include, ",")}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.URL+"/api/peer/projects/"+url.PathEscape(project)+"/pack?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	res, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("không gọi được office bên kia: %w", err)
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(res.Body, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode == http.StatusNotFound && !strings.Contains(string(raw), "error") {
+		return nil, errors.New("office bên kia chưa có xuất project (cần cập nhật office đó)")
+	}
+	if res.StatusCode/100 != 2 {
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &e)
+		return nil, fmt.Errorf("office bên kia từ chối (%d): %s", res.StatusCode, cmp.Or(e.Error, http.StatusText(res.StatusCode)))
+	}
+	if int64(len(raw)) > max {
+		return nil, errors.New("gói project quá lớn")
+	}
+	return raw, nil
+}
+
 // LinkOf finds, among the projects in other offices projectID links to, the
 // one a dashboard link of the other office points into.
 func (s *Service) LinkOf(ctx context.Context, projectID, link string) (Link, bool) {
@@ -695,6 +739,34 @@ func randomHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// PublicRemote is a git remote fit to show another office: a URL with no
+// user, password or query, or scp-like user@host:path; "" otherwise.
+func PublicRemote(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > 300 || strings.ContainsAny(s, " \t\n\r") {
+		return ""
+	}
+	if strings.Contains(s, "://") {
+		u, err := url.Parse(s)
+		if err != nil || u.Host == "" || !slices.Contains([]string{"https", "http", "ssh", "git"}, u.Scheme) {
+			return ""
+		}
+		if u.Scheme == "ssh" && u.User != nil {
+			u.User = url.User(u.User.Username()) // ssh://git@host: the user is no secret
+		} else {
+			u.User = nil
+		}
+		u.RawQuery, u.Fragment = "", ""
+		return u.String()
+	}
+	// scp-like: [user@]host:path, never a local path
+	host, path, ok := strings.Cut(s, ":")
+	if !ok || path == "" || strings.HasPrefix(s, "/") || strings.ContainsAny(host, "/\\") || strings.Count(s, "@") > 1 || strings.ContainsAny(path, "@\\") {
+		return ""
+	}
+	return s
 }
 
 func oneLine(s string, max int) string {

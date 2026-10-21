@@ -20,6 +20,7 @@ import (
 	"github.com/tung1998/agent-office/internal/ops"
 	"github.com/tung1998/agent-office/internal/peer"
 	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/transfer"
 )
 
 // Tool is one callable tool.
@@ -49,6 +50,33 @@ type Toolbox struct {
 	wf Workflows
 	// peers: linked projects in other offices (ADR-167; nil = none)
 	peers *peer.Service
+	// transfer and home: create, export and import projects (ADR-170; nil = none)
+	transfer *transfer.Service
+	home     string
+	// providers: feature packs' tools (support, ADR-171)
+	providers []Provider
+}
+
+// Provider is a feature pack's tools (support, ADR-171): Tools lists none
+// for a project without the pack on, so with it off nothing changes.
+type Provider interface {
+	Tools(sc Scope) []Tool
+	Call(ctx context.Context, sc Scope, name string, raw json.RawMessage) (string, bool)
+}
+
+// AddProvider adds a feature pack's tools.
+func (t *Toolbox) AddProvider(p Provider) { t.providers = append(t.providers, p) }
+
+// provider: the pack whose tool name is, for sc.
+func (t *Toolbox) provider(sc Scope, name string) Provider {
+	for _, p := range t.providers {
+		for _, x := range p.Tools(sc) {
+			if x.Name == name {
+				return p
+			}
+		}
+	}
+	return nil
 }
 
 // SetPeers gives the MCP other_office (ADR-169) the paired offices.
@@ -343,6 +371,15 @@ func (t *Toolbox) ToolsFor(sc Scope) []Tool {
 		}
 		out = append(out, x)
 	}
+	if !sc.Office {
+		for _, p := range t.providers {
+			for _, x := range p.Tools(sc) {
+				if !sc.AnswerOnly || !proposes(x.Name) {
+					out = append(out, x)
+				}
+			}
+		}
+	}
 	if sc.Office { // the office assistant (ADR-046)
 		for _, x := range t.officeTools() {
 			if !sc.AnswerOnly || !proposes(x.Name) {
@@ -356,7 +393,7 @@ func (t *Toolbox) ToolsFor(sc Scope) []Tool {
 // proposes: a tool that proposes a change or runs something (none for an
 // assistant that only answers).
 func proposes(name string) bool {
-	return strings.HasPrefix(name, "propose") || name == "run_automation" || name == "send_to_chat" || name == "run_workflow"
+	return strings.HasPrefix(name, "propose") || name == "export_project" || name == "run_automation" || name == "send_to_chat" || name == "run_workflow"
 }
 
 // Has reports whether name is one of the tools.
@@ -371,6 +408,9 @@ func (t *Toolbox) Has(sc Scope, name string) bool {
 
 // Call runs a tool for a project and returns text (and whether it failed).
 func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawMessage) (string, bool) {
+	if p := t.provider(sc, name); p != nil && !sc.Office {
+		return p.Call(ctx, sc, name, raw)
+	}
 	projectID := sc.ProjectID
 	var in struct {
 		Project  string          `json:"project"`

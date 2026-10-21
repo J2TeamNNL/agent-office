@@ -45,7 +45,20 @@ var Kinds = map[string]string{
 	"mcp_call":          "Gọi tool MCP",
 	"send_message":      "Gửi tin sang chat khác",
 	"workflow_gate":     "Duyệt cổng quy trình",
+	"create_project":    "Tạo project",
+	"import_project":    "Nhập project",
+	"data_delete":       "Xóa bản ghi dữ liệu",
 }
+
+// Projects makes the projects the office assistant proposes (ADR-170).
+type Projects interface {
+	// CheckNewProject checks np (and fills it from its pack) before a person decides.
+	CheckNewProject(ctx context.Context, np *storage.NewProject) error
+	CreateProject(ctx context.Context, np storage.NewProject) (storage.Repo, error)
+}
+
+// SetProjects lets the office assistant propose new projects.
+func (s *Service) SetProjects(p Projects) { s.projects = p }
 
 // Sender sends a message to another chat in the name of the person whose
 // run proposed it (the chat engine, send_to_chat).
@@ -138,15 +151,16 @@ type Scope struct {
 
 // Service proposes and decides actions.
 type Service struct {
-	store  storage.Store
-	ops    *ops.Manager
-	config ConfigApplier
-	runner Runner
-	memory Memory
-	direct AutoApprover
-	mcp    MCPCaller
-	sender Sender
-	peers  *peer.Service // other offices' linked projects (ADR-167; nil = none)
+	store    storage.Store
+	ops      *ops.Manager
+	config   ConfigApplier
+	runner   Runner
+	memory   Memory
+	direct   AutoApprover
+	mcp      MCPCaller
+	sender   Sender
+	peers    *peer.Service // other offices' linked projects (ADR-167; nil = none)
+	projects Projects
 }
 
 // SetPeers lets send_message reach linked projects in other offices.
@@ -208,10 +222,39 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 		if sc.ConversationID == "" || a.Target == "" || a.Reason == "" {
 			return a, errors.New("cổng quy trình cần cuộc chat, tên cổng và điều cần duyệt")
 		}
+	} else if kind == "create_project" || kind == "import_project" { // only the office assistant (ADR-170)
+		if !sc.Office || s.projects == nil || a.Args.NewProject == nil {
+			return a, errors.New("chỉ trợ lý office tạo hay nhập project")
+		}
+		if (kind == "import_project") != (a.Args.NewProject.Pack != "") {
+			return a, errors.New("nhập project cần gói project (pack); tạo project thì không")
+		}
+		if err := s.projects.CheckNewProject(ctx, a.Args.NewProject); err != nil {
+			return a, err
+		}
+		np := a.Args.NewProject
+		a.Target = strings.TrimSpace(np.Name)
+		if from := firstNonEmpty(np.URL, np.Path); from != "" {
+			a.Target = strings.TrimSpace(a.Target + " ← " + from)
+		}
 	} else if kind == "send_message" { // Target: the chat it goes to, Args.Message: what it says
 		if err := s.checkSend(ctx, sc, &a); err != nil {
 			return a, err
 		}
+	} else if kind == "data_delete" { // a person always decides; the record's history keeps it
+		r := a.Args.Record
+		if r == nil || r.Collection == "" || r.ID == "" {
+			return a, errors.New("cần collection và id của bản ghi")
+		}
+		c, err := s.store.Collections().Get(ctx, sc.ProjectID, r.Collection)
+		if err != nil {
+			return a, fmt.Errorf("không có collection %q", r.Collection)
+		}
+		x, err := s.store.Collections().Record(ctx, c.ID, r.ID)
+		if err != nil {
+			return a, fmt.Errorf("không có bản ghi %q trong %q", r.ID, r.Collection)
+		}
+		a.Target, a.TargetID = recordLabel(c, x), x.ID
 	} else if kind == "run_automation" { // costs tokens: a person always decides
 		if s.runner == nil {
 			return a, errors.New("không giao việc được ở đây")
@@ -358,6 +401,10 @@ func (s *Service) autoAllowed(ctx context.Context, a storage.Action, acc perm.Ac
 		return false // the gateway already let through what the agent may call itself
 	case "workflow_gate":
 		return false // the point of the gate: a person decides
+	case "create_project", "import_project":
+		return false // a new folder and project on the machine: a person decides
+	case "data_delete":
+		return false // a person decides
 	case "send_message": // never on and on: what a relayed message started asks a person
 		if s.sender == nil {
 			return false
@@ -680,6 +727,24 @@ func (s *Service) run(ctx context.Context, a storage.Action) error {
 		_, err := s.runner.RunAutomation(ctx, a.TargetID)
 		return err
 	}
+	if a.Kind == "create_project" || a.Kind == "import_project" {
+		if s.projects == nil || a.Args.NewProject == nil {
+			return errors.New("không tạo project được ở đây")
+		}
+		_, err := s.projects.CreateProject(ctx, *a.Args.NewProject)
+		return err
+	}
+	if a.Kind == "data_delete" {
+		c, err := s.store.Collections().Get(ctx, a.ProjectID, a.Args.Record.Collection)
+		if err != nil {
+			return err
+		}
+		x, err := s.store.Collections().Record(ctx, c.ID, a.Args.Record.ID)
+		if err != nil {
+			return err
+		}
+		return s.store.Collections().Delete(ctx, x, "agent:"+a.ProposedBy)
+	}
 	if a.Kind == "config_change" {
 		if s.config == nil {
 			return errors.New("không đổi được cài đặt ở đây")
@@ -883,4 +948,17 @@ func (s *Service) unmerged(ctx context.Context, conversationID string) bool {
 		}
 	}
 	return false
+}
+
+// recordLabel: a record as a card shows it (its collection, its first text field).
+func recordLabel(c storage.Collection, x storage.Record) string {
+	for _, f := range c.Fields {
+		if v, ok := x.Data[f.Name].(string); ok && v != "" {
+			if r := []rune(v); len(r) > 60 {
+				v = string(r[:60]) + "…"
+			}
+			return c.Name + ": " + v
+		}
+	}
+	return c.Name + ": " + x.ID
 }

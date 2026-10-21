@@ -44,8 +44,10 @@ import (
 	"github.com/tung1998/agent-office/internal/auth"
 	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/clitools"
+	"github.com/tung1998/agent-office/internal/collections"
 	"github.com/tung1998/agent-office/internal/setup"
 	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/support"
 	"github.com/tung1998/agent-office/internal/transfer"
 )
 
@@ -158,6 +160,13 @@ func serveCmd() *cobra.Command {
 			chatEngine.SetQueueRunner(chatDecider{store: a.store, chat: chatEngine, acts: acts}.RunQueued)
 			office := officetools.New(a.store, procs, acts)
 			office.SetPeers(peers) // read_link/search_history in other offices
+			// the office assistant creates, exports and imports projects (ADR-170)
+			transfers := transfer.New(a.store, a.providers, a.team, a.workflows.Lib)
+			if h.ProjectRoot != "" {
+				transfers.SetCloneRoot(filepath.Dir(h.ProjectRoot)) // as the dashboard clones
+			}
+			acts.SetProjects(transfers)
+			office.SetProjects(transfers, h.Dir)
 			mcp := mcpserver.New(office, version)
 			chatEngine.SetOffice(office, mcp, "http://"+loopback(addr)+"/mcp")
 			monitors := monitor.New(a.store, procs, chatEngine)
@@ -186,6 +195,19 @@ func serveCmd() *cobra.Command {
 				}
 				return &channels.Telegram{Token: token}, nil
 			})
+			// the support pack (ADR-171): its points do nothing where it is off
+			supportPack := support.New(a.store)
+			supportPack.SetRunner(runner)
+			supportPack.SetBox(a.providers.Box()) // Crisp keys, SMTP passwords, hook secrets
+			supportPack.SetBotSender(func(ctx context.Context, channelID, chatID, text string) error {
+				return bots.NotifyConversation(ctx, channelID, chatID, text, "")
+			})
+			go supportPack.Run(ctx)            // replies and hooks out, SLAs, playbooks
+			runner.AddOnDone(supportPack.Done) // a customer message's answer
+			support.Who = api.Actor
+			bots.SetTap(supportPack)
+			office.AddProvider(supportPack)
+			office.AddProvider(collections.NewTools(collections.New(a.store), acts)) // data_* (ADR-172); a delete is a card
 			runner.SetOnReply(bots.Reply)
 			runner.SetOnProgress(bots.Progress)
 			acts.SetAutoApprover(bots.DirectApprover) // a chat in direct mode: approved in the turn, the agent goes on
@@ -255,10 +277,11 @@ func serveCmd() *cobra.Command {
 			chatEngine.SetGateway(gatewayFor(a.store, gateway))
 			handler := api.New(api.Config{
 				Office: office, Channels: bots, Memory: mem, Events: liveBus,
+				Packs: []api.PackRoutes{supportPack},
 				Store: st, Auth: a.auth, AllowedOrigins: origins,
 				SecureCookies: secureCookies, TrustedProxies: proxies, Logger: log, Version: version,
 				Providers: a.providers, Team: a.team, Setup: setup.New(a.store, a.providers, a.team),
-				Transfer:   transfer.New(a.store, a.providers, a.team, a.workflows.Lib),
+				Transfer:   transfers,
 				Usage:      a.usage,
 				CLITools:   cliTools,
 				Chat:       chatEngine,

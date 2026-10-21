@@ -14,8 +14,8 @@ const project = computed(() => data.value?.project)
 // the tab lives in the URL so the sidebar can link to each section
 // (older links: tab=config&section=…, tab=tools, tab=channels: bots live in Automations now,
 // tab=model: the agents)
-type Tab = 'chat' | 'tasks' | 'automations' | 'ops' | 'files' | 'agents' | 'workflows' | 'perm' | 'skill' | 'mcp' | 'info' | 'log' | 'burn'
-const tabs: Tab[] = ['chat', 'tasks', 'automations', 'ops', 'files', 'agents', 'workflows', 'perm', 'skill', 'mcp', 'info', 'log', 'burn']
+type Tab = 'chat' | 'tasks' | 'support' | 'automations' | 'ops' | 'files' | 'agents' | 'workflows' | 'perm' | 'skill' | 'mcp' | 'info' | 'log' | 'burn'
+const tabs: Tab[] = ['chat', 'tasks', 'support', 'automations', 'ops', 'files', 'agents', 'workflows', 'perm', 'skill', 'mcp', 'info', 'log', 'burn']
 const aliases: Record<string, Tab> = { tools: 'skill', channels: 'automations', model: 'agents' }
 
 // "Hỏi agent" from Vận hành: open Chat with the log attached
@@ -31,6 +31,7 @@ const tab = computed<Tab>({
     const q = aliases[raw] ?? raw
     const found = tabs.find(t => t === q) ?? 'chat'
     if (found === 'ops' && project.value && !hasFeature(project.value, 'ops')) return 'chat' // Vận hành turned off
+    if (found === 'support' && project.value && !hasFeature(project.value, 'support')) return 'chat' // the support pack off
     return (found === 'log' || found === 'files') && !isAdmin.value ? 'chat' : found // the change log and files are for admins
   },
   set: t => navigateTo({ query: { tab: t } }, { replace: true })
@@ -40,9 +41,9 @@ watch(id, v => touch(v), { immediate: true })
 
 // ---- edit project ----
 const editOpen = ref(false)
-const form = reactive({ name: '', description: '' })
+const form = reactive({ name: '', description: '', git_remote: '' })
 function openEdit() {
-  Object.assign(form, { name: project.value!.name, description: project.value!.description })
+  Object.assign(form, { name: project.value!.name, description: project.value!.description, git_remote: project.value!.git_remote })
   editOpen.value = true
 }
 const saving = ref(false)
@@ -81,7 +82,7 @@ async function removeRepo() {
     </template>
 
     <!-- Chat fills the page height (the panel body is a bounded flex column) -->
-    <div v-if="project" :class="((tab === 'chat' || tab === 'tasks') && project.agent_count) || tab === 'files' ? 'flex min-h-0 flex-1 flex-col gap-4' : 'space-y-4'">
+    <div v-if="project" :class="((tab === 'chat' || tab === 'tasks') && project.agent_count) || tab === 'files' || tab === 'support' ? 'flex min-h-0 flex-1 flex-col gap-4' : 'space-y-4'">
       <UAlert v-if="!project.exists" color="error" variant="subtle" icon="i-lucide-folder-x" :title="t('project.notFound')" />
 
 
@@ -90,6 +91,7 @@ async function removeRepo() {
       <Suspense :key="tab">
         <div class="contents">
           <AutomationsPanel v-if="tab === 'automations'" :project-id="project.id" />
+          <SupportPanel v-else-if="tab === 'support'" :project-id="project.id" />
           <BurnPanel v-else-if="tab === 'burn' && isAdmin" :project-id="project.id" />
           <FilesPanel v-else-if="tab === 'files' && isAdmin && project.path" :project-id="project.id" :git="hasFeature(project, 'git')" />
           <AuditLog v-else-if="tab === 'log' && isAdmin" :key="project.id" class="max-w-6xl" :filter="{ project: project.id }" show-filters />
@@ -102,10 +104,8 @@ async function removeRepo() {
                 <span class="text-(--ui-text-muted)">{{ t('project.infoFolder') }}</span>
                 <span v-if="project.scope === 'folder'" class="min-w-0 break-all font-mono text-xs">{{ project.path }}</span>
                 <span v-else>{{ t('project.machineHelper') }}</span>
-                <template v-if="project.git_remote">
-                  <span class="text-(--ui-text-muted)">{{ t('project.infoRemote') }}</span>
-                  <span class="min-w-0 break-all font-mono text-xs">{{ project.git_remote }}</span>
-                </template>
+                <span class="text-(--ui-text-muted)">{{ t('project.infoRemote') }}</span>
+                <span class="min-w-0 break-all font-mono text-xs">{{ project.git_remote || '—' }}</span>
                 <span class="text-(--ui-text-muted)">{{ t('project.infoDescription') }}</span>
                 <p class="whitespace-pre-line text-(--ui-text-toned)">{{ project.description || '—' }}</p>
               </div>
@@ -149,6 +149,7 @@ async function removeRepo() {
         <form id="project-edit" class="space-y-4" @submit.prevent="saveRepo">
           <UFormField :label="t('projects.name')"><UInput v-model="form.name" class="w-full" /></UFormField>
           <UFormField :label="t('project.description')"><UTextarea v-model="form.description" :rows="3" class="w-full" /></UFormField>
+          <UFormField :label="t('project.infoRemote')" :hint="t('project.remoteHint')"><UInput v-model="form.git_remote" placeholder="https://github.com/org/repo.git" class="w-full font-mono" /></UFormField>
         </form>
       </template>
       <template #footer>
