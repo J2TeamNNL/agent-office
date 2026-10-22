@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -30,7 +29,8 @@ type relayInfo struct {
 	Agent          string `json:"relayed_by_agent,omitempty"`
 	Project        string `json:"relayed_from_project,omitempty"` // another project's chat: its name
 	// Hops: relays so far in a chain between linked projects (hand-off,
-	// report back, answer…): past maxRelayHops nothing goes on its own
+	// report back, answer…): with another office, past maxRelayHops nothing
+	// goes on its own
 	Hops      int    `json:"relay_hops,omitempty"`
 	Report    bool   `json:"relay_report,omitempty"`            // the linked chat's agent reporting back
 	ProjectID string `json:"relayed_from_project_id,omitempty"` // its project's id (a link to its chat)
@@ -89,7 +89,7 @@ func (e *Engine) fillRelay(ctx context.Context, r *Relay, names map[string]strin
 	r.Project = cmp.Or(r.Project, names[c.ProjectID])
 }
 
-// maxRelayHops caps a chain between linked projects' chats, like a group
+// maxRelayHops caps a chain with another office's chats, like a group
 // chat's hand-offs with a person around (maxHopsPerson).
 const maxRelayHops = maxHopsPerson
 
@@ -194,21 +194,23 @@ func (e *Engine) Relayed(ctx context.Context, conversationID string) bool {
 	return false
 }
 
-// RelayLimit: the chat's work comes from a chain between linked projects
-// that reached maxRelayHops — sending on waits for a person.
+// RelayLimit: the chat's work comes from a chain with another office that
+// reached maxRelayHops — sending on waits for a person (chains between this
+// office's own projects have no cap).
 func (e *Engine) RelayLimit(ctx context.Context, conversationID string) bool {
 	msgs, err := e.store.Chat().ListMessages(ctx, conversationID)
 	if err != nil {
 		return true
 	}
 	o, _, ok := relayOrigin(msgs)
-	return ok && o.Hops >= maxRelayHops
+	return ok && o.Peer != "" && o.Hops >= maxRelayHops
 }
 
 // reportBack: an agent answered in a chat a linked project's agent opened or
 // sent to (send_to_chat): its answer goes back to that chat in the person's
 // name, and the agent there goes on from it (answers what it can, asks the
-// person the rest). Only up to maxRelayHops in a chain.
+// person the rest). No cap between this office's projects: the agents stop
+// when they have nothing to add.
 func (e *Engine) reportBack(conv storage.Conversation, project storage.Repo, agent storage.Agent, reply string) {
 	if strings.TrimSpace(reply) == "" {
 		return
@@ -232,23 +234,18 @@ func (e *Engine) reportBack(conv storage.Conversation, project storage.Repo, age
 	if err != nil || src.Cleaned != "" {
 		return
 	}
-	if origin.Hops >= maxRelayHops {
-		e.note(conv, fmt.Sprintf("Không tự báo lại chat %q nữa: đã quá %d lượt qua lại giữa hai project. Hãy xem và trả lời trực tiếp.", cmp.Or(src.Title, src.ID), maxRelayHops))
-		return
-	}
 	info := relayInfo{ConversationID: conv.ID, Title: conv.Title, Agent: agent.Name, Project: project.Name, Name: project.Name, ProjectID: project.ID, Hops: origin.Hops + 1, Report: true}
 	raw, _ := json.Marshal(info)
 	text := prompts.Render("chat/linked-report", map[string]any{"Project": project.Name, "Agent": agent.Name,
 		"Link": "/projects/" + conv.ProjectID + "?tab=chat&c=" + conv.ID, "Reply": truncate(reply, 8000)})
-	e.deliver(src.ID, as, text, string(raw), func(err error) { e.note(conv, "Không báo lại được chat gốc: "+err.Error()) })
+	e.deliver(actor.With(context.Background(), as), src.ID, text, string(raw), func(err error) { e.note(conv, "Không báo lại được chat gốc: "+err.Error()) })
 }
 
 // deliver sends text into a chat as the person as, in the background: a
 // chat answering now gets it after its answer (up to 10 minutes); failed
 // tells what went wrong (a chat whose agent is off just keeps it).
-func (e *Engine) deliver(conversationID, as, text, context_ string, failed func(error)) {
+func (e *Engine) deliver(ctx context.Context, conversationID, text, context_ string, failed func(error)) {
 	safeGo("relay deliver", func() {
-		ctx := actor.With(context.Background(), as)
 		for try := 0; try < 120; try++ {
 			_, _, err := e.SendWithContext(ctx, conversationID, text, context_, nil)
 			var off *OffError

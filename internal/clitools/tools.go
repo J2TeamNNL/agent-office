@@ -45,14 +45,28 @@ type Tool struct {
 	methods     []Method
 	loginArgv   []string
 	logoutArgv  []string
-	logoutFiles func() []string
+	logoutFiles func(env []string) []string
 	status      func(ctx context.Context, bin string, env []string) Auth
 	// loginEnv / prepareLogin set up a sign-in that is no subcommand of its
 	// own; loginDone ends it once signed in (Gemini's sign-in opens its chat).
 	loginEnv     []string
 	loginTerm    term
-	prepareLogin func() error
+	prepareLogin func(env []string) error
 	loginDone    func(ctx context.Context, bin string, env []string) bool
+	// homeEnv names the variable that moves the tool's config and
+	// credentials to another folder: a second account (ADR-178); share is
+	// what that folder takes from the machine's
+	homeEnv string
+	share   shared
+}
+
+// shared is how a second account's folder shares the machine's setup
+// (ADR-178): links (with every *.md) and copies, never the credentials.
+type shared struct {
+	src    func() string // the machine's folder
+	sub    string        // where in the account's folder the tool looks ("" = the folder)
+	links  []string
+	copies []string // copied once: the account may change its own (Gemini's sign-in method)
 }
 
 // Auth is a tool's sign-in state.
@@ -79,6 +93,11 @@ var tools = []Tool{
 		ID: "claude", Name: "Claude Code", Bin: "claude", DocsURL: "https://code.claude.com/docs/en/setup",
 		LoginCmd: "claude auth login", loginArgv: []string{"claude", "auth", "login"},
 		LogoutCmd: "claude auth logout", logoutArgv: []string{"claude", "auth", "logout"},
+		homeEnv: "CLAUDE_CONFIG_DIR",
+		// the person's setup and the sessions (a turn resumes on another
+		// account), never the .claude.json backups or the organisation's
+		// policy and remote settings
+		share: shared{src: claudeDir, links: []string{"settings.json", "skills", "agents", "commands", "plugins", "hooks", "output-styles", "projects"}},
 		methods: []Method{
 			{ID: "native", Label: "Trình cài chính thức", Command: "curl -fsSL https://claude.ai/install.sh | bash", Requires: "curl", Recommended: true,
 				argv: []string{"/bin/sh", "-c", "curl -fsSL https://claude.ai/install.sh | bash"}},
@@ -93,6 +112,8 @@ var tools = []Tool{
 		ID: "codex", Name: "Codex", Bin: "codex", DocsURL: "https://github.com/openai/codex",
 		LoginCmd: "codex login --device-auth", loginArgv: []string{"codex", "login", "--device-auth"},
 		LogoutCmd: "codex logout", logoutArgv: []string{"codex", "logout"},
+		homeEnv: "CODEX_HOME",
+		share:   shared{src: llm.CodexHome, links: []string{"config.toml", "prompts", "skills", "rules"}},
 		methods: []Method{
 			// like Antigravity: a quarantined cask binary hangs on a Gatekeeper
 			// check when the office (no window) runs it
@@ -108,7 +129,12 @@ var tools = []Tool{
 		// Gemini signs in when it starts; NO_BROWSER prints the URL and asks for the code
 		LoginCmd: "gemini", loginArgv: []string{"gemini"},
 		// no logout subcommand (only /logout inside its chat): drop the Google credentials
-		LogoutCmd: "rm ~/.gemini/oauth_creds.json", logoutFiles: func() []string { return []string{filepath.Join(geminiDir(), "oauth_creds.json")} },
+		LogoutCmd: "rm ~/.gemini/oauth_creds.json", logoutFiles: func(env []string) []string { return []string{filepath.Join(llm.GeminiDir(env), "oauth_creds.json")} },
+		homeEnv: "GEMINI_CLI_HOME",
+		// sessions and the project registry too; settings.json is copied:
+		// it holds the sign-in method
+		share: shared{src: func() string { return llm.GeminiDir(nil) }, sub: ".gemini",
+			links: []string{"extensions", "commands", "skills", "tmp", "history", "projects.json"}, copies: []string{"settings.json"}},
 		loginEnv: []string{"NO_BROWSER=true", "GEMINI_CLI_TRUST_WORKSPACE=true"},
 		methods: []Method{
 			{ID: "npm", Label: "npm (cần Node 20+)", Command: "npm install -g @google/gemini-cli", Requires: "npm", Recommended: true,
@@ -118,7 +144,7 @@ var tools = []Tool{
 		},
 		status:       geminiStatus,
 		prepareLogin: geminiPrepareLogin,
-		loginDone:    func(context.Context, string, []string) bool { return llm.GeminiSignedIn() },
+		loginDone:    func(_ context.Context, _ string, env []string) bool { return llm.GeminiSignedIn(llm.GeminiDir(env)) },
 	},
 	{
 		// Antigravity CLI replaces Gemini CLI for Google accounts (AI Pro/Ultra
@@ -127,7 +153,7 @@ var tools = []Tool{
 		LoginCmd: "agy", loginArgv: []string{"agy"},
 		// no logout subcommand either
 		LogoutCmd: "rm ~/.gemini/antigravity-cli/antigravity-oauth-token",
-		logoutFiles: func() []string {
+		logoutFiles: func([]string) []string {
 			home, _ := os.UserHomeDir()
 			return []string{filepath.Join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")}
 		},
@@ -159,7 +185,7 @@ func antigravityStatus(ctx context.Context, bin string, env []string) Auth {
 
 // geminiStatus: Gemini CLI has no status subcommand; read its credentials.
 func geminiStatus(ctx context.Context, bin string, env []string) Auth {
-	if ok, account := llm.GeminiAccount(); ok {
+	if ok, account := llm.GeminiAccount(llm.GeminiDir(env)); ok {
 		return Auth{LoggedIn: true, Account: account}
 	}
 	return Auth{Detail: "chưa đăng nhập Google hoặc chưa có GEMINI_API_KEY"}
@@ -168,8 +194,8 @@ func geminiStatus(ctx context.Context, bin string, env []string) Auth {
 // geminiPrepareLogin picks "Login with Google" in ~/.gemini/settings.json when
 // no sign-in method is chosen yet, so the CLI goes straight to the URL instead
 // of a menu the dashboard cannot drive.
-func geminiPrepareLogin() error {
-	dir := geminiDir()
+func geminiPrepareLogin(env []string) error {
+	dir := llm.GeminiDir(env)
 	path := filepath.Join(dir, "settings.json")
 	settings := map[string]any{}
 	if raw, err := os.ReadFile(path); err == nil {
@@ -200,13 +226,13 @@ func geminiPrepareLogin() error {
 	return os.WriteFile(path, raw, 0o600)
 }
 
-// geminiDir is Gemini CLI's settings and credentials folder.
-func geminiDir() string {
-	home := os.Getenv("GEMINI_CLI_HOME")
-	if home == "" {
-		home, _ = os.UserHomeDir()
+// claudeDir is the machine's Claude Code config folder.
+func claudeDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return d
 	}
-	return filepath.Join(home, ".gemini")
+	h, _ := os.UserHomeDir()
+	return filepath.Join(h, ".claude")
 }
 
 // claudeStatus reads `claude auth status --json`.
@@ -231,6 +257,7 @@ func claudeStatus(ctx context.Context, bin string, env []string) Auth {
 // codexStatus trusts `codex login status` when it answers; the credentials
 // file is only a fallback for versions without that subcommand.
 func codexStatus(ctx context.Context, bin string, env []string) Auth {
+	home := llm.CodexHomeIn(env)
 	out, err := runOut(ctx, env, bin, "login", "status")
 	text := strings.TrimSpace(out)
 	low := strings.ToLower(text)
@@ -239,25 +266,23 @@ func codexStatus(ctx context.Context, bin string, env []string) Auth {
 		return Auth{LoggedIn: false, Detail: text}
 	case err == nil && strings.Contains(low, "logged in"):
 		// the CLI only checks the file exists: an expired session reads "Logged in" too
-		if expired, detail := llm.CodexSessionExpired(time.Now()); expired {
+		if expired, detail := llm.CodexSessionExpired(home, time.Now()); expired {
 			return Auth{LoggedIn: false, Detail: detail}
 		}
 		// nor does it know the server refused the session in a real call
-		if rejected, detail := llm.CodexRejected(); rejected {
+		if rejected, detail := llm.CodexRejected(home); rejected {
 			return Auth{LoggedIn: false, Detail: detail}
 		}
 		return Auth{LoggedIn: true, Detail: text}
 	}
-	if home, herr := os.UserHomeDir(); herr == nil {
-		if _, serr := os.Stat(filepath.Join(home, ".codex", "auth.json")); serr == nil {
-			if expired, detail := llm.CodexSessionExpired(time.Now()); expired {
-				return Auth{LoggedIn: false, Detail: detail}
-			}
-			if rejected, detail := llm.CodexRejected(); rejected {
-				return Auth{LoggedIn: false, Detail: detail}
-			}
-			return Auth{LoggedIn: true, Detail: "đã có ~/.codex/auth.json"}
+	if _, serr := os.Stat(filepath.Join(home, "auth.json")); serr == nil {
+		if expired, detail := llm.CodexSessionExpired(home, time.Now()); expired {
+			return Auth{LoggedIn: false, Detail: detail}
 		}
+		if rejected, detail := llm.CodexRejected(home); rejected {
+			return Auth{LoggedIn: false, Detail: detail}
+		}
+		return Auth{LoggedIn: true, Detail: "đã có " + filepath.Join(home, "auth.json")}
 	}
 	return Auth{LoggedIn: false, Detail: text}
 }
@@ -394,10 +419,20 @@ func (m *Manager) List(ctx context.Context) []Status {
 
 // Status inspects one tool: installed, version, sign-in, install methods, last job.
 func (m *Manager) Status(ctx context.Context, id string) (Status, error) {
+	return m.StatusIn(ctx, id, "")
+}
+
+// StatusIn is Status for the account kept in home ("" = the machine's).
+func (m *Manager) StatusIn(ctx context.Context, id, home string) (Status, error) {
 	t, ok := m.find(id)
 	if !ok {
 		return Status{}, ErrUnknownTool
 	}
+	vars, err := homeVars(t, home)
+	if err != nil {
+		return Status{}, err
+	}
+	env := append(m.Env(), vars...)
 	s := Status{Tool: t, Methods: []Method{}}
 	for _, meth := range t.methods {
 		meth.Available = m.lookPath(meth.Requires) != ""
@@ -409,10 +444,10 @@ func (m *Manager) Status(ctx context.Context, id string) (Status, error) {
 		defer cancel()
 		v, _ := runOut(ctx, m.env, path, "--version")
 		s.Version = strings.TrimSpace(strings.SplitN(v, "\n", 2)[0])
-		s.Auth = t.status(ctx, path, m.env)
+		s.Auth = t.status(ctx, path, env)
 	}
 	m.mu.Lock()
-	if j := m.last[id]; j != nil {
+	if j := m.last[jobKey(id, home)]; j != nil {
 		snap := j.Snapshot()
 		s.Job = &snap
 	}
@@ -452,28 +487,40 @@ func (m *Manager) Install(id, method string) (*Job, error) {
 		}
 		// brew asks [y/n] before installing (the default since Homebrew 6, or
 		// HOMEBREW_ASK before); the install box cannot answer
-		return m.start(id, "install", meth.argv, 15*time.Minute, term{}, "HOMEBREW_NO_ASK=1", "HOMEBREW_ASK=")
+		return m.start(id, id, "install", meth.argv, 15*time.Minute, term{}, "HOMEBREW_NO_ASK=1", "HOMEBREW_ASK=")
 	}
 	return nil, ErrUnknownMethod
 }
 
 // Login starts the tool's sign-in flow.
-func (m *Manager) Login(id string) (*Job, error) {
+func (m *Manager) Login(id string) (*Job, error) { return m.LoginIn(id, "") }
+
+// LoginIn signs in the account kept in home ("" = the machine's).
+func (m *Manager) LoginIn(id, home string) (*Job, error) {
 	t, ok := m.find(id)
 	if !ok {
 		return nil, ErrUnknownTool
+	}
+	vars, err := homeVars(t, home)
+	if err != nil {
+		return nil, err
 	}
 	path := m.lookPath(t.Bin)
 	if path == "" {
 		return nil, ErrNotInstalled
 	}
+	if home != "" {
+		if err := PrepareHome(id, home); err != nil {
+			return nil, err
+		}
+	}
 	if t.prepareLogin != nil {
-		if err := t.prepareLogin(); err != nil {
+		if err := t.prepareLogin(append(m.Env(), vars...)); err != nil {
 			return nil, err
 		}
 	}
 	argv := append([]string{path}, t.loginArgv[1:]...)
-	j, err := m.start(id, "login", argv, 15*time.Minute, t.loginTerm, t.loginEnv...)
+	j, err := m.start(jobKey(id, home), id, "login", argv, 15*time.Minute, t.loginTerm, append(vars, t.loginEnv...)...)
 	if err == nil && t.loginDone != nil {
 		go func() {
 			tick := time.NewTicker(2 * time.Second)
@@ -484,7 +531,7 @@ func (m *Manager) Login(id string) (*Job, error) {
 					return
 				case <-tick.C:
 					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					done := t.loginDone(ctx, path, m.Env())
+					done := t.loginDone(ctx, path, append(m.Env(), vars...))
 					cancel()
 					if done {
 						j.finish()
@@ -500,19 +547,26 @@ func (m *Manager) Login(id string) (*Job, error) {
 // Logout signs the tool out: its logout subcommand, or removing its
 // credentials file. Signing in again after it starts from a clean slate
 // (Gemini's sign-in skips straight to its chat while credentials exist).
-func (m *Manager) Logout(ctx context.Context, id string) error {
+func (m *Manager) Logout(ctx context.Context, id string) error { return m.LogoutIn(ctx, id, "") }
+
+// LogoutIn signs out the account kept in home ("" = the machine's).
+func (m *Manager) LogoutIn(ctx context.Context, id, home string) error {
 	t, ok := m.find(id)
 	if !ok {
 		return ErrUnknownTool
 	}
+	vars, err := homeVars(t, home)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
-	j := m.last[id]
+	j := m.last[jobKey(id, home)]
 	m.mu.Unlock()
 	if j != nil && j.Snapshot().State == "running" {
 		return ErrBusy
 	}
 	if t.logoutFiles != nil {
-		for _, f := range t.logoutFiles() {
+		for _, f := range t.logoutFiles(append(m.Env(), vars...)) {
 			if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
@@ -525,16 +579,18 @@ func (m *Manager) Logout(ctx context.Context, id string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if out, err := runOut(ctx, m.env, path, t.logoutArgv[1:]...); err != nil {
+	if out, err := runOut(ctx, append(m.Env(), vars...), path, t.logoutArgv[1:]...); err != nil {
 		return fmt.Errorf("%s: %v: %s", t.LogoutCmd, err, strings.TrimSpace(out))
 	}
 	return nil
 }
 
-func (m *Manager) start(tool, action string, argv []string, timeout time.Duration, tm term, env ...string) (*Job, error) {
+// start runs a job; key is what at most one job runs for at a time (the
+// tool, or the tool in one account's folder).
+func (m *Manager) start(key, tool, action string, argv []string, timeout time.Duration, tm term, env ...string) (*Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if j := m.last[tool]; j != nil && j.Snapshot().State == "running" {
+	if j := m.last[key]; j != nil && j.Snapshot().State == "running" {
 		return nil, ErrBusy
 	}
 	if p := m.lookPathLocked(argv[0]); p != "" {
@@ -544,7 +600,7 @@ func (m *Manager) start(tool, action string, argv []string, timeout time.Duratio
 	if err != nil {
 		return nil, err
 	}
-	m.jobs[j.ID], m.last[tool] = j, j
+	m.jobs[j.ID], m.last[key] = j, j
 	go m.expireJob(j)
 	return j, nil
 }
@@ -573,6 +629,74 @@ func (m *Manager) Job(id string) (*Job, bool) {
 	defer m.mu.Unlock()
 	j, ok := m.jobs[id]
 	return j, ok
+}
+
+// ErrNoHome: the tool cannot keep a second account in a folder of its own.
+var ErrNoHome = errors.New("công cụ này chưa hỗ trợ nhiều tài khoản")
+
+// homeVars is what the tool's environment adds for the account in home.
+func homeVars(t Tool, home string) ([]string, error) {
+	if home == "" {
+		return nil, nil
+	}
+	if t.homeEnv == "" {
+		return nil, ErrNoHome
+	}
+	return []string{t.homeEnv + "=" + home}, nil
+}
+
+func jobKey(id, home string) string {
+	if home == "" {
+		return id
+	}
+	return id + "@" + home
+}
+
+// PrepareHome makes home the config folder of a second account of tool
+// (ADR-178): the machine's setup (Tool.share) is linked in, so the account
+// differs and the setup does not. Run again, it links what is new.
+func PrepareHome(tool, home string) error {
+	t, ok := tools[0], false
+	for _, x := range tools {
+		if x.ID == tool {
+			t, ok = x, true
+		}
+	}
+	if !ok || t.homeEnv == "" {
+		return ErrNoHome
+	}
+	dir := filepath.Join(home, t.share.sub)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	src := t.share.src()
+	entries, err := os.ReadDir(src)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		link := slices.Contains(t.share.links, name) || (!e.IsDir() && strings.HasSuffix(name, ".md"))
+		if !link && !slices.Contains(t.share.copies, name) {
+			continue
+		}
+		dst := filepath.Join(dir, name)
+		if _, err := os.Lstat(dst); err == nil {
+			continue
+		}
+		if link {
+			err = os.Symlink(filepath.Join(src, name), dst)
+		} else if raw, rerr := os.ReadFile(filepath.Join(src, name)); rerr == nil {
+			err = os.WriteFile(dst, raw, 0o600)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runOut(ctx context.Context, env []string, bin string, args ...string) (string, error) {

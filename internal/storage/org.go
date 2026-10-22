@@ -36,6 +36,23 @@ func (k ProviderKind) IsCLI() bool {
 	return k == ProviderClaudeCLI || k == ProviderCodexCLI || k == ProviderGeminiCLI || k == ProviderAntigravityCLI
 }
 
+// cliHomeEnv is the variable that moves each CLI's config and credentials
+// to another folder: a connection with an account of its own (ADR-178).
+var cliHomeEnv = map[ProviderKind]string{ProviderClaudeCLI: "CLAUDE_CONFIG_DIR", ProviderCodexCLI: "CODEX_HOME", ProviderGeminiCLI: "GEMINI_CLI_HOME"}
+
+// OwnAccounts reports whether a connection of kind k can sign in to an
+// account of its own (Antigravity CLI keeps it under $HOME only).
+func (k ProviderKind) OwnAccounts() bool { return cliHomeEnv[k] != "" }
+
+// CLIEnv is what a connection with an account of its own adds to the CLI's
+// environment (ADR-178); nil for the machine's account.
+func (p Provider) CLIEnv() []string {
+	if p.CLIHome == "" || cliHomeEnv[p.Kind] == "" {
+		return nil
+	}
+	return []string{cliHomeEnv[p.Kind] + "=" + p.CLIHome}
+}
+
 // Model tiers let templates say "strong model" without naming a vendor model.
 const (
 	TierStrong   = "strong"
@@ -48,16 +65,19 @@ func ValidTier(t string) bool { return t == TierStrong || t == TierBalanced || t
 
 // Provider is an AI connection.
 type Provider struct {
-	ID           string
-	Name         string
-	Kind         ProviderKind
-	Preset       string // catalog entry it was made from ("" = by hand)
-	BaseURL      string
-	APIKeyEnc    string // encrypted; only internal/secrets decrypts it
-	APIKeyEnv    string
-	APIKeyHint   string
-	TierModels   map[string]string
-	LimitCaps    map[string]int // usage window (five_hour, seven_day) → stop at this percent; 0/missing = off (ADR-136)
+	ID         string
+	Name       string
+	Kind       ProviderKind
+	Preset     string // catalog entry it was made from ("" = by hand)
+	BaseURL    string
+	APIKeyEnc  string // encrypted; only internal/secrets decrypts it
+	APIKeyEnv  string
+	APIKeyHint string
+	TierModels map[string]string
+	LimitCaps  map[string]int // usage window (five_hour, seven_day) → stop at this percent; 0/missing = off (ADR-136)
+	// CLIHome: a Claude Code connection signed in to an account of its own
+	// keeps its config and credentials here ("" = the machine's ~/.claude, ADR-178)
+	CLIHome      string
 	Models       []string
 	IsDefault    bool
 	Enabled      bool
