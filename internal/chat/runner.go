@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"github.com/tung1998/agent-office/internal/attach"
 	"github.com/tung1998/agent-office/internal/officetools"
+	"os/exec"
+	"syscall"
+	"time"
 
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/storage"
@@ -44,7 +47,7 @@ type RunRequest struct {
 	APIKey   string
 	Bin      string // CLI binary for CLI providers
 	// FullAccess: every tool and command on the machine, nothing asked (the
-	// office assistant as administrator, for an admin; Claude Code only)
+	// office assistant as administrator, for an admin)
 	FullAccess bool
 	Model      string
 	Effort     string // how hard it thinks (storage.Efforts; "" = the CLI's own): Claude Code and Codex, not API runs
@@ -142,4 +145,17 @@ func runnerFor(kind storage.ProviderKind) Runner {
 	default:
 		return openAIRunner{official: kind == storage.ProviderOpenAI}
 	}
+}
+
+// ownGroup runs an agent's CLI in a process group of its own: the signal
+// that stops office does not reach it, office ends it itself (Shutdown) so
+// the turn goes on after the restart; a cancel ends what it started too.
+func ownGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		pid := cmd.Process.Pid
+		time.AfterFunc(5*time.Second, func() { _ = syscall.Kill(-pid, syscall.SIGKILL) }) // what ignored it
+		return syscall.Kill(-pid, syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 6 * time.Second // its pipes closed even if a child keeps them
 }

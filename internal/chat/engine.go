@@ -74,8 +74,10 @@ type MessageDTO struct {
 	Patches     []PatchDTO           `json:"patches"`
 	Actions     []ActionDTO          `json:"actions"`
 	CostUSD     *float64             `json:"cost_usd,omitempty"`
-	Relay       *Relay               `json:"relay,omitempty"`   // sent by an agent from another chat: who, from which project and chat
-	Consult     *Consult             `json:"consult,omitempty"` // an expert's answer to a question asked here (ADR-177)
+	Relay       *Relay               `json:"relay,omitempty"`    // sent by an agent from another chat: who, from which project and chat
+	Consult     *Consult             `json:"consult,omitempty"`  // an expert's answer to a question asked here (ADR-177)
+	Provider    string               `json:"provider,omitempty"` // the connection that wrote it
+	Model       string               `json:"model,omitempty"`
 }
 
 // PatchDTO is a proposed change.
@@ -232,6 +234,7 @@ type Engine struct {
 	wf          wfState         // workflows running in chats
 	acts        actionsProposer // the workflows' gates propose through it
 	peers       Peers           // linked projects in other offices (ADR-167; nil = none)
+	stopping    atomic.Bool     // office is going down: answers cut off now go on after it (Shutdown)
 
 	// testStepPanic: a step id runSteps' per-step goroutine panics on
 	// instead of running, for a regression test to force that path
@@ -772,6 +775,10 @@ func (e *Engine) SendWithContext(ctx context.Context, conversationID, text, page
 		wfID = r.rec.ID
 	}
 	e.mu.Lock()
+	if e.stopping.Load() { // under e.mu: Shutdown, which takes the turns under it, never misses this one
+		e.mu.Unlock()
+		return nil, storage.Message{}, ErrStopping
+	}
 	if _, busy := e.active[conv.ID]; busy {
 		e.mu.Unlock()
 		return nil, storage.Message{}, ErrBusy
@@ -950,7 +957,7 @@ func (e *Engine) finish(t *Turn) {
 	}
 	e.mu.Unlock()
 	e.running(t.ConversationID)
-	if freed {
+	if freed && !e.stopping.Load() {
 		safeGo("SendQueued", func() { e.SendQueued(t.ConversationID) }) // what the person wrote meanwhile goes now
 	}
 	// keep the turn for late subscribers, then forget it
@@ -1033,7 +1040,9 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 	// worked out now with the person chatting as the actor, and saved back.
 	agentFull, agentFullBy := false, ""
 	var agentExtraDirs []string
+	origin := ""
 	if job, jerr := e.store.Jobs().Get(ctx, turn.JobID); jerr == nil {
+		origin = job.Origin
 		if job.Origin == "user" {
 			agentFull, agentFullBy = perm.EffectiveFullAccess(perm.FullAccessInput{
 				Level: level, AnswerOnly: power == assistant.ModeAnswer, ActorTrusted: e.isAdmin(ctx, turn.actor),
@@ -1273,8 +1282,19 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 		}
 	}
 	_ = e.store.Chat().UpsertMember(context.Background(), mem)
+	// cut off by office going down (not an answer that ended meanwhile): a
+	// person's turn in a project chat keeps its job running, the next office
+	// goes on with it (ResumeInterrupted); the others end as stopped turns did
+	cut := e.stopping.Load() && runErr != nil && ctx.Err() != nil
+	if cut && origin == "user" && conv.Purpose == "" && conv.TaskID == "" && !turn.background &&
+		turn.wfRun == "" && turn.wfRole == "" && turn.wfStep == "" && !turn.wfWatch {
+		turn.emit(Event{Type: "error", Text: "Office đang khởi động lại, agent làm tiếp khi office lên lại"}) // its stream ends
+		return
+	}
 	if runErr != nil && strings.TrimSpace(res.Text) == "" {
-		if errors.Is(ctx.Err(), context.Canceled) {
+		if cut {
+			runErr = errors.New("office khởi động lại khi đang trả lời, hãy nhắn lại để làm tiếp")
+		} else if errors.Is(ctx.Err(), context.Canceled) {
 			runErr = errors.New("đã dừng")
 		}
 		fail(runErr)
@@ -1282,12 +1302,13 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 	}
 	msg, err := e.store.Chat().AddMessage(context.Background(), storage.Message{
 		ConversationID: conv.ID, Role: "assistant", Content: res.Text, Tools: res.Tools, RunID: runID, Author: agent.Name, AgentID: agent.ID,
+		Provider: p.Name, Model: model,
 	})
 	if err != nil {
 		fail(err)
 		return
 	}
-	dto := MessageDTO{ID: msg.ID, Role: msg.Role, Content: msg.Content, Tools: msg.Tools, Attachments: []storage.Attachment{}, Author: msg.Author, CreatedAt: msg.CreatedAt, CostUSD: cost, Patches: []PatchDTO{}, Actions: []ActionDTO{}}
+	dto := MessageDTO{ID: msg.ID, Role: msg.Role, Content: msg.Content, Tools: msg.Tools, Attachments: []storage.Attachment{}, Author: msg.Author, CreatedAt: msg.CreatedAt, CostUSD: cost, Provider: msg.Provider, Model: msg.Model, Patches: []PatchDTO{}, Actions: []ActionDTO{}}
 	// operations the agent proposed during this run belong to its answer
 	seq := e.cardsBefore(context.Background(), conv.ID, msg.ID)
 	if acts, err := e.store.Actions().List(context.Background(), "", "", turn.ID); err == nil {
@@ -1645,7 +1666,7 @@ func (e *Engine) History(ctx context.Context, conversationID string) ([]MessageD
 	out := make([]MessageDTO, 0, len(msgs))
 	names := map[string]string{} // project names, for older relayed messages
 	for _, m := range msgs {
-		d := MessageDTO{ID: m.ID, Role: m.Role, Content: m.Content, Tools: m.Tools, Attachments: nonNilAtt(m.Attachments), Author: m.Author, Sender: m.Sender, CreatedAt: m.CreatedAt, Patches: byMsg[m.ID], Relay: RelayOf(m), Consult: ConsultOf(m)}
+		d := MessageDTO{ID: m.ID, Role: m.Role, Content: m.Content, Tools: m.Tools, Attachments: nonNilAtt(m.Attachments), Author: m.Author, Sender: m.Sender, CreatedAt: m.CreatedAt, Patches: byMsg[m.ID], Relay: RelayOf(m), Consult: ConsultOf(m), Provider: m.Provider, Model: m.Model}
 		e.fillRelay(ctx, d.Relay, names)
 		if d.Patches == nil {
 			d.Patches = []PatchDTO{}

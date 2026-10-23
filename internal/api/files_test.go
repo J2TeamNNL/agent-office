@@ -1,10 +1,14 @@
 package api_test
 
 import (
+	"encoding/base64"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -83,5 +87,89 @@ func TestFileEditor(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "out.txt")); err == nil {
 			t.Fatal("wrote outside the project")
 		}
+	}
+
+	// upload: any bytes, a new folder made, an existing file only with overwrite
+	up := func(p, data string, extra map[string]any) int {
+		b := map[string]any{"path": p, "data": base64.StdEncoding.EncodeToString([]byte(data))}
+		for k, v := range extra {
+			b[k] = v
+		}
+		resp, _ := do(t, admin, "POST", base+"/file/upload", b, nil)
+		return resp.StatusCode
+	}
+	if c := up("assets/img/x.bin", "\x00\x01", nil); c != 200 {
+		t.Fatalf("upload = %d", c)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "assets/img/x.bin")); string(b) != "\x00\x01" {
+		t.Fatalf("uploaded = %q", b)
+	}
+	if c := up("a.txt", "up", nil); c != 409 {
+		t.Fatalf("upload over existing = %d", c)
+	}
+	if c := up("a.txt", "up", map[string]any{"overwrite": true}); c != 200 {
+		t.Fatalf("upload overwrite = %d", c)
+	}
+	if c := up("sub/.env", "K=3", nil); c != 428 {
+		t.Fatalf("upload secret = %d", c)
+	}
+	if c := up(".git/hooks/x", "x", nil); c == 200 {
+		t.Fatal("uploaded into .git")
+	}
+	up("../up.txt", "x", nil) // cleaned to a path inside the project
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "up.txt")); err == nil {
+		t.Fatal("uploaded outside the project")
+	}
+}
+
+func TestFilePreview(t *testing.T) {
+	dir := t.TempDir()
+	image := []byte("\x89PNG\r\n\x1a\npreview")
+	if err := os.WriteFile(filepath.Join(dir, "icon48.png"), image, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "page.html"), []byte("<script>alert(1)</script>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e := setup(t)
+	admin := e.client(t)
+	login(t, e, admin, "admin@x.io", "admin-password")
+	_, body := do(t, admin, "POST", e.srv.URL+"/api/projects", map[string]any{"path": dir, "name": "preview"}, nil)
+	base := e.srv.URL + "/api/projects/" + body["project"].(map[string]any)["id"].(string)
+	_, meta := do(t, admin, "GET", base+"/file?path=icon48.png", nil, nil)
+	if meta["binary"] != true || meta["preview"].(map[string]any)["kind"] != "image" {
+		t.Fatalf("metadata = %v", meta)
+	}
+	req, _ := http.NewRequest("GET", base+"/file/preview?path=icon48.png", nil)
+	req.Header.Set("Range", "bytes=0-7")
+	resp, err := admin.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Type") != "image/png" || string(data) != string(image[:8]) || resp.Header.Get("Content-Security-Policy") == "" {
+		t.Fatalf("preview = %d %q %q", resp.StatusCode, resp.Header.Get("Content-Type"), data)
+	}
+	_, htmlMeta := do(t, admin, "GET", base+"/file?path=page.html", nil, nil)
+	if htmlMeta["preview"].(map[string]any)["kind"] != "document" {
+		t.Fatalf("HTML metadata = %v", htmlMeta)
+	}
+	resp, err = admin.Get(base + "/file/preview?path=page.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "text/html; charset=utf-8" || resp.Header.Get("X-Frame-Options") != "SAMEORIGIN" || !strings.Contains(resp.Header.Get("Content-Security-Policy"), "sandbox") || string(html) != "<script>alert(1)</script>" {
+		t.Fatalf("HTML preview = %d %q %q", resp.StatusCode, resp.Header.Get("Content-Type"), html)
+	}
+	resp, err = admin.Get(base + "/file/preview?path=page.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("script preview = %d", resp.StatusCode)
 	}
 }
