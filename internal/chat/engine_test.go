@@ -719,6 +719,41 @@ func TestAgentFullAccessRevokedWhenEnablerNotAdmin(t *testing.T) {
 	}
 }
 
+// The power follows the agent (ADR-217): a person who is no admin (a member,
+// or the one a paired office or a linked project speaks for) runs an agent an
+// admin made administrator as administrator; what is not a person never does.
+func TestAgentFullAccessFollowsTheAgent(t *testing.T) {
+	for _, tc := range []struct {
+		who  string
+		full bool
+	}{{"human:member@x.io", true}, {"human:gone@x.io", false}, {"bot:tg", false}} {
+		t.Run(tc.who, func(t *testing.T) {
+			bin, argsLog := fullAccessFakeBin(t, t.TempDir())
+			f := setup(t, func(provs *provider.Service) storage.Provider {
+				p, _ := provs.Create(context.Background(), provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
+				return p
+			})
+			ctx := actor.With(context.Background(), tc.who)
+			f.st.Users().Create(ctx, storage.User{Email: "admin@x.io", Role: storage.RoleAdmin, PasswordHash: "h"})
+			f.st.Users().Create(ctx, storage.User{Email: "member@x.io", Role: storage.RoleMember, PasswordHash: "h"})
+			conv, _ := f.engine.StartConversation(ctx, f.project.ID, "")
+			f.engine.SetMode(ctx, conv.ID, perm.Operate)
+			agent, _ := f.st.Agents().Get(ctx, conv.AgentID)
+			agent.Permissions.Level, agent.Permissions.FullAccess, agent.Permissions.FullAccessBy = perm.Operate, true, "admin@x.io"
+			f.st.Agents().Update(ctx, agent)
+			turn, _, err := f.engine.Send(ctx, conv.ID, "chạy lệnh", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			collect(t, turn)
+			b, _ := os.ReadFile(argsLog)
+			if got := strings.Contains(string(b), "bypassPermissions"); got != tc.full {
+				t.Fatalf("full access = %v, want %v: %s", got, tc.full, b)
+			}
+		})
+	}
+}
+
 // The office assistant limited to "answer only" (ADR-059) never escalates to
 // full access either, even when its own agent has FullAccess (ADR-074 security fix).
 func TestAgentFullAccessDoesNotEscalateUnderAnswerOnlyAssistant(t *testing.T) {

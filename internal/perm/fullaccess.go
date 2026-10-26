@@ -6,8 +6,8 @@ package perm
 type FullAccessInput struct {
 	Level      string // the run's effective level, already resolved
 	AnswerOnly bool   // the office assistant answers only, proposes nothing
-	// ActorTrusted: whoever started this run may use full access — a chat: an
-	// admin; a channel message: MayDecide; an automation: triggered by its
+	// ActorTrusted: whoever started this run may use full access — a chat: a
+	// person with an account (the office assistant's: an admin; ADR-217); a channel message: MayDecide; an automation: triggered by its
 	// schedule or run by hand, never a webhook, a PR webhook, or a channel message.
 	ActorTrusted bool
 	AgentFull    bool

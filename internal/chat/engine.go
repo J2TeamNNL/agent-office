@@ -285,6 +285,18 @@ func (e *Engine) isAdmin(ctx context.Context, who string) bool {
 	return e.isAdminEmail(ctx, email)
 }
 
+// actorTrusted: a run started by who may use its agent's full access. In a
+// project the power follows the agent (ADR-217): any person with an account
+// here (a chat they opened, one a linked project or a paired office opened in
+// their name) runs the agent as an admin set it; bots and webhooks never do.
+// The office assistant's rights stay those of the person asking (ADR-059).
+func (e *Engine) actorTrusted(ctx context.Context, projectID, who string) bool {
+	if e.isAssistant(ctx, projectID) {
+		return e.isAdmin(ctx, who)
+	}
+	return e.activePerson(ctx, who)
+}
+
 // isAdminEmail: that email is still an admin of the office (ADR-074: a
 // FullAccess an admin turned on only holds while they still are one).
 func (e *Engine) isAdminEmail(ctx context.Context, email string) bool {
@@ -1057,7 +1069,7 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 		origin = job.Origin
 		if job.Origin == "user" {
 			agentFull, agentFullBy = perm.EffectiveFullAccess(perm.FullAccessInput{
-				Level: level, AnswerOnly: power == assistant.ModeAnswer, ActorTrusted: e.isAdmin(ctx, turn.actor),
+				Level: level, AnswerOnly: power == assistant.ModeAnswer, ActorTrusted: e.actorTrusted(ctx, project.ID, turn.actor),
 				AgentFull: agent.Permissions.FullAccess, AgentFullBy: agent.Permissions.FullAccessBy,
 				IsAdminEmail: func(email string) bool { return e.isAdminEmail(ctx, email) },
 			})
