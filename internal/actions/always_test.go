@@ -83,12 +83,12 @@ func TestDecideAlways(t *testing.T) {
 		t.Fatalf("auto next = %+v %v", b, err)
 	}
 
-	// a risky command is refused before it runs
-	c, _ := svc.Propose(ctx, scope("r3"), "run_command", "git push origin main", "đẩy")
+	// a wrapper is refused before it runs
+	c, _ := svc.Propose(ctx, scope("r3"), "run_command", "sudo git push origin main", "đẩy")
 	if _, _, err := svc.DecideAlways(ctx, c.ID, "an@x.io"); !errors.Is(err, perm.ErrNotAlways) {
-		t.Fatalf("risky = %v", err)
+		t.Fatalf("wrapper = %v", err)
 	}
 	if c, _ = st.Actions().Get(ctx, c.ID); c.Status != "pending" {
-		t.Fatalf("risky must stay pending: %+v", c)
+		t.Fatalf("wrapper must stay pending: %+v", c)
 	}
 }

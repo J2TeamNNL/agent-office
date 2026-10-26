@@ -74,8 +74,6 @@ func (e *Engine) Receive(ctx context.Context, p peer.Peer, m peer.Message) (peer
 		return peer.Reply{}, errors.New("người đứng tên ghép nối không còn hoạt động ở office này")
 	case text == "" || m.From.Chat == "":
 		return peer.Reply{}, errors.New("thiếu nội dung hoặc chat gửi")
-	case m.From.Hops < 0 || m.From.Hops > maxRelayHops:
-		return peer.Reply{}, fmt.Errorf("đã quá %d lượt qua lại, cần người xem", maxRelayHops)
 	}
 	var conv storage.Conversation
 	if m.Chat == "" { // a new chat: only in a project shared with it
@@ -114,8 +112,16 @@ func (e *Engine) Receive(ctx context.Context, p peer.Peer, m peer.Message) (peer
 // sent to here, in a project still shared with it. A chat of this office
 // that handed it work is its person's own: p only answers into it.
 func (e *Engine) PeerChat(ctx context.Context, c storage.Conversation, p peer.Peer) bool {
+	if !p.Opens(c.ProjectID, e.assistantID(ctx)) {
+		return false
+	}
+	// an office made administrator here may already run the assistant with
+	// full access: it reads every chat of a project shared with it (ADR-211)
+	if p.Admin && e.isAdmin(ctx, p.As) {
+		return true
+	}
 	from, _ := e.peerChat(ctx, c.ID, p.ID)
-	return from && p.Opens(c.ProjectID, e.assistantID(ctx))
+	return from
 }
 
 type peerFromKey struct{}
@@ -176,10 +182,6 @@ func (e *Engine) reportPeer(conv storage.Conversation, project storage.Repo, age
 	p, err := e.peers.Get(ctx, origin.Peer)
 	if err != nil {
 		e.note(conv, "Không báo lại được: office gửi việc đã gỡ ghép nối.")
-		return
-	}
-	if origin.Hops >= maxRelayHops {
-		e.note(conv, fmt.Sprintf("Không tự báo lại office %s nữa: đã quá %d lượt qua lại. Hãy xem và trả lời trực tiếp.", p.Name, maxRelayHops))
 		return
 	}
 	text := prompts.Render("chat/linked-report", map[string]any{"Project": project.Name, "Agent": agent.Name,

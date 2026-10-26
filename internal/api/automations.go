@@ -239,6 +239,7 @@ func (s *server) applyAutomation(r *http.Request, in automationInput, a *storage
 	cfg := storage.AutomationConfig{ConversationID: a.Config.ConversationID, SecretHash: a.Config.SecretHash}
 	if in.Source == "schedule" {
 		cfg.EveryMinutes, cfg.Cron, cfg.Timezone = in.Config.EveryMinutes, strings.TrimSpace(in.Config.Cron), strings.TrimSpace(in.Config.Timezone)
+		cfg.OnlyIf = in.Config.OnlyIf // ADR-194: kept as it came (the dashboard sends back what it read)
 		if cfg.Cron != "" {
 			cfg.EveryMinutes = 0
 		}

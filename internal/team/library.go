@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ var LibraryCategories = []string{"code", "design", "plan", "customer", "content"
 // person browses (ADR-154). The instructions are read when one is opened.
 type LibraryEntry struct {
 	ID          string `json:"id"`  // "<set>/<key>": office/devops, agency/frontend-developer
-	Set         string `json:"set"` // office (written for office) | agency (imported)
+	Set         string `json:"set"` // office (written for office) | agency, ecc, aitmpl (imported)
 	Key         string `json:"key" yaml:"key"`
 	Name        string `json:"name" yaml:"name"`
 	Role        string `json:"role" yaml:"role"`
@@ -33,9 +34,15 @@ type LibraryEntry struct {
 	Emoji       string `json:"emoji,omitempty" yaml:"emoji"`
 	ModelTier   string `json:"model_tier" yaml:"model_tier"`
 	Level       string `json:"level" yaml:"level"`
-	Featured    bool   `json:"featured,omitempty" yaml:"featured"`
-	Source      string `json:"source,omitempty" yaml:"source"` // where it was adapted from
-	Words       int    `json:"words"`                          // length of the instructions
+	// Caps: its own picks of capabilities instead of the level's preset
+	// (perm.Caps ids), e.g. web search for a researcher.
+	Caps     []string `json:"caps,omitempty" yaml:"caps"`
+	Featured bool     `json:"featured,omitempty" yaml:"featured"`
+	Source   string   `json:"source,omitempty" yaml:"source"` // where it was adapted from
+	Words    int      `json:"words"`                          // length of the instructions
+	// Skills are the library skills (templates/library/skills) it keeps at
+	// hand when added to a project (ADR-185).
+	Skills []string `json:"skills,omitempty" yaml:"skills"`
 }
 
 // LibraryAgent is a library agent in full.
@@ -141,5 +148,9 @@ func readLibrary(name string) (LibraryAgent, error) {
 	a.Words = len(strings.Fields(a.Instructions))
 	// ADR-074: a library agent never brings full access or extra folders
 	a.Permissions = storage.Permissions{Level: a.Level, ReadOnly: a.Level == "read"}
+	if len(a.Caps) > 0 {
+		caps := slices.Clone(a.Caps)
+		a.Permissions.Caps = &caps
+	}
 	return a, nil
 }

@@ -40,7 +40,7 @@ type wfRun struct {
 	tier     string          // the model tier of the message that started it
 	ceiling  string          // the most that message may have run (a bot's user…)
 	tree     treeOpt         // the worktree that message ran in (a Burn piece's): its roles read there too
-	deadline time.Time       // the run's timeout
+	deadline time.Time       // the run's expected end (past it the chat is told; it goes on)
 	timer    *time.Timer     // fires at the deadline
 	batch    map[string]bool // roles answering now; when none is left the coordinator is called back
 	voting   *wfVoting       // a vote in progress
@@ -147,6 +147,7 @@ type wfAsk struct {
 	role   string
 	agent  storage.Agent
 	prompt string
+	effort string // how hard it thinks ("" = the agent's own)
 	vote   bool
 	flow   bool              // the role is a sub-workflow: the turn is a run of it
 	inputs map[string]string // a sub-workflow's inputs by key
@@ -493,27 +494,21 @@ func (e *Engine) cancelRoleTurns(runID string) {
 	}
 }
 
-// wfExpire ends a run that ran out of time, stopping its roles' turns.
+// wfExpire tells the chat a run went past its expected time. It does not
+// stop it: a gate may wait on the person for hours; the person stops it.
 func (e *Engine) wfExpire(conversationID, runID string) {
-	e.cancelRunTurns(runID)
-	e.finishRun(conversationID, runID, storage.RunFailed, "", "hết thời gian của quy trình")
+	e.wf.mu.Lock()
+	run := e.wf.byConv[conversationID]
+	if run == nil || run.rec.ID != runID {
+		e.wf.mu.Unlock()
+		return
+	}
+	run.logf("Quá thời gian dự kiến, vẫn chạy tiếp")
+	rec, seq := run.snapshot()
+	e.wf.mu.Unlock()
+	e.saveRun(run, rec, seq)
 	if conv, err := e.store.Chat().GetConversation(context.Background(), conversationID); err == nil {
-		e.note(conv, "⏱️ Quy trình đã hết thời gian và dừng lại.")
-	}
-}
-
-// cancelRunTurns stops the turns of a run still answering.
-func (e *Engine) cancelRunTurns(runID string) {
-	e.mu.Lock()
-	var stop []*Turn
-	for _, t := range e.turns {
-		if t.wfRun == runID {
-			stop = append(stop, t)
-		}
-	}
-	e.mu.Unlock()
-	for _, t := range stop {
-		t.Cancel()
+		e.note(conv, "⏱️ Quy trình "+run.def.Name+" đã quá thời gian dự kiến nhưng vẫn chạy tiếp; dừng nó nếu không cần nữa.")
 	}
 }
 
@@ -698,6 +693,7 @@ func (e *Engine) WorkflowCall(ctx context.Context, sc officetools.Scope, name st
 		Role     string            `json:"role"`
 		Agent    string            `json:"agent"`
 		Brief    map[string]string `json:"brief"`
+		Effort   string            `json:"effort"`
 		Message  string            `json:"message"`
 		Question string            `json:"question"`
 		Agents   map[string]string `json:"agents"`
@@ -716,7 +712,7 @@ func (e *Engine) WorkflowCall(ctx context.Context, sc officetools.Scope, name st
 	}
 	switch name {
 	case "workflow_delegate":
-		return e.wfDelegate(ctx, sc, run, in.Role, in.Agent, in.Brief)
+		return e.wfDelegate(ctx, sc, run, in.Role, in.Agent, in.Effort, in.Brief)
 	case "workflow_ask":
 		return e.wfAskNow(ctx, sc, run, in.Role, in.Question, in.Wait)
 	case "workflow_send":
@@ -823,10 +819,13 @@ func (e *Engine) checkDifferAmong(ctx context.Context, run *wfRun, role string, 
 	return nil
 }
 
-func (e *Engine) wfDelegate(ctx context.Context, sc officetools.Scope, run *wfRun, role, agentName string, brief map[string]string) (string, error) {
+func (e *Engine) wfDelegate(ctx context.Context, sc officetools.Scope, run *wfRun, role, agentName, effort string, brief map[string]string) (string, error) {
 	d, ok := run.def.Role(role)
 	if !ok {
 		return "", fmt.Errorf("quy trình không có vai %q (có: %s)", role, roleKeys(run.def))
+	}
+	if !storage.ValidEffort(effort) {
+		return "", fmt.Errorf("effort %q không hợp lệ (có: %s)", effort, strings.Join(storage.Efforts, ", "))
 	}
 	if d.Workflow != "" {
 		return e.wfDelegateFlow(ctx, sc, run, d, agentName, brief)
@@ -858,8 +857,8 @@ func (e *Engine) wfDelegate(ctx context.Context, sc officetools.Scope, run *wfRu
 	}
 	e.wf.mu.Lock()
 	r = run.role(role)
-	r.AgentID, r.AgentName = a.ID, a.Name
-	e.wf.pending[sc.RunRef] = append(e.wf.pending[sc.RunRef], wfAsk{role: role, agent: a, prompt: prompt})
+	r.AgentID, r.AgentName, r.Effort = a.ID, a.Name, effort
+	e.wf.pending[sc.RunRef] = append(e.wf.pending[sc.RunRef], wfAsk{role: role, agent: a, prompt: prompt, effort: effort})
 	run.logf("Giao vai %s cho %s", d.Name, a.Name)
 	rec, seq := run.snapshot()
 	e.wf.mu.Unlock()
@@ -947,7 +946,7 @@ func (e *Engine) wfSend(ctx context.Context, sc officetools.Scope, run *wfRun, r
 		e.wf.mu.Unlock()
 		return "", fmt.Errorf("đã gửi tiếp cho vai %s %d lần (giới hạn); tổng kết với kết quả hiện có", role, r.Rounds)
 	}
-	agentID := r.AgentID
+	agentID, effort := r.AgentID, r.Effort
 	e.wf.mu.Unlock()
 	if d.Workflow != "" { // a sub-workflow: it runs again with this as its input
 		return e.wfAskFlow(ctx, sc, run, d, agentID, message, map[string]string{"text": message}, true)
@@ -966,7 +965,7 @@ func (e *Engine) wfSend(ctx context.Context, sc officetools.Scope, run *wfRun, r
 	}
 	run.role(role).Rounds++
 	prompt := prompts.Render("workflow/send", struct{ Coordinator, Workflow, Role, Message, AccessNote string }{run.coord.Name, run.def.Name, d.Name, message, workflow.AccessNote(d.Access)})
-	e.wf.pending[sc.RunRef] = append(e.wf.pending[sc.RunRef], wfAsk{role: role, agent: a, prompt: prompt})
+	e.wf.pending[sc.RunRef] = append(e.wf.pending[sc.RunRef], wfAsk{role: role, agent: a, prompt: prompt, effort: effort})
 	run.logf("Gửi tiếp cho %s (%s)", d.Name, a.Name)
 	rec, seq := run.snapshot()
 	e.wf.mu.Unlock()
@@ -1320,10 +1319,6 @@ func (e *Engine) startRole(run *wfRun, conv storage.Conversation, project storag
 	if run.ceiling != "" {
 		level = perm.Min(level, run.ceiling)
 	}
-	limit := time.Until(run.deadline)
-	if limit <= time.Second {
-		return false
-	}
 	e.wf.mu.Lock()
 	r := run.role(a.role)
 	r.Status = "working"
@@ -1331,8 +1326,8 @@ func (e *Engine) startRole(run *wfRun, conv storage.Conversation, project storag
 	run.rec.Turns++
 	r.Turns++
 	e.wf.mu.Unlock()
-	t, why := e.startTurn(conv, project, turnSpec{agent: a.agent, background: true, delegator: run.coord.ID, actor: run.rec.Actor,
-		tier: run.tier, ceiling: level, tree: run.tree, limit: limit, title: run.coord.Name + " → " + a.agent.Name + " (" + d.Name + ")", prompt: a.prompt,
+	t, why := e.startTurn(conv, project, turnSpec{agent: a.agent, effort: a.effort, background: true, delegator: run.coord.ID, actor: run.rec.Actor,
+		tier: run.tier, ceiling: level, tree: run.tree, title: run.coord.Name + " → " + a.agent.Name + " (" + d.Name + ")", prompt: a.prompt,
 		wfRun: run.rec.ID, wfRole: a.role, wfVote: a.vote})
 	if t == nil {
 		e.wf.mu.Lock()
@@ -1448,16 +1443,12 @@ func (e *Engine) wfCallBack(runID string, conv storage.Conversation, project sto
 		}
 	}
 	coord, tier, tree, actorOf := run.coord, run.tier, run.tree, run.rec.Actor
-	limit := time.Until(run.deadline)
 	e.wf.mu.Unlock()
-	if limit <= time.Second {
-		return
-	}
 	prompt := prompts.Render("workflow/callback", struct {
 		Workflow, Vote string
 		Done, Notes    []string
 	}{run.def.Name, vote, lines, notes})
-	t, why := e.startTurn(conv, project, turnSpec{agent: coord, actor: actorOf, tier: tier, ceiling: run.ceiling, tree: tree, limit: limit,
+	t, why := e.startTurn(conv, project, turnSpec{agent: coord, actor: actorOf, tier: tier, ceiling: run.ceiling, tree: tree,
 		title: "Quy trình " + run.def.Name + " → " + coord.Name, prompt: prompt, wfRun: runID})
 	if t == nil {
 		if why == "" { // the chat is busy: again in a moment
@@ -1541,6 +1532,8 @@ func roleBrief(name, workflowName string) string {
 // actionsProposer is what the gates propose through.
 type actionsProposer interface {
 	Propose(ctx context.Context, sc actions.Scope, kind, target, reason string, args ...storage.ActionArgs) (storage.Action, error)
+	// RunDeferred: a commit held for its turn's diff, once that is merged (ADR-189)
+	RunDeferred(ctx context.Context, sc actions.Scope, id string, blocked bool) (storage.Action, error)
 }
 
 // SetActions lets workflows open gates (approval cards, check commands).

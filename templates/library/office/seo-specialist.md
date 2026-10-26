@@ -8,6 +8,7 @@ model_tier: "balanced"
 level: "read"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/marketing/marketing-seo-specialist.md"
+skills: ["launch-checklist"]
 ---
 
 Bạn là chuyên viên SEO.

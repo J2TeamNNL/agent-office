@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/tung1998/agent-office/internal/mcpserver"
@@ -157,8 +159,11 @@ func foregroundSettings() string {
 // `claude -p`; when the agent answers, the CLI exits, what runs in the
 // background is killed and no notification ever wakes the agent, so "I'll
 // wait for it" would end the turn with nothing waiting.
+// It also keeps an administrator's shell off master/main (ADR-188): a push
+// there goes through propose_action git_push, a person approves.
 func Foreground(in io.Reader, out io.Writer) {
 	var ev struct {
+		Cwd       string         `json:"cwd"`
 		ToolInput map[string]any `json:"tool_input"`
 	}
 	if json.NewDecoder(in).Decode(&ev) != nil {
@@ -166,5 +171,88 @@ func Foreground(in io.Reader, out io.Writer) {
 	}
 	if bg, _ := ev.ToolInput["run_in_background"].(bool); bg {
 		deny(out, "agent-office: không chạy nền được — lượt chạy kết thúc khi bạn trả lời, việc chạy nền bị dừng và không có thông báo nào gọi lại bạn. Chạy ở tiền cảnh (Bash timeout tối đa 600000 ms) và đợi kết quả ngay trong lượt này; việc lâu hơn thì dùng propose_action (tiến trình) hoặc propose_automation")
+		return
 	}
+	if cmd, _ := ev.ToolInput["command"].(string); cmd != "" && pushesProtected(cmd, ev.Cwd, currentBranch) {
+		deny(out, "agent-office: không được push lên master/main. Push nhánh khác, hoặc đề xuất bằng propose_action git_push để người duyệt")
+	}
+}
+
+// protectedBranches: no agent pushes there itself (ADR-188).
+var protectedBranches = []string{"master", "main"}
+
+// pushesProtected: a shell command with a git push that may land on
+// master/main: a refspec naming one, --all/--mirror, or no refspec while
+// the branch (or what it tracks) is one. Best effort on the text: unsure
+// counts as protected.
+func pushesProtected(cmd, cwd string, branchOf func(dir string) (branch, upstream string)) bool {
+	split := strings.NewReplacer("&&", "\n", "||", "\n", ";", "\n", "|", "\n", "(", "\n", ")", "\n", "`", "\n", "$(", "\n")
+	for _, seg := range strings.Split(split.Replace(cmd), "\n") {
+		f := strings.Fields(seg)
+		dir := cwd
+		i := 0 // the command itself: past VAR=x, sudo, env, command
+		for i < len(f) && (strings.Contains(f[i], "=") || f[i] == "sudo" || f[i] == "env" || f[i] == "command" || f[i] == "exec") {
+			i++
+		}
+		if i >= len(f) || filepath.Base(f[i]) != "git" {
+			continue
+		}
+		j := i + 1
+		for j < len(f) && strings.HasPrefix(f[j], "-") { // git -C dir, -c k=v
+			if (f[j] == "-C" || f[j] == "-c") && j+1 < len(f) {
+				if f[j] == "-C" {
+					dir = f[j+1]
+					if !filepath.IsAbs(dir) {
+						dir = filepath.Join(cwd, dir)
+					}
+				}
+				j++
+			}
+			j++
+		}
+		if j >= len(f) || f[j] != "push" {
+			continue
+		}
+		var rest []string
+		for _, a := range f[j+1:] {
+			if a == "--all" || a == "--mirror" {
+				return true
+			}
+			if !strings.HasPrefix(a, "-") {
+				rest = append(rest, strings.Trim(a, `"'`))
+			}
+		}
+		if len(rest) > 1 { // remote, then refspecs
+			for _, r := range rest[1:] {
+				_, dst, ok := strings.Cut(r, ":")
+				if !ok {
+					dst = r
+				}
+				dst = strings.TrimPrefix(strings.TrimPrefix(dst, "+"), "refs/heads/")
+				if dst == "HEAD" || dst == "@" {
+					dst, _ = branchOf(dir)
+				}
+				if dst == "" || slices.Contains(protectedBranches, dst) {
+					return true
+				}
+			}
+			continue
+		}
+		branch, upstream := branchOf(dir)
+		_, up, _ := strings.Cut(upstream, "/")
+		if branch == "" || slices.Contains(protectedBranches, branch) || slices.Contains(protectedBranches, up) {
+			return true
+		}
+	}
+	return false
+}
+
+// currentBranch: the branch checked out in dir and what it tracks.
+func currentBranch(dir string) (string, string) {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		return "", ""
+	}
+	up, _ := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "@{upstream}").Output()
+	return strings.TrimSpace(string(out)), strings.TrimSpace(string(up))
 }

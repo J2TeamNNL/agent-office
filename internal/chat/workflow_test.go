@@ -133,7 +133,7 @@ func TestWorkflowCommitteeRunsInParallelAndCallsBack(t *testing.T) {
 	}
 	own := g.own(t)
 	brief := map[string]string{"question": "Vì sao test chập chờn?", "context": "Đã thử tăng timeout"}
-	if _, err := g.during(t, "workflow_delegate", map[string]any{"role": "a", "brief": brief}); err != nil {
+	if _, err := g.during(t, "workflow_delegate", map[string]any{"role": "a", "brief": brief, "effort": "high"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := g.during(t, "workflow_delegate", map[string]any{"role": "b", "brief": brief}); err != nil {
@@ -157,6 +157,11 @@ func TestWorkflowCommitteeRunsInParallelAndCallsBack(t *testing.T) {
 		switch {
 		case strings.Contains(a, "You are Dev"):
 			devIn = in
+			if !strings.Contains(a, "--effort high") {
+				t.Fatalf("Dev did not run at the effort the coordinator asked: %s", a)
+			}
+		case strings.Contains(a, "You are QA") && strings.Contains(a, "--effort"):
+			t.Fatalf("QA was given no effort, yet ran with one: %s", a)
 		case strings.Contains(in, "[office · workflow Hội đồng]"):
 			back = in
 		}
@@ -186,7 +191,7 @@ func TestWorkflowCommitteeRunsInParallelAndCallsBack(t *testing.T) {
 	g.waitIn(t, own, 7)
 	var resumed bool
 	for i := 5; i <= 7; i++ {
-		if a, in := call(t, g.dir, i); strings.Contains(a, "You are Dev") && strings.Contains(a, "--resume sess-dev") && strings.Contains(in, "race") {
+		if a, in := call(t, g.dir, i); strings.Contains(a, "You are Dev") && strings.Contains(a, "--resume sess-dev") && strings.Contains(a, "--effort high") && strings.Contains(in, "race") {
 			resumed = true
 		}
 	}
@@ -259,7 +264,7 @@ func TestWorkflowEnforcesItsRules(t *testing.T) {
 	if coord, inRun := g.engine.WorkflowScope(sc); !coord || !inRun {
 		t.Fatalf("scope = %v %v", coord, inRun)
 	}
-	if _, err := g.engine.Delegate(g.context, sc, "Dev", "x"); err == nil {
+	if _, err := g.engine.Delegate(g.context, sc, "Dev", "x", ""); err == nil {
 		t.Fatal("delegate inside a workflow")
 	}
 	collect(t, turn)

@@ -13,8 +13,9 @@ import (
 	"github.com/tung1998/agent-office/internal/team"
 )
 
-// An agent's "remember" waits for a person, unless the project keeps its
-// agents' notes on its own; approved, the note is the agent's.
+// An agent's "remember" is kept on its own (unless the project turned that
+// off), within guards: too short or already noted is refused; no reason, or
+// more than a turn's share, waits for a person.
 func TestRemember(t *testing.T) {
 	ctx := context.Background()
 	st, _ := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
@@ -27,8 +28,9 @@ func TestRemember(t *testing.T) {
 	mem := memory.New(st, nil)
 	svc := New(st, nil)
 	svc.SetMemory(mem)
+	mem.SetAuto(ctx, proj.ID, false)
 	sc := Scope{ProjectID: proj.ID, RunRef: "r1", Agent: agents[0].Name, Level: perm.Propose}
-	a, err := svc.Propose(ctx, sc, "remember", "project dùng pnpm", "thấy lockfile")
+	a, err := svc.Propose(ctx, sc, "remember", "project dùng pnpm, không dùng npm", "thấy lockfile")
 	if err != nil || a.Status != "pending" || a.TargetID != agents[0].ID {
 		t.Fatalf("propose = %+v %v", a, err)
 	}
@@ -36,15 +38,30 @@ func TestRemember(t *testing.T) {
 		t.Fatal(err)
 	}
 	list, _ := st.Memories().List(ctx, proj.ID, agents[0].ID)
-	if len(list) != 1 || list[0].Text != "project dùng pnpm" || list[0].Source != "agent" {
+	if len(list) != 1 || list[0].Text != "project dùng pnpm, không dùng npm" || list[0].Source != "agent" {
 		t.Fatalf("notes = %+v", list)
 	}
 	mem.SetAuto(ctx, proj.ID, true)
 	sc.RunRef = "r2"
-	if a, _ = svc.Propose(ctx, sc, "remember", "chạy pnpm test trước khi báo xong", ""); a.Status != "done" {
+	if a, _ = svc.Propose(ctx, sc, "remember", "chạy pnpm test trước khi báo xong", "bị nhắc"); a.Status != "done" {
 		t.Fatalf("auto = %+v", a)
 	}
-	if _, err := svc.Propose(ctx, Scope{ProjectID: proj.ID, Agent: "không có", Level: perm.Propose}, "remember", "x", ""); err == nil {
+	if _, err := svc.Propose(ctx, sc, "remember", "Project dùng pnpm — không dùng npm.", "x"); err == nil {
+		t.Fatal("the same note twice")
+	}
+	if _, err := svc.Propose(ctx, sc, "remember", "dùng pnpm", "x"); err == nil {
+		t.Fatal("a note too short to help")
+	}
+	if a, _ = svc.Propose(ctx, sc, "remember", "migration nằm ở internal/storage/sqlite/migrations", ""); a.Status != "pending" {
+		t.Fatalf("no reason = %+v", a)
+	}
+	if a, _ = svc.Propose(ctx, sc, "remember", "log của office ở .office/logs/office.log", "tìm lâu"); a.Status != "done" {
+		t.Fatalf("second of the turn = %+v", a)
+	}
+	if a, _ = svc.Propose(ctx, sc, "remember", "build dashboard bằng pnpm --dir dashboard build", "tìm lâu"); a.Status != "pending" {
+		t.Fatalf("over the turn's share = %+v", a)
+	}
+	if _, err := svc.Propose(ctx, Scope{ProjectID: proj.ID, Agent: "không có", Level: perm.Propose}, "remember", "một ghi chú đủ dài để có ích", ""); err == nil {
 		t.Fatal("a note of an agent that is not in the project")
 	}
 }

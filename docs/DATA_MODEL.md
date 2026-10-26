@@ -347,6 +347,10 @@ Index `(day, agent_id)`, `(incident_id)`. View `cost_daily` group theo `day, age
 
 `workflow_runs`: một lần chạy: `project_id`, `conversation_id` (chat riêng của lần chạy, ADR-101), `caller_conversation_id` (chat đã gọi; '' = lần chạy cũ), `parent_run_id`, `depth` (quy trình con, ADR-102), `outputs` (đầu ra theo key, ADR-103), `workflow_id`, `workflow_key`, `coordinator_id`, `input`, `status` (`running` \| `done` \| `failed` \| `stopped`), `turns`, `cost_usd`, `roles` (json: vai, agent, phiên, round, trạng thái, chi phí), `gates`, `log`, `result`, `error`, `started_at`, `finished_at`.
 
+### `agent_skills` (ADR-185)
+
+Skill mỗi agent giữ sẵn: `agent_id` (FK `agents`, cascade) + `name` là khóa, `why` (khi nào dùng), `source` (`person` | `agent` | `setup` | `library` | `call`), `uses`, `last_used_at` ('' = chưa dùng), `created_at`. Tối đa 12 mỗi agent (`agentskills.Limit`). Prompt chỉ có tên, mô tả, lý do, số lần dùng; hướng dẫn đọc bằng `use_skill`. Agent đề xuất cài skill của thư viện office bằng thẻ `actions.kind = install_skill` (ADR-187).
+
 ### `audit_log`
 
 | Cột | Kiểu | Ghi chú |

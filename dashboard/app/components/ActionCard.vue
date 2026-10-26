@@ -10,13 +10,14 @@ export interface ProposedAction {
   reason: string
   status: 'pending' | 'queued' | 'done' | 'failed' | 'rejected'
   deciding?: string // who is deciding it now (it says pending until done)
+  after_diff?: boolean // a commit that runs once its answer's diff is merged (ADR-189)
   detail: string
   proposed_by: string
   decided_by: string
   message?: string
   target_id?: string
   files?: string[]
-  // run_command: the pattern "luôn cho phép" would add (none: a risky command)
+  // run_command: the pattern "luôn cho phép" would add (none: a wrapper such as sudo)
   always?: string
   // config_change: a settings change (ADR-045)
   change?: { resource: string, op: 'create' | 'update' | 'delete', id?: string, patch?: Record<string, unknown>, before?: Record<string, unknown> }
@@ -52,6 +53,7 @@ const alwaysInfo = computed(() => {
 
 const icon = computed(() => props.action.kind === 'workflow_gate' ? 'i-lucide-user-check' : props.action.kind.endsWith('_project') ? 'i-lucide-folder-plus' : props.action.kind === 'send_message' ? 'i-lucide-send' : props.action.kind.endsWith('_automation') ? 'i-lucide-alarm-clock' : props.action.kind === 'git_commit' ? 'i-lucide-git-commit-horizontal'
   : props.action.kind === 'git_branch' ? 'i-lucide-git-branch'
+    : props.action.kind === 'git_merge' ? 'i-lucide-git-merge'
     : props.action.kind === 'git_push' ? 'i-lucide-upload'
       : props.action.kind.startsWith('stop') ? 'i-lucide-square'
   : props.action.kind.startsWith('restart') ? 'i-lucide-rotate-cw' : 'i-lucide-play')
@@ -64,6 +66,7 @@ const kindLabels: Record<string, string> = {
   stop_container: 'action.kind.stop_container',
   git_commit: 'action.kind.git_commit',
   git_branch: 'action.kind.git_branch',
+  git_merge: 'action.kind.git_merge',
   git_push: 'action.kind.git_push',
   run_command: 'action.kind.run_command',
   create_automation: 'action.kind.create_automation',
@@ -72,11 +75,13 @@ const kindLabels: Record<string, string> = {
   start_task: 'action.kind.start_task',
   run_automation: 'action.kind.run_automation',
   remember: 'action.kind.remember',
+  forget: 'action.kind.forget',
   mcp_call: 'action.kind.mcp_call',
   send_message: 'action.kind.send_message',
   workflow_gate: 'action.kind.workflow_gate',
   create_project: 'action.kind.create_project',
-  import_project: 'action.kind.import_project'
+  import_project: 'action.kind.import_project',
+  install_skill: 'action.kind.install_skill'
 }
 const kindLabel = computed(() => {
   const key = kindLabels[props.action.kind]
@@ -196,6 +201,9 @@ async function decide(approve: boolean, always = false, skip = false) {
           />
         </div>
         <p v-if="action.reason" class="text-xs text-(--ui-text-muted)">{{ action.reason }}</p>
+        <p v-if="action.after_diff && (action.status === 'pending' || action.status === 'queued')" class="flex items-center gap-1 text-xs text-(--ui-text-muted)">
+          <UIcon name="i-lucide-git-merge" class="size-3.5 shrink-0" />{{ t('action.afterDiff') }}
+        </p>
         <p v-if="action.status !== 'pending' && action.detail" class="line-clamp-2 text-xs" :title="action.detail" :class="action.status === 'failed' ? 'text-(--ui-error)' : 'text-(--ui-text-muted)'">{{ action.detail }}</p>
       </div>
       <UBadge v-if="action.status === 'pending' && action.deciding" color="info" variant="subtle" size="sm" icon="i-lucide-loader-circle" :ui="{ leadingIcon: 'animate-spin' }" :label="t('card.deciding')" :title="action.deciding" />

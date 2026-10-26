@@ -12,6 +12,7 @@ import (
 
 	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/cleanup"
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
@@ -47,11 +48,11 @@ func setup(t *testing.T) fx {
 	u := usage.New(st, time.UTC)
 	provs.SetUsage(u)
 	bin := filepath.Join(tmp, "claude")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat > /dev/null
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"- sửa lỗi thanh toán, nhánh fix/pay","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 	org := team.NewService(st, nil)
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})

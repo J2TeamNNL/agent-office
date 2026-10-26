@@ -220,7 +220,7 @@ func (c *claudeCLI) Complete(ctx context.Context, req Request) (Result, error) {
 			CacheCreationTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.Unmarshal([]byte(lastJSONObject(out)), &res); err != nil {
+	if err := json.Unmarshal([]byte(claudeResultJSON(out)), &res); err != nil {
 		return Result{}, fmt.Errorf("claude: không đọc được output JSON: %w", err)
 	}
 	if res.IsError {
@@ -804,6 +804,31 @@ func (c *antigravityCLI) Complete(ctx context.Context, req Request) (Result, err
 	}
 	return Result{Text: strings.TrimSpace(res.Response), Model: req.Model, DurationMS: time.Since(start).Milliseconds(),
 		InputTokens: res.Usage.InputTokens + res.Usage.CacheReadTokens, OutputTokens: res.Usage.OutputTokens + res.Usage.ThinkingTokens}, nil
+}
+
+// claudeResultJSON is the result object of `claude -p --output-format json`.
+// With verbose on (in the person's settings.json or env), Claude Code prints
+// every message as one JSON array instead: take its last "result" element.
+func claudeResultJSON(out string) string {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for i, l := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(l), "[") {
+			continue
+		}
+		var items []json.RawMessage
+		if json.Unmarshal([]byte(strings.Join(lines[i:], "\n")), &items) != nil {
+			continue
+		}
+		for j := len(items) - 1; j >= 0; j-- {
+			var m struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(items[j], &m) == nil && m.Type == "result" {
+				return string(items[j])
+			}
+		}
+	}
+	return lastJSONObject(out)
 }
 
 // lastJSONObject returns the last line that looks like a JSON object, since

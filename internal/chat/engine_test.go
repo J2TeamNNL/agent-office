@@ -18,6 +18,7 @@ import (
 	"github.com/tung1998/agent-office/internal/actor"
 	"github.com/tung1998/agent-office/internal/assistant"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/officetools"
 	"github.com/tung1998/agent-office/internal/perm"
@@ -200,7 +201,7 @@ func TestAnthropicToolLoopAndPatch(t *testing.T) {
 func TestClaudeCLIRunnerStreams(t *testing.T) {
 	tmp := t.TempDir()
 	bin, argsLog := filepath.Join(tmp, "claude"), filepath.Join(tmp, "args")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 echo "$*" >> `+argsLog+`
 case "$*" in *"--tools Read,Glob,Grep"*) ;; *) echo "missing read-only tools: $*" >&2; exit 2;; esac
 case "$*" in *"--permission-mode dontAsk"*) ;; *) echo "may ask or bypass: $*" >&2; exit 2;; esac
@@ -210,7 +211,7 @@ echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"typ
 echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"hello.txt"}}]}}'
 echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"chào"}}}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"Xin chào","session_id":"sess-1","total_cost_usd":0.02,"usage":{"input_tokens":5,"cache_read_input_tokens":100,"output_tokens":7}}'
-`), 0o755)
+`))
 	f := setup(t, func(provs *provider.Service) storage.Provider {
 		p, err := provs.Create(context.Background(), provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 		if err != nil {
@@ -259,13 +260,13 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Xin chào"
 func TestClaudeCLIKeepsContextAndLimits(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "claude")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat >/dev/null
 echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
 echo '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.2,"resetsAt":1790593200}}}}'
 echo '{"type":"assistant","message":{"model":"claude-sonnet-5","usage":{"input_tokens":4,"cache_read_input_tokens":1000,"cache_creation_input_tokens":0},"content":[]}}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"sess-1","usage":{"input_tokens":4,"output_tokens":2},"modelUsage":{"claude-sonnet-5":{"contextWindow":200000}}}'
-`), 0o755)
+`))
 	var prov storage.Provider
 	f := setup(t, func(provs *provider.Service) storage.Provider {
 		p, err := provs.Create(context.Background(), provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
@@ -342,7 +343,7 @@ func call(t *testing.T, dir string, n int) (args, stdin string) {
 func fakeGroupClaude(t *testing.T) (bin, dir string) {
 	dir = t.TempDir()
 	bin = filepath.Join(dir, "claude")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 while ! mkdir `+dir+`/.lock 2>/dev/null; do sleep 0.01; done
 n=$(ls `+dir+` | grep -c 'args$')
 n=$((n+1))
@@ -362,7 +363,7 @@ echo '{"type":"assistant","message":{"model":"m","usage":{"input_tokens":5,"cach
 result="$who: $reply"
 [ -f `+dir+`/raw-$who ] && result=$(cat `+dir+`/raw-$who)
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"'"$result"'","session_id":"sess-'$who'","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	return bin, dir
 }
 
@@ -474,12 +475,12 @@ func (g group) waitAuthors(t *testing.T, n int) []string {
 
 // delegateDuring hands a task to agent from inside the answer in progress,
 // as the delegate tool does (the fake CLI cannot call office's MCP).
-func (g group) delegateDuring(t *testing.T, agent, task string) {
+func (g group) delegateDuring(t *testing.T, agent, task, effort string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if turn, ok := g.engine.Active(g.conv.ID); ok {
-			if _, err := g.engine.Delegate(g.context, officetools.Scope{ProjectID: g.f.project.ID, ConversationID: g.conv.ID, RunRef: turn.ID, Agent: g.leadNm}, agent, task); err != nil {
+			if _, err := g.engine.Delegate(g.context, officetools.Scope{ProjectID: g.f.project.ID, ConversationID: g.conv.ID, RunRef: turn.ID, Agent: g.leadNm}, agent, task, effort); err != nil {
 				t.Fatal(err)
 			}
 			return
@@ -491,16 +492,57 @@ func (g group) delegateDuring(t *testing.T, agent, task string) {
 	}
 }
 
+// Work handed to an agent runs at the effort its delegator asked for, else
+// at the agent's own, never at the chat's.
+func TestDelegateEffort(t *testing.T) {
+	g := newGroup(t)
+	if err := g.engine.SetEffort(g.context, g.conv.ID, "max"); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ effort, want string }{{"low", "--effort low"}, {"", ""}} {
+		old, _ := filepath.Glob(filepath.Join(g.dir, "call*"))
+		for _, f := range old {
+			os.Remove(f)
+		}
+		os.WriteFile(filepath.Join(g.dir, "sleep-lead"), []byte("0.3"), 0o644)
+		if _, _, err := g.engine.Send(g.context, g.conv.ID, "@"+g.leadNm+" giao việc", nil); err != nil {
+			t.Fatal(err)
+		}
+		g.delegateDuring(t, "Dev", "sửa lỗi", c.effort)
+		g.waitAuthors(t, 2)
+		calls, _ := filepath.Glob(filepath.Join(g.dir, "call*.args"))
+		dev := ""
+		for _, f := range calls {
+			b, _ := os.ReadFile(f)
+			if strings.Contains(string(b), "You are Dev") {
+				dev = string(b)
+			} else if !strings.Contains(string(b), "--effort max") {
+				t.Fatalf("the lead's own turn lost the chat's effort: %s", b)
+			}
+		}
+		if dev == "" {
+			t.Fatalf("effort %q: Dev never ran", c.effort)
+		}
+		if got := strings.Contains(dev, "--effort"); got != (c.want != "") || (c.want != "" && !strings.Contains(dev, c.want)) {
+			t.Fatalf("effort %q: Dev ran with %s", c.effort, dev)
+		}
+	}
+	sc := officetools.Scope{ProjectID: g.f.project.ID, ConversationID: g.conv.ID, RunRef: "r", Agent: g.leadNm}
+	if _, err := g.engine.Delegate(g.context, sc, "Dev", "x", "huge"); err == nil {
+		t.Fatal("an unknown effort was accepted")
+	}
+}
+
 func TestDelegateChecks(t *testing.T) {
 	g := newGroup(t)
 	sc := officetools.Scope{ProjectID: g.f.project.ID, ConversationID: g.conv.ID, RunRef: "nope", Agent: g.leadNm}
-	if _, err := g.engine.Delegate(g.context, sc, "Nobody", "x"); err == nil {
+	if _, err := g.engine.Delegate(g.context, sc, "Nobody", "x", ""); err == nil {
 		t.Fatal("an unknown agent was accepted")
 	}
-	if _, err := g.engine.Delegate(g.context, sc, g.leadNm, "x"); err == nil {
+	if _, err := g.engine.Delegate(g.context, sc, g.leadNm, "x", ""); err == nil {
 		t.Fatal("delegating to itself was accepted")
 	}
-	if _, err := g.engine.Delegate(g.context, officetools.Scope{ProjectID: g.f.project.ID, TaskID: "tsk_1", Agent: g.leadNm}, "Dev", "x"); err == nil {
+	if _, err := g.engine.Delegate(g.context, officetools.Scope{ProjectID: g.f.project.ID, TaskID: "tsk_1", Agent: g.leadNm}, "Dev", "x", ""); err == nil {
 		t.Fatal("delegate outside a chat was accepted")
 	}
 }
@@ -532,11 +574,11 @@ func TestDelegateInChannelChat(t *testing.T) {
 		t.Fatal(err)
 	}
 	sc := officetools.Scope{ProjectID: g.f.project.ID, ConversationID: conv.ID, RunRef: "r1", Agent: g.leadNm}
-	if _, err := g.engine.Delegate(g.context, sc, "Dev", "sửa lỗi"); err != nil {
+	if _, err := g.engine.Delegate(g.context, sc, "Dev", "sửa lỗi", ""); err != nil {
 		t.Fatalf("delegate from a bot chat: %v", err)
 	}
 	auto, _ := g.engine.StartConversationPurpose(g.context, g.f.project.ID, "", "automation")
-	if _, err := g.engine.Delegate(g.context, officetools.Scope{ProjectID: g.f.project.ID, ConversationID: auto.ID, RunRef: "r2", Agent: g.leadNm}, "Dev", "x"); err == nil {
+	if _, err := g.engine.Delegate(g.context, officetools.Scope{ProjectID: g.f.project.ID, ConversationID: auto.ID, RunRef: "r2", Agent: g.leadNm}, "Dev", "x", ""); err == nil {
 		t.Fatal("delegate from an automation-building chat was accepted")
 	}
 }
@@ -558,12 +600,12 @@ func TestMentionInChannelChat(t *testing.T) {
 func TestFullAccessTurn(t *testing.T) {
 	tmp := t.TempDir()
 	bin, argsLog := filepath.Join(tmp, "claude"), filepath.Join(tmp, "args")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 echo "$*" >> `+argsLog+`
 cat >/dev/null
 echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"sess-1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	f := setup(t, func(provs *provider.Service) storage.Provider {
 		p, _ := provs.Create(context.Background(), provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 		return p
@@ -584,12 +626,12 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","sessi
 func fullAccessFakeBin(t *testing.T, tmp string) (bin, argsLog string) {
 	t.Helper()
 	bin, argsLog = filepath.Join(tmp, "claude"), filepath.Join(tmp, "args")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 echo "$*" >> `+argsLog+`
 cat >/dev/null
 echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"sess-1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	return bin, argsLog
 }
 
@@ -765,5 +807,48 @@ func TestDecidedInBotChatGoesToTheBot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(g.dir, "call1.args")); err == nil {
 		t.Fatal("a turn ran on the dashboard for a bot's chat")
+	}
+}
+
+// ADR-210: a hand-off tied to a task of the work board tells the board hook
+// when it starts and when it is done, with its answer.
+func TestBoardHook(t *testing.T) {
+	g := newGroup(t)
+	var mu sync.Mutex
+	var evs []chat.BoardEvent
+	g.engine.SetBoardHook(func(_ context.Context, ev chat.BoardEvent) {
+		mu.Lock()
+		evs = append(evs, ev)
+		mu.Unlock()
+	})
+	os.WriteFile(filepath.Join(g.dir, "sleep-lead"), []byte("1"), 0o644)
+	if _, _, err := g.engine.Send(g.context, g.conv.ID, "giao việc", nil); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if turn, ok := g.engine.Active(g.conv.ID); ok {
+			ctx := officetools.WithBoardTask(g.context, "item_1")
+			if _, err := g.engine.Delegate(ctx, officetools.Scope{ProjectID: g.f.project.ID, ConversationID: g.conv.ID, RunRef: turn.ID, Agent: g.leadNm}, "Dev", "sửa lỗi", ""); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no answer in progress")
+		}
+	}
+	g.waitAuthors(t, 3)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		mu.Lock()
+		n := len(evs)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(evs) != 2 || evs[0].Task != "item_1" || evs[0].Done || evs[0].Agent != "Dev" || !evs[1].Done || evs[1].Result != "dev: ok" {
+		t.Fatalf("events: %+v", evs)
 	}
 }

@@ -353,7 +353,7 @@ func scanPrompt(b storage.BurnSession, it storage.BurnItem, items []storage.Burn
 // openPiece: a piece still waiting or being done.
 func openPiece(status string) bool {
 	switch status {
-	case "found", "queued", "doing", "paused", "review":
+	case "found", "queued", "doing", "paused", "review", StatusHanded:
 		return true
 	}
 	return false

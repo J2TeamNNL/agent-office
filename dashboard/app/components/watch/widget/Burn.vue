@@ -22,7 +22,7 @@ const runItems = computed(() => {
 const count = (...s: string[]) => runItems.value.filter(i => s.includes(i.status)).length
 const counts = computed(() => [
   { key: 'found', n: count('found'), label: t('burn.col.found'), cls: 'text-(--ui-text)' },
-  { key: 'doing', n: count('doing', 'review', 'queued'), label: t('burn.col.doing'), cls: 'text-(--ui-warning)' },
+  { key: 'doing', n: count('doing', 'review', 'queued', 'handed'), label: t('burn.col.doing'), cls: 'text-(--ui-warning)' },
   { key: 'done', n: count('done'), label: t('burn.col.done'), cls: 'text-(--ui-success)' },
   { key: 'other', n: count('failed', 'skipped'), label: t('burn.col.other'), cls: 'text-(--ui-text-muted)' }
 ])

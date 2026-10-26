@@ -205,13 +205,11 @@ func (m *Manager) still(ctx context.Context, p proposal) bool {
 }
 
 // mustAsk: what is always asked, even when the chat approves directly —
-// a push, stopping something, a setting, a command that deletes.
+// a push, stopping something, a setting. Commands follow the permissions.
 func mustAsk(p proposal) bool {
 	switch p.Action {
 	case "git_push", "stop_process", "stop_container", "config_change", "update_automation":
 		return true
-	case "run_command", "run_process":
-		return perm.Risky(p.Target)
 	}
 	return false
 }

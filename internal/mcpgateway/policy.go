@@ -116,28 +116,28 @@ func (g *Gateway) gateCall(ctx context.Context, m storage.MCPServer, c Caller, i
 	case pass:
 		return nil, true
 	case deny:
-		g.logCall(ctx, m, c, tool, "denied", "", 0, "")
+		g.logCall(ctx, m, c, tool, "denied", "", 0, "", callSize{})
 		return rpcResult(id, toolResult(denyText(m, tool), true)), false
 	}
 	p, err := g.Propose(ctx, c, m.Name, tool, args)
 	if err != nil {
-		g.logCall(ctx, m, c, tool, "error", err.Error(), 0, "")
+		g.logCall(ctx, m, c, tool, "error", err.Error(), 0, "", callSize{})
 		return rpcResult(id, toolResult("office không tạo được đề xuất: "+err.Error(), true)), false
 	}
-	g.logCall(ctx, m, c, tool, "proposed", "", 0, p.ActionID)
+	g.logCall(ctx, m, c, tool, "proposed", "", 0, p.ActionID, callSize{})
 	text, isErr := proposalText(m, tool, p)
 	return rpcResult(id, toolResult(text, isErr)), false
 }
 
 // logCall records one call (best effort; a log failure never fails a call).
-func (g *Gateway) logCall(ctx context.Context, m storage.MCPServer, c Caller, tool, status, errMsg string, ms int64, actionID string) {
+func (g *Gateway) logCall(ctx context.Context, m storage.MCPServer, c Caller, tool, status, errMsg string, ms int64, actionID string, size callSize) {
 	if g.Store == nil {
 		return
 	}
 	ctx = context.WithoutCancel(ctx)
 	_ = g.Store.MCPCalls().Add(ctx, storage.MCPCall{ServerID: m.ID, ServerName: m.Name, Tool: tool,
 		Caller: c.Agent, CallerKind: c.Kind, ProjectID: c.ProjectID, ConversationID: c.ConversationID, JobID: c.JobID, ActionID: actionID,
-		Status: status, Error: firstLine(errMsg, 300), DurationMS: ms})
+		Status: status, Error: firstLine(errMsg, 300), DurationMS: ms, BytesIn: size.in, BytesOut: size.out, BytesCut: size.cut})
 	if g.logged.Add(1)%500 == 1 { // now and then, the log keeps its last CallLogDays
 		_, _ = g.Store.MCPCalls().Prune(ctx, time.Now().UTC().AddDate(0, 0, -CallLogDays))
 	}
@@ -270,29 +270,33 @@ func (g *Gateway) Invoke(ctx context.Context, c Caller, server, tool string, arg
 	}
 	switch decide(m, c, tool, g.Propose != nil) {
 	case deny:
-		g.logCall(ctx, m, c, tool, "denied", "", 0, "")
+		g.logCall(ctx, m, c, tool, "denied", "", 0, "", callSize{})
 		return denyText(m, tool), true
 	case propose:
 		p, err := g.Propose(ctx, c, m.Name, tool, args)
 		if err != nil {
-			g.logCall(ctx, m, c, tool, "error", err.Error(), 0, "")
+			g.logCall(ctx, m, c, tool, "error", err.Error(), 0, "", callSize{})
 			return "office không tạo được đề xuất: " + err.Error(), true
 		}
-		g.logCall(ctx, m, c, tool, "proposed", "", 0, p.ActionID)
+		g.logCall(ctx, m, c, tool, "proposed", "", 0, p.ActionID, callSize{})
 		return proposalText(m, tool, p)
 	}
 	start := time.Now()
 	text, isErr, err := g.CallTool(ctx, server, tool, args)
 	ms := time.Since(start).Milliseconds()
+	size := callSize{in: int64(len(args))}
 	if err != nil {
-		g.logCall(ctx, m, c, tool, "error", err.Error(), ms, "")
+		g.logCall(ctx, m, c, tool, "error", err.Error(), ms, "", size)
 		return "MCP " + server + ": " + err.Error(), true
 	}
 	status, msg := "ok", ""
 	if isErr {
 		status, msg = "error", text
 	}
-	g.logCall(ctx, m, c, tool, status, msg, ms, "")
+	var n int
+	text, n = g.cutText(c, server, tool, text)
+	size.out, size.cut = int64(len(text)), int64(n)
+	g.logCall(ctx, m, c, tool, status, msg, ms, "", size)
 	return text, isErr
 }
 

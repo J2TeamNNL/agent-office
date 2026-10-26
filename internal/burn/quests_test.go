@@ -8,6 +8,7 @@ import (
 
 	"github.com/tung1998/agent-office/internal/actions"
 	"github.com/tung1998/agent-office/internal/burn"
+	"github.com/tung1998/agent-office/internal/storage"
 )
 
 // An automation's quests (ADR-132): a project with no Burn yet gets one with
@@ -82,7 +83,40 @@ func TestQuestTools(t *testing.T) {
 		t.Fatal("the same open quest was added twice")
 	}
 	out, err = f.svc.Tool(ctx, sc, "burn_quests", burn.ToolInput{})
-	if err != nil || !strings.Contains(out, "[found] Viết test") {
+	if err != nil || !strings.Contains(out, "[found] (default agent) Viết test") {
 		t.Fatalf("quests: %q, %v", out, err)
+	}
+}
+
+// ADR-197: a quest has who follows it up: the calling agent of the project,
+// or one named; burn_quests filters by it; burn_assign hands one quest, or
+// every open quest of an agent, to another.
+func TestQuestOwners(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	for _, a := range []storage.Agent{{ProjectID: f.project.ID, Key: "ceo", Name: "Tổng giám đốc", ModelTier: storage.TierStrong}, {ProjectID: f.project.ID, Key: "cto", Name: "Giám đốc kỹ thuật", ModelTier: storage.TierStrong}} {
+		if _, err := f.st.Agents().Create(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ceo := actions.Scope{ProjectID: f.project.ID, Agent: "Tổng giám đốc"}
+	f.svc.Tool(ctx, ceo, "burn_quest", burn.ToolInput{Title: "Kế hoạch", Detail: "d"})
+	f.svc.Tool(ctx, ceo, "burn_quest", burn.ToolInput{Title: "API thanh toán", Detail: "d", Owner: "cto"})
+	if _, err := f.svc.Tool(ctx, ceo, "burn_quest", burn.ToolInput{Title: "X", Detail: "d", Owner: "nobody"}); err == nil {
+		t.Fatal("a quest went to an agent the project does not have")
+	}
+	out, _ := f.svc.Tool(ctx, ceo, "burn_quests", burn.ToolInput{Owner: "ceo"})
+	if !strings.Contains(out, "(ceo) Kế hoạch") || strings.Contains(out, "API thanh toán") {
+		t.Fatalf("the CEO's quests: %q", out)
+	}
+	if out, err := f.svc.Tool(ctx, ceo, "burn_assign", burn.ToolInput{Owner: "Giám đốc kỹ thuật", From: "ceo"}); err != nil || !strings.Contains(out, "1 quest") {
+		t.Fatalf("handover: %q %v", out, err)
+	}
+	out, _ = f.svc.Tool(ctx, ceo, "burn_quests", burn.ToolInput{Owner: "cto"})
+	if !strings.Contains(out, "(cto) Kế hoạch") || !strings.Contains(out, "(cto) API thanh toán") {
+		t.Fatalf("after the handover: %q", out)
+	}
+	if _, err := f.svc.Tool(ctx, ceo, "burn_assign", burn.ToolInput{Owner: "ceo"}); err == nil {
+		t.Fatal("assigned with neither item nor from")
 	}
 }

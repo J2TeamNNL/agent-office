@@ -9,20 +9,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tung1998/agent-office/internal/actor"
 	"github.com/tung1998/agent-office/internal/assistant"
 	"maps"
 	"os"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tung1998/agent-office/internal/audit"
 	"github.com/tung1998/agent-office/internal/deciding"
 	"github.com/tung1998/agent-office/internal/gitops"
+	"github.com/tung1998/agent-office/internal/memory"
 	"github.com/tung1998/agent-office/internal/ops"
 	"github.com/tung1998/agent-office/internal/peer"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/worktree"
 )
 
 // Kinds agents may propose.
@@ -35,6 +39,7 @@ var Kinds = map[string]string{
 	"stop_container":    "Dừng container",
 	"git_commit":        "Commit",
 	"git_branch":        "Tạo nhánh",
+	"git_merge":         "Gộp nhánh",
 	"git_push":          "Push lên remote",
 	"run_command":       "Chạy lệnh",
 	"create_automation": "Tạo tự động hóa",
@@ -42,12 +47,14 @@ var Kinds = map[string]string{
 	"config_change":     "Đổi cài đặt",
 	"run_automation":    "Chạy tự động hóa",
 	"remember":          "Ghi nhớ",
+	"forget":            "Bỏ ghi nhớ",
 	"mcp_call":          "Gọi tool MCP",
 	"send_message":      "Gửi tin sang chat khác",
 	"workflow_gate":     "Duyệt cổng quy trình",
 	"create_project":    "Tạo project",
 	"import_project":    "Nhập project",
 	"data_delete":       "Xóa bản ghi dữ liệu",
+	"install_skill":     "Cài skill cho agent",
 }
 
 // Projects makes the projects the office assistant proposes (ADR-170).
@@ -67,8 +74,6 @@ type Sender interface {
 	Relay(ctx context.Context, a storage.Action) (detail, conversationID string, err error)
 	// Relayed: the chat's last message from a person was itself relayed
 	Relayed(ctx context.Context, conversationID string) bool
-	// RelayLimit: a chain between linked projects' chats reached its cap
-	RelayLimit(ctx context.Context, conversationID string) bool
 }
 
 // SetSender turns on send_message proposals.
@@ -114,11 +119,22 @@ func isAutomation(kind string) bool {
 // Memory keeps agents' notes (ADR-068).
 type Memory interface {
 	Keep(ctx context.Context, m storage.Memory) (storage.Memory, error)
+	Revise(ctx context.Context, projectID, agentID string, add []storage.Memory, edit map[string]string, drop []string, reason string) (int, error)
 	Auto(ctx context.Context, projectID string) bool
+	Duplicate(ctx context.Context, projectID, agentID, text string) (storage.Memory, bool)
 }
 
 // SetMemory turns on remember proposals.
 func (s *Service) SetMemory(m Memory) { s.memory = m }
+
+// Skills installs library skills for an agent (ADR-187).
+type Skills interface {
+	Check(ctx context.Context, projectID, name string) error
+	Install(ctx context.Context, projectID, agentID, name, why string) (string, error)
+}
+
+// SetSkills turns on install_skill proposals.
+func (s *Service) SetSkills(k Skills) { s.skills = k }
 
 // SetConfig turns on config_change proposals.
 func (s *Service) SetConfig(c ConfigApplier) { s.config = c }
@@ -144,6 +160,13 @@ type Scope struct {
 	Agent          string
 	Level          string      // what the agent may do in this run (internal/perm)
 	Access         perm.Access // its capabilities and commands in this run
+	// Admin: the run has administrator access (ADR-074, ADR-188): what it
+	// proposes is carried out at once, all but a push to master/main and a
+	// workflow's gate (a person's by design).
+	Admin bool
+	// AdminBy: the admin an administrator's run acts for (who turned its
+	// access on, or the admin chatting): settings it changes are applied as theirs.
+	AdminBy string
 	// Dir is the run's own worktree ("" = the project folder): commands run
 	// there, and the project's allowed commands run without asking since
 	// nothing there touches the project until a person merges it.
@@ -157,6 +180,7 @@ type Service struct {
 	config   ConfigApplier
 	runner   Runner
 	memory   Memory
+	skills   Skills
 	direct   AutoApprover
 	mcp      MCPCaller
 	sender   Sender
@@ -209,6 +233,40 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 		if s.memory == nil || a.Target == "" {
 			return a, errors.New("không ghi nhớ được ở đây")
 		}
+		if utf8.RuneCountInString(a.Target) < memory.MinNote {
+			return a, errors.New("ghi chú quá ngắn để có ích lần sau: nói rõ điều gì, ở đâu")
+		}
+		id, err := s.agentID(ctx, sc.ProjectID, sc.Agent)
+		if err != nil {
+			return a, err
+		}
+		if m, dup := s.memory.Duplicate(ctx, sc.ProjectID, id, a.Target); dup && !slices.Contains(a.Args.Replaces, m.ID) {
+			return a, fmt.Errorf("đã có trong sổ ghi nhớ (%s): %q; sửa nó thì ghi lại với replaces", m.ID, m.Text)
+		}
+		a.TargetID = id
+	} else if kind == "forget" { // notes of the agent's own that are wrong or outdated (ADR-215)
+		if s.memory == nil || len(a.Args.Replaces) == 0 {
+			return a, errors.New("không bỏ ghi nhớ được ở đây: cần id (recall cho thấy id)")
+		}
+		id, err := s.agentID(ctx, sc.ProjectID, sc.Agent)
+		if err != nil {
+			return a, err
+		}
+		a.TargetID = id
+		own, _ := s.store.Memories().List(ctx, sc.ProjectID, id)
+		if !slices.ContainsFunc(own, func(m storage.Memory) bool { return slices.Contains(a.Args.Replaces, m.ID) }) {
+			return a, errors.New("không có ghi nhớ nào của bạn với id đó (recall cho thấy id)")
+		}
+		if a.Target == "" {
+			a.Target = strings.Join(a.Args.Replaces, ", ")
+		}
+	} else if kind == "install_skill" { // a library skill into the project, for the agent proposing it
+		if s.skills == nil || a.Target == "" {
+			return a, errors.New("không cài skill được ở đây")
+		}
+		if err := s.skills.Check(ctx, sc.ProjectID, a.Target); err != nil {
+			return a, err
+		}
 		id, err := s.agentID(ctx, sc.ProjectID, sc.Agent)
 		if err != nil {
 			return a, err
@@ -223,9 +281,20 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 		if sc.ConversationID == "" || a.Target == "" || a.Reason == "" {
 			return a, errors.New("cổng quy trình cần cuộc chat, tên cổng và điều cần duyệt")
 		}
-	} else if kind == "create_project" || kind == "import_project" { // only the office assistant (ADR-170)
-		if !sc.Office || s.projects == nil || a.Args.NewProject == nil {
-			return a, errors.New("chỉ trợ lý office tạo hay nhập project")
+	} else if kind == "create_project" || kind == "import_project" { // the office assistant (ADR-170), or an administrator under its project (ADR-191)
+		if !(sc.Office || sc.Admin) || s.projects == nil || a.Args.NewProject == nil {
+			return a, errors.New("chỉ trợ lý office hay agent chạy như administrator tạo hay nhập project")
+		}
+		if np := a.Args.NewProject; !sc.Office {
+			if np.Parent == "" {
+				np.Parent = sc.ProjectID
+			}
+			if np.Parent != sc.ProjectID {
+				if _, err := perm.LinkedProject(ctx, s.store, sc.ProjectID, np.Parent); err != nil {
+					return a, err
+				}
+			}
+			np.Path = "" // a new folder (or a clone), never one of the machine's
 		}
 		if (kind == "import_project") != (a.Args.NewProject.Pack != "") {
 			return a, errors.New("nhập project cần gói project (pack); tạo project thì không")
@@ -284,10 +353,16 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 	} else if isGit(kind) {
 		// a run in its own worktree: git works on the project, once what the
 		// worktree changed is merged into it (its diffs decided)
-		if sc.Dir != "" && s.unmerged(ctx, sc.ConversationID) {
+		// a commit asked in the same turn as the edits waits for them (ADR-189)
+		after := kind == "git_commit" && sc.Dir != "" && s.pendingTree(ctx, sc)
+		if !after && sc.Dir != "" && s.unmerged(ctx, sc.ConversationID) {
 			return a, errors.New("thay đổi trong worktree riêng của cuộc chat chưa được gộp vào project: nhờ người dùng duyệt diff đang chờ (trên Discord/Telegram: /pending rồi /approve <số>; hoặc Tổng quan → Cần xử lý), rồi đề xuất lại commit/nhánh/push")
 		}
-		if err := s.checkGit(ctx, &a); err != nil {
+		if after {
+			if err := s.checkAfterDiff(ctx, sc, &a); err != nil {
+				return a, err
+			}
+		} else if err := s.checkGit(ctx, &a); err != nil {
 			return a, err
 		}
 	} else if kind == "run_command" {
@@ -347,9 +422,22 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 	if err != nil {
 		return a, err
 	}
+	if a.Args.AfterDiff {
+		return a, nil // decided once its turn's diff is merged (RunDeferred) or by a person
+	}
 	// within the agent's permission package and the project's allow lists,
 	// office carries it out right away
-	if s.autoAllowed(ctx, a, sc.Access) {
+	if sc.Admin && sc.AdminBy != "" {
+		ctx = WithPrincipal(ctx, sc.AdminBy)
+	}
+	if !sc.Admin && a.Kind == "config_change" && PrincipalOf(ctx) == "" { // a change on the agent's own permission (ADR-194): in the name of the person its turn speaks for
+		if j, err := s.store.Jobs().Get(ctx, a.JobID); err == nil {
+			if as, ok := storage.SpeaksFor(ctx, s.store, j); ok {
+				ctx = WithPrincipal(ctx, strings.TrimPrefix(as, "human:"))
+			}
+		}
+	}
+	if (sc.Admin && s.adminAllowed(ctx, a)) || s.autoAllowed(ctx, a, sc.Access) {
 		done, err := s.Decide(ctx, a.ID, true, "auto:"+sc.Agent+" ("+perm.Label(sc.Access.Level)+")")
 		s.auditAuto(ctx, sc, done, err)
 		return done, err
@@ -375,6 +463,32 @@ func (s *Service) Propose(ctx context.Context, sc Scope, kind, target, reason st
 	return a, nil
 }
 
+// RunDeferred carries out a commit held for its turn's diff (ADR-189) when
+// the run's permissions (or the chat's direct mode) allow it: now that the
+// diff is merged, or queued (blocked) behind a diff still waiting for a
+// person, to run once that is decided. Else it waits for a person.
+func (s *Service) RunDeferred(ctx context.Context, sc Scope, id string, blocked bool) (storage.Action, error) {
+	a, err := s.store.Actions().Get(ctx, id)
+	if err != nil || a.Status != "pending" || !a.Args.AfterDiff {
+		return a, err
+	}
+	if s.autoAllowed(ctx, a, sc.Access) {
+		by := "auto:" + sc.Agent + " (" + perm.Label(sc.Access.Level) + ")"
+		if blocked {
+			return s.Queue(ctx, a.ID, by)
+		}
+		done, err := s.Decide(ctx, a.ID, true, by)
+		s.auditAuto(ctx, sc, done, err)
+		return done, err
+	}
+	if s.direct != nil && a.JobID != "" && !blocked {
+		if by, ok := s.direct(ctx, a); ok {
+			return s.Decide(ctx, a.ID, true, by)
+		}
+	}
+	return a, nil
+}
+
 // auditAuto logs an action office carried out on the agent's own permission
 // (no person approved it) as the agent's change (ADR-043).
 func (s *Service) auditAuto(ctx context.Context, sc Scope, a storage.Action, err error) {
@@ -392,12 +506,66 @@ func (s *Service) auditAuto(ctx context.Context, sc Scope, a storage.Action, err
 
 // autoAllowed: the run's capabilities decide, within the project's allow
 // lists (processes, containers, commands). Push always needs a person.
+// adminAllowed: what an administrator's run carries out without asking
+// (ADR-188). Loop guards on relayed messages still hold.
+func (s *Service) adminAllowed(ctx context.Context, a storage.Action) bool {
+	switch a.Kind {
+	case "workflow_gate":
+		return false // the point of the gate: a person decides
+	case "git_push":
+		return !s.PushesProtected(ctx, a)
+	case "send_message":
+		return s.autoAllowed(ctx, a, perm.Access{Caps: []string{perm.CapChatSend, perm.CapChatCross}})
+	}
+	return true
+}
+
+type principalKey struct{}
+
+// WithPrincipal: the admin an administrator's run acts for (ADR-188); a
+// settings change it approves is applied in their name.
+func WithPrincipal(ctx context.Context, email string) context.Context {
+	return context.WithValue(ctx, principalKey{}, email)
+}
+
+// PrincipalOf is the admin set by WithPrincipal ("" = none).
+func PrincipalOf(ctx context.Context) string {
+	v, _ := ctx.Value(principalKey{}).(string)
+	return v
+}
+
+// ProtectedBranches never get a push without a person (ADR-188).
+var ProtectedBranches = []string{"master", "main"}
+
+// PushesProtected: the push would land on a protected branch, the current
+// one or the one it tracks (unknown counts as protected).
+func (s *Service) PushesProtected(ctx context.Context, a storage.Action) bool {
+	root, err := s.projectPath(ctx, a.ProjectID)
+	if err != nil {
+		return true
+	}
+	st, err := gitops.ReadStatus(ctx, root)
+	if err != nil {
+		return true
+	}
+	_, upstream, _ := strings.Cut(st.Upstream, "/")
+	return slices.Contains(ProtectedBranches, st.Branch) || slices.Contains(ProtectedBranches, upstream)
+}
+
 func (s *Service) autoAllowed(ctx context.Context, a storage.Action, acc perm.Access) bool {
 	switch a.Kind {
 	case "remember": // the project keeps its agents' notes on its own, or a person reads each
-		return s.memory != nil && s.memory.Auto(ctx, a.ProjectID)
-	case "create_automation", "update_automation", "config_change", "run_automation":
+		return s.memory != nil && s.memory.Auto(ctx, a.ProjectID) && a.Reason != "" && s.keptThisTurn(ctx, a) < memory.AutoPerTurn
+	case "forget": // its own notes, kept as a revision that can be put back (ADR-215)
+		return s.memory != nil && s.memory.Auto(ctx, a.ProjectID) && a.Reason != ""
+	case "create_automation", "update_automation": // within bounds, an agent that manages itself (ADR-194)
+		return acc.Can(perm.CapSelf) && s.selfAutomation(ctx, a)
+	case "config_change":
+		return acc.Can(perm.CapSelf) && s.selfChange(ctx, a.ProjectID, a.Args.Change)
+	case "run_automation":
 		return false // code that runs unattended, or settings: a person always decides
+	case "install_skill":
+		return false // files written into the project: a person decides
 	case "mcp_call":
 		return false // the gateway already let through what the agent may call itself
 	case "workflow_gate":
@@ -410,20 +578,19 @@ func (s *Service) autoAllowed(ctx context.Context, a storage.Action, acc perm.Ac
 		if s.sender == nil {
 			return false
 		}
-		if a.Args.Peer != "" || (a.Args.Project != "" && a.Args.Project != a.ProjectID) { // a linked project's chat (or another office's): another office's chain within its cap
-			return acc.Can(perm.CapChatCross) && !s.sender.RelayLimit(ctx, a.ConversationID)
+		if a.Args.Peer != "" || (a.Args.Project != "" && a.Args.Project != a.ProjectID) { // a linked project's chat (or another office's)
+			return acc.Can(perm.CapChatCross)
 		}
 		return acc.Can(perm.CapChatSend) && !s.sender.Relayed(ctx, a.ConversationID)
 	case "git_commit":
 		return acc.Can(perm.CapCommit)
 	case "git_branch":
 		return acc.Can(perm.CapBranch)
+	case "git_merge": // a Burn run's branch passed its review (ADR-196); anything else: a person decides
+		return acc.Can(perm.CapCommit) && strings.HasPrefix(a.Args.Branch, "burn/")
 	case "git_push":
 		return false // publishing code always needs a person
 	case "run_command":
-		if perm.Risky(a.Target) {
-			return false // always asked, never auto-run, even for a pattern saved before this check existed
-		}
 		args, _ := perm.SplitCommand(a.Target)
 		if _, safe := perm.MatchCommand(acc.Safe, args); safe {
 			return true // checks and reads, from read only
@@ -563,8 +730,8 @@ func (s *Service) Queue(ctx context.Context, id, by string) (storage.Action, err
 }
 
 // DecideAlways approves a proposed command, then lets its agent run the like
-// of it on its own from now on (perm.SuggestPattern, perm.AllowAlways). Risky
-// commands and wrappers are refused before anything runs. An error means
+// of it on its own from now on (perm.SuggestPattern, perm.AllowAlways). A
+// wrapper (sudo, bash…) is refused before anything runs. An error means
 // nothing was decided; once it ran, a permission that could not be saved is
 // in Allowed.Error.
 func (s *Service) DecideAlways(ctx context.Context, id, by string) (storage.Action, perm.Allowed, error) {
@@ -673,6 +840,12 @@ func (s *Service) checkGit(ctx context.Context, a *storage.Action) error {
 			return errors.New("cần tên nhánh")
 		}
 		a.Target = a.Args.Branch
+	case "git_merge":
+		a.Args.Branch = strings.TrimSpace(firstNonEmpty(a.Args.Branch, a.Target))
+		if a.Args.Branch == "" {
+			return errors.New("cần tên nhánh để gộp")
+		}
+		a.Target = a.Args.Branch
 	case "git_push":
 		st, err := gitops.ReadStatus(ctx, root)
 		if err != nil {
@@ -681,6 +854,24 @@ func (s *Service) checkGit(ctx context.Context, a *storage.Action) error {
 		a.Target = st.Branch
 	}
 	return nil
+}
+
+// changedOf keeps of files those the project has changes in.
+func changedOf(ctx context.Context, root string, files []string) ([]string, error) {
+	st, err := gitops.ReadStatus(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	var keep []string
+	for _, c := range st.Changes {
+		if slices.Contains(files, c.Path) {
+			keep = append(keep, c.Path)
+		}
+	}
+	if len(keep) == 0 {
+		return nil, errors.New("không có thay đổi nào của lượt này trong project để commit (diff bị bỏ qua hoặc chưa gộp)")
+	}
+	return keep, nil
 }
 
 func (s *Service) projectPath(ctx context.Context, projectID string) (string, error) {
@@ -705,6 +896,21 @@ func sameFiles(a, b []string) bool {
 	return slices.Equal(a, b)
 }
 
+// keptThisTurn counts the notes the turn of a already kept on its own.
+func (s *Service) keptThisTurn(ctx context.Context, a storage.Action) int {
+	if a.RunRef == "" {
+		return 0
+	}
+	list, _ := s.store.Actions().List(ctx, "", "", a.RunRef)
+	n := 0
+	for _, x := range list {
+		if x.Kind == "remember" && x.Status == "done" && x.ID != a.ID {
+			n++
+		}
+	}
+	return n
+}
+
 func firstNonEmpty(a, b string) string {
 	if strings.TrimSpace(a) != "" {
 		return a
@@ -717,8 +923,27 @@ func (s *Service) run(ctx context.Context, a storage.Action) error {
 		return nil // approved: the workflow goes on (its coordinator is called back, ADR-084)
 	}
 	if a.Kind == "remember" {
-		_, err := s.memory.Keep(ctx, storage.Memory{ProjectID: a.ProjectID, AgentID: a.TargetID, Text: a.Target, Source: "agent",
-			CreatedBy: a.ProposedBy, Topic: a.Args.Topic, Summary: a.Args.Summary})
+		m := storage.Memory{ProjectID: a.ProjectID, AgentID: a.TargetID, Text: a.Target, Source: "agent",
+			CreatedBy: a.ProposedBy, Topic: a.Args.Topic, Summary: a.Args.Summary}
+		if len(a.Args.Replaces) > 0 { // in the place of what it corrects (ADR-215)
+			_, err := s.memory.Revise(ctx, a.ProjectID, a.TargetID, []storage.Memory{m}, nil, a.Args.Replaces, "ghi đè: "+a.Reason)
+			return err
+		}
+		_, err := s.memory.Keep(ctx, m)
+		return err
+	}
+	if a.Kind == "forget" {
+		n, err := s.memory.Revise(ctx, a.ProjectID, a.TargetID, nil, nil, a.Args.Replaces, "bỏ: "+a.Reason)
+		if err == nil && n == 0 {
+			return errors.New("không có ghi nhớ nào của bạn với id đó (recall cho thấy id)")
+		}
+		return err
+	}
+	if a.Kind == "install_skill" {
+		if s.skills == nil {
+			return errors.New("không cài skill được ở đây")
+		}
+		_, err := s.skills.Install(ctx, a.ProjectID, a.TargetID, a.Target, a.Args.Summary)
 		return err
 	}
 	if a.Kind == "run_automation" {
@@ -732,8 +957,17 @@ func (s *Service) run(ctx context.Context, a storage.Action) error {
 		if s.projects == nil || a.Args.NewProject == nil {
 			return errors.New("không tạo project được ở đây")
 		}
-		_, err := s.projects.CreateProject(ctx, *a.Args.NewProject)
-		return err
+		if by := s.owner(ctx, a); strings.Contains(by, "@") { // its automations get an owner (ADR-194)
+			ctx = actor.With(ctx, "human:"+by)
+		}
+		r, err := s.projects.CreateProject(ctx, *a.Args.NewProject)
+		if err != nil {
+			return err
+		}
+		if by := PrincipalOf(ctx); by != "" { // an administrator's run made it (ADR-191)
+			return s.inheritAdmin(ctx, r.ID, by, nil)
+		}
+		return nil
 	}
 	if a.Kind == "data_delete" {
 		c, err := s.store.Collections().Get(ctx, a.ProjectID, a.Args.Record.Collection)
@@ -750,8 +984,27 @@ func (s *Service) run(ctx context.Context, a storage.Action) error {
 		if s.config == nil {
 			return errors.New("không đổi được cài đặt ở đây")
 		}
-		_, err := s.config.ApplyChange(ctx, a)
-		return err
+		// an agent an administrator's run adds works as its makers do (ADR-207),
+		// and so does one it makes a lead (ADR-214)
+		by, had := PrincipalOf(ctx), map[string]bool{}
+		agentChange := by != "" && a.Args.Change != nil && a.Args.Change.Resource == "agent"
+		newAgent := agentChange && a.Args.Change.Op == "create"
+		if newAgent {
+			agents, _ := s.store.Agents().List(ctx, a.ProjectID)
+			for _, x := range agents {
+				had[x.ID] = true
+			}
+		}
+		if _, err := s.config.ApplyChange(ctx, a); err != nil {
+			return err
+		}
+		if newAgent {
+			return s.inheritAdmin(ctx, a.ProjectID, by, had)
+		}
+		if agentChange && a.Args.Change.Op == "update" {
+			return s.leadAdmin(ctx, a.Args.Change.ID, by)
+		}
+		return nil
 	}
 	if isAutomation(a.Kind) {
 		return s.saveAutomation(ctx, a)
@@ -763,9 +1016,17 @@ func (s *Service) run(ctx context.Context, a storage.Action) error {
 		}
 		switch a.Kind {
 		case "git_commit":
-			_, err = gitops.Commit(ctx, root, a.Args.Message, a.Args.Files)
+			files := a.Args.Files
+			if a.Args.AfterDiff { // only what reached the project: a file the person left out of the diff is not there
+				if files, err = changedOf(ctx, root, files); err != nil {
+					return err
+				}
+			}
+			_, err = gitops.Commit(ctx, root, a.Args.Message, files)
 		case "git_branch":
 			err = gitops.CreateBranch(ctx, root, a.Args.Branch)
+		case "git_merge":
+			_, _, err = gitops.Merge(ctx, root, a.Args.Branch)
 		case "git_push":
 			_, err = gitops.Push(ctx, root)
 		}
@@ -801,8 +1062,10 @@ func (s *Service) checkSend(ctx context.Context, sc Scope, a *storage.Action) er
 	if sc.ConversationID == "" || sc.JobID == "" {
 		return errors.New("chỉ gửi được từ một cuộc chat")
 	}
-	if j, err := s.store.Jobs().Get(ctx, sc.JobID); err != nil || !strings.HasPrefix(j.CreatedBy, "human:") {
-		return errors.New("chỉ gửi thay được khi lượt chat do một người gửi (không phải bot hay tự động hóa)")
+	if j, err := s.store.Jobs().Get(ctx, sc.JobID); err != nil {
+		return errors.New("không rõ lượt chat gửi tin này")
+	} else if _, ok := storage.SpeaksFor(ctx, s.store, j); !ok {
+		return errors.New("chỉ gửi thay được khi lượt chat do một người gửi, hoặc tự động hóa theo lịch có người chịu trách nhiệm (không phải bot hay webhook)")
 	}
 	if strings.TrimSpace(a.Args.Message) == "" {
 		return errors.New("thiếu nội dung tin nhắn")
@@ -947,6 +1210,54 @@ func (s *Service) checkRun(ctx context.Context, a *storage.Action) error {
 
 // unmerged: the conversation (a chat in its own worktree) has diffs still
 // waiting to be merged into the project. No conversation: nothing to check.
+// pendingTree: the run's worktree has changes not in the project yet, made
+// in this turn or waiting in a diff.
+func (s *Service) pendingTree(ctx context.Context, sc Scope) bool {
+	if files, err := worktree.Changed(ctx, sc.Dir); err == nil && len(files) > 0 {
+		return true
+	}
+	return sc.ConversationID != "" && s.unmerged(ctx, sc.ConversationID)
+}
+
+// checkAfterDiff checks a commit held for its turn's diff: its files are the
+// worktree's changes (those named, or all of them: never the project's other
+// changes, another chat's).
+func (s *Service) checkAfterDiff(ctx context.Context, sc Scope, a *storage.Action) error {
+	if _, err := s.projectPath(ctx, a.ProjectID); err != nil {
+		return err
+	}
+	a.Args.Message = strings.TrimSpace(firstNonEmpty(a.Args.Message, a.Target))
+	if a.Args.Message == "" {
+		return errors.New("commit cần message")
+	}
+	files := a.Args.Files
+	if len(files) == 0 {
+		files, _ = worktree.Changed(ctx, sc.Dir)
+		if ps, err := s.store.Chat().ListPatches(ctx, sc.ConversationID); err == nil {
+			for _, p := range ps {
+				if p.Status == "pending" || p.Status == "queued" {
+					files = append(files, p.Files...)
+				}
+			}
+		}
+	}
+	var keep []string
+	for _, f := range files {
+		if f = strings.TrimPrefix(strings.TrimSpace(f), "./"); f != "" && !slices.Contains(keep, f) {
+			keep = append(keep, f)
+		}
+	}
+	if denied := perm.LoadPolicy(ctx, s.store, a.ProjectID).Denied(keep); len(denied) > 0 {
+		return fmt.Errorf("không được commit file cấm: %s", strings.Join(denied, ", "))
+	}
+	if len(keep) == 0 {
+		return errors.New("không có thay đổi nào để commit")
+	}
+	a.Args.Files, a.Args.AfterDiff = keep, true
+	a.Target = strings.SplitN(a.Args.Message, "\n", 2)[0]
+	return nil
+}
+
 func (s *Service) unmerged(ctx context.Context, conversationID string) bool {
 	if conversationID == "" {
 		return true // a run in a worktree of its own with nothing to show for it: keep git away

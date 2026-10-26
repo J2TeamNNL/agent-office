@@ -116,6 +116,8 @@ type Store interface {
 
 	Providers() ProviderRepo
 	Agents() AgentRepo
+	// AgentSkills are the skills each agent keeps at hand (ADR-185).
+	AgentSkills() AgentSkillRepo
 	Repos() RepoRepo
 	Revisions() RevisionRepo
 	Runs() RunRepo
@@ -311,7 +313,10 @@ type MCPCall struct {
 	Status                         string // ok | error | proposed | denied
 	Error                          string
 	DurationMS                     int64
-	CreatedAt                      time.Time
+	// BytesIn: the request; BytesOut: the answer the caller got; BytesCut:
+	// what office cut out of a long result (ADR-183)
+	BytesIn, BytesOut, BytesCut int64
+	CreatedAt                   time.Time
 }
 
 // MCPCallStat sums a server's calls since a time.
@@ -320,6 +325,8 @@ type MCPCallStat struct {
 	Calls    int        `json:"calls"`
 	Errors   int        `json:"errors"`
 	Proposed int        `json:"proposed"`
+	BytesOut int64      `json:"bytes_out"` // answers sent (ADR-183)
+	BytesCut int64      `json:"bytes_cut"` // cut out of long results
 	LastAt   *time.Time `json:"last_at"`
 }
 

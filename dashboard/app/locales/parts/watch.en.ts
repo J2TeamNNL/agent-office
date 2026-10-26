@@ -238,7 +238,24 @@ const en: Record<keyof typeof vi, string> = {
   'watchW.burn.open': 'Open the Burn page',
   'watchW.burnwork.add': 'Add a quest for Burn…',
   'watchW.burnwork.none': 'Burn has no open work',
-  'watchW.consoles.more': '{n} more consoles do not fit; make the box larger'
+  'watchW.consoles.more': '{n} more consoles do not fit; make the box larger',
+  'watchW.kind.tasks': 'Work board',
+  'watchW.desc.tasks': 'Each project\'s open, in progress, done and failed work (with its linked projects)',
+  'watchW.kind.team': 'Agents at work',
+  'watchW.desc.team': 'Each agent\'s runs, errors and cost over the period',
+  'watchW.kind.changes': 'Setup changes',
+  'watchW.desc.changes': 'Who changed agents, workflows, schedules, tables, and when',
+  'watchW.tasks.line': '{open} open · {doing} in progress · {done} done',
+  'watchW.tasks.failed': '{n} failed',
+  'watchW.team.none': 'No agent has run yet',
+  'watchW.team.errors': '{n} errors',
+  'watchW.changes.none': 'No setup changes yet',
+  'watchW.kind.officemap': 'Office map',
+  'watchW.desc.officemap': 'The board room and the departments, agents at their desks: idle ones doze off, busy ones type, hand-offs and talk fly across',
+  'watchW.officemap.none': 'The project has no map process (the Startup pack\'s node ban-do/server.mjs): add it in Operations',
+  'watchW.officemap.stopped': 'The office map process is stopped',
+  'watchW.officemap.noPort': 'The map is starting',
+  'watchW.officemap.start': 'Start the map'
 }
 
 export default en

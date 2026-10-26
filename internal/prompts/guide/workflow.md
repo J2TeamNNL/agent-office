@@ -40,7 +40,7 @@ Header (office enforces these rules at run time):
 - inputs / outputs: lists of { key, description, required, type } (output type: string | number | boolean | list | json; a wrong type makes workflow_done fail). inputs are what the caller gives (a parent workflow passes them by key); outputs are named results, and workflow_done must have every required key.
 - callable: chat (only #key in chat) | sub (only called by other workflows, hidden from the / suggestions) | empty = both.
 - prefer in a role: { tier: strong|balanced|fast, family: anthropic|openai|google|… } so office can suggest an agent at install.
-- parallel: groups of roles that run at the same time; limits: rounds (times one role may be asked again), turns (total turns), timeout, budget_usd, depth (levels of sub-workflows nested below, default 2, max 5), concurrency (roles working at once in the whole tree of sub-workflows, default 6), idle (report a role working too long, e.g. 15m); budget_usd includes the cost of sub-workflows.
+- parallel: groups of roles that run at the same time; limits: rounds (times one role may be asked again), turns (total turns), timeout (past it the chat is told; the run goes on), budget_usd, depth (levels of sub-workflows nested below, default 2, max 5), concurrency (roles working at once in the whole tree of sub-workflows, default 6), idle (report a role working too long, e.g. 15m); budget_usd includes the cost of sub-workflows.
 - brief: required parts of a brief (outcome, question, context, constraints, current_option, tried, files, done_when, must_not).
 - gates (must pass before finishing): key, name, kind: approve (the person approves) | check (the project's check command), required.
 - vote: roles, quorum, veto [roles with veto power].

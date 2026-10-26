@@ -89,6 +89,9 @@ type mcpCallDTO struct {
 	Status         string    `json:"status"`
 	Error          string    `json:"error"`
 	DurationMS     int64     `json:"duration_ms"`
+	BytesIn        int64     `json:"bytes_in"`
+	BytesOut       int64     `json:"bytes_out"`
+	BytesCut       int64     `json:"bytes_cut"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
@@ -104,7 +107,7 @@ func (s *server) mcpCalls(w http.ResponseWriter, r *http.Request) {
 	for _, c := range list {
 		out = append(out, mcpCallDTO{ID: c.ID, Server: c.ServerName, Tool: c.Tool, Caller: c.Caller, CallerKind: c.CallerKind,
 			ProjectID: c.ProjectID, ConversationID: c.ConversationID, ActionID: c.ActionID, Status: c.Status, Error: c.Error,
-			DurationMS: c.DurationMS, CreatedAt: c.CreatedAt})
+			DurationMS: c.DurationMS, BytesIn: c.BytesIn, BytesOut: c.BytesOut, BytesCut: c.BytesCut, CreatedAt: c.CreatedAt})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"calls": out, "keep_days": mcpgateway.CallLogDays})
 }

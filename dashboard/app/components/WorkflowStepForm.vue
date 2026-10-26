@@ -177,6 +177,10 @@ const onErrorItems = computed(() => [{ label: t('wf.step.onErrorStop'), value: '
       <UFormField :label="t('wf.step.prompt')" :hint="miss('prompt')" :ui="ui">
         <UTextarea :model-value="step.prompt ?? ''" :rows="5" autoresize :maxrows="16" class="w-full" @update:model-value="v => patch({ prompt: String(v) })" />
       </UFormField>
+      <UFormField>
+        <template #label><InfoLabel :label="t('wf.step.skill')" :info="t('wf.step.skillInfo')" /></template>
+        <UInput :model-value="step.skill ?? ''" size="sm" class="w-full font-mono" :placeholder="t('wf.step.skillPlaceholder')" @update:model-value="v => patch({ skill: String(v).trim() || undefined })" />
+      </UFormField>
     </template>
 
     <!-- coordinate: an agent decides inside the step (ADR-111) -->

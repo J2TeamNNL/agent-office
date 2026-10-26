@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tung1998/agent-office/internal/features"
 	"github.com/tung1998/agent-office/internal/peer"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/team"
@@ -19,7 +20,7 @@ import (
 
 // What a project pack may carry (ADR-170). Code goes by git only.
 const (
-	IncludeConfig = "config" // agents, their permissions, workflows
+	IncludeConfig = "config" // agents, their permissions, workflows, scheduled automations, policy, data tables (ADR-190), Burn (ADR-196)
 	IncludeChats  = "chats"  // the project's chats and their messages
 	IncludeMemory = "memory" // the agents' notes
 )
@@ -29,6 +30,10 @@ var Includes = []string{IncludeConfig, IncludeChats, IncludeMemory}
 
 // PackFile is the pack's one entry in its zip.
 const PackFile = "project.json"
+
+// RepoPackFile is a pack kept in a repo, as JSON (ADR-190): a project made
+// from that folder or a clone of it imports it.
+const RepoPackFile = "office.pack.json"
 
 // MaxPack bounds a pack read from a file, a link or another office.
 const MaxPack = 64 << 20
@@ -42,6 +47,12 @@ type Pack struct {
 	Project    ProjectSpec  `json:"project"`
 	Chats      []PackChat   `json:"chats,omitempty"`
 	Memories   []PackMemory `json:"memories,omitempty"`
+	// With config (ADR-190):
+	Automations []PackAutomation `json:"automations,omitempty"`
+	Policy      *PackPolicy      `json:"policy,omitempty"`
+	Features    *features.Config `json:"features,omitempty"`
+	Collections []PackCollection `json:"collections,omitempty"`
+	Burn        *PackBurn        `json:"burn,omitempty"` // ADR-196
 }
 
 // PackChat is a chat; agents are named by key.
@@ -114,6 +125,11 @@ func (s *Service) ExportPack(ctx context.Context, repoID string, include []strin
 	for _, a := range agents {
 		keyOf[a.ID] = a.Key
 	}
+	if slices.Contains(include, IncludeConfig) {
+		if err := s.exportSetup(ctx, r, keyOf, &p); err != nil {
+			return p, err
+		}
+	}
 	if slices.Contains(include, IncludeChats) {
 		convs, err := s.store.Chat().ListConversationsFrom(ctx, r.ID, "all", 100000)
 		if err != nil {
@@ -183,16 +199,32 @@ func ReadZip(data []byte) (Pack, error) {
 		if err := json.NewDecoder(io.LimitReader(rc, 4*MaxPack)).Decode(&p); err != nil {
 			return Pack{}, bad
 		}
-		if p.Version != Version && p.Version != 1 {
-			return Pack{}, fmt.Errorf("không hỗ trợ gói project version %d", p.Version)
-		}
-		if strings.TrimSpace(p.Project.Name) == "" {
-			return Pack{}, errors.New("gói project không có tên project")
-		}
-		p.Include = CleanIncludes(p.Include)
-		return p, nil
+		return checkPack(p)
 	}
 	return Pack{}, bad
+}
+
+// ReadPack reads a pack as a zip or as its JSON (RepoPackFile).
+func ReadPack(data []byte) (Pack, error) {
+	if bytes.HasPrefix(data, []byte("PK")) {
+		return ReadZip(data)
+	}
+	var p Pack
+	if err := json.Unmarshal(data, &p); err != nil {
+		return Pack{}, fmt.Errorf("gói project không đọc được: %w", err)
+	}
+	return checkPack(p)
+}
+
+func checkPack(p Pack) (Pack, error) {
+	if p.Version != Version && p.Version != 1 {
+		return Pack{}, fmt.Errorf("không hỗ trợ gói project version %d", p.Version)
+	}
+	if strings.TrimSpace(p.Project.Name) == "" {
+		return Pack{}, errors.New("gói project không có tên project")
+	}
+	p.Include = CleanIncludes(p.Include)
+	return p, nil
 }
 
 // ImportPack puts what include picks of p into project r: config replaces
@@ -208,6 +240,11 @@ func (s *Service) ImportPack(ctx context.Context, p Pack, r storage.Repo, includ
 		got, err := s.Import(ctx, Bundle{Version: Version, Projects: []ProjectSpec{spec}}, false)
 		if err != nil {
 			return res, err
+		}
+		for _, c := range got.Changes { // a pack whose config does not take is not half put in
+			if c.Kind == "project" && c.Op == "skip" {
+				return res, errors.New("gói project không nhập được: " + c.Detail)
+			}
 		}
 		res.Changes = append(res.Changes, got.Changes...)
 	}
@@ -226,6 +263,13 @@ func (s *Service) ImportPack(ctx context.Context, p Pack, r storage.Repo, includ
 	byKey := map[string]storage.Agent{}
 	for _, a := range agents {
 		byKey[a.Key] = a
+	}
+	if slices.Contains(include, IncludeConfig) {
+		got, err := s.importSetup(ctx, p, r, byKey)
+		res.Changes = append(res.Changes, got...)
+		if err != nil {
+			return res, err
+		}
 	}
 	if slices.Contains(include, IncludeChats) {
 		for _, pc := range p.Chats {

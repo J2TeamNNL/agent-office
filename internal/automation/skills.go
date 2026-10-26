@@ -185,6 +185,22 @@ func ExpandSkillCall(home, projectPath, text string) (string, *SkillRef, error) 
 	if !ok {
 		return text, nil, nil
 	}
+	skill, body, others, err := LoadSkill(home, projectPath, name)
+	if err != nil {
+		return "", nil, err
+	}
+	if skill.Kind == "command" {
+		return prompts.Render("chat/command-call", map[string]any{"Name": name, "File": skill.Path, "Body": strings.TrimSpace(commandArgs(body, rest)), "Request": rest}), &skill, nil
+	}
+	if rest == "" {
+		rest = "(no further request; follow the skill)"
+	}
+	return prompts.Render("chat/skill-call", map[string]any{"Name": name, "Dir": skill.Path, "Body": body, "Others": others, "Request": rest}), &skill, nil
+}
+
+// LoadSkill reads a skill or command of the project by name: its
+// instructions and, for a skill, the other files of its folder.
+func LoadSkill(home, projectPath, name string) (SkillRef, string, []string, error) {
 	var skill *SkillRef
 	for _, s := range ProjectSkills(home, projectPath) {
 		if s.Name == name {
@@ -194,11 +210,11 @@ func ExpandSkillCall(home, projectPath, text string) (string, *SkillRef, error) 
 		}
 	}
 	if skill == nil {
-		return "", nil, fmt.Errorf("%w: /%s", ErrUnknownSkill, name)
+		return SkillRef{}, "", nil, fmt.Errorf("%w: /%s", ErrUnknownSkill, name)
 	}
 	if skill.Kind == "command" {
 		_, body := commandFile(skill.Path)
-		return prompts.Render("chat/command-call", map[string]any{"Name": name, "File": skill.Path, "Body": strings.TrimSpace(commandArgs(body, rest)), "Request": rest}), skill, nil
+		return *skill, body, nil, nil
 	}
 	body := readText(filepath.Join(skill.Path, "SKILL.md"), 32<<10)
 	var others []string
@@ -211,10 +227,7 @@ func ExpandSkillCall(home, projectPath, text string) (string, *SkillRef, error) 
 		}
 		return nil
 	})
-	if rest == "" {
-		rest = "(no further request; follow the skill)"
-	}
-	return prompts.Render("chat/skill-call", map[string]any{"Name": name, "Dir": skill.Path, "Body": strings.TrimSpace(body), "Others": others, "Request": rest}), skill, nil
+	return *skill, strings.TrimSpace(body), others, nil
 }
 
 var argRe = regexp.MustCompile(`\$(ARGUMENTS|[1-9])|\{\{args\}\}`)

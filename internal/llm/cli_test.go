@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 func TestCLIFailureReadsTheEndOfTheJSON(t *testing.T) {
@@ -23,13 +26,27 @@ func TestCLIFailureReadsTheEndOfTheJSON(t *testing.T) {
 	}
 }
 
+func TestClaudeResultJSONVerboseArray(t *testing.T) {
+	// verbose on: one JSON array of every message, the result last
+	arr := `[{"type":"system","subtype":"init"},{"type":"assistant","message":{"content":[]}},` +
+		`{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":3,"output_tokens":1}}]`
+	for _, out := range []string{arr, "warning: something\n" + arr, `{"type":"result","result":"ok"}`} {
+		var res struct {
+			Result string `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(claudeResultJSON(out)), &res); err != nil || res.Result != "ok" {
+			t.Fatalf("%q: %v %+v", out, err, res)
+		}
+	}
+}
+
 // fakeBin writes an executable script answering --version and auth status.
 func fakeBin(t *testing.T, loggedIn string) string {
 	t.Helper()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "claude")
 	script := "#!/bin/sh\ncase \"$1\" in\n--version) echo '9.9.9 (Claude Code)';;\nauth) printf '%s' '{\"loggedIn\":" + loggedIn + ",\"email\":\"a@b.c\"}';;\nesac\n"
-	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+	if err := fakebin.Write(p, []byte(script)); err != nil {
 		t.Fatal(err)
 	}
 	return p

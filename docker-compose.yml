@@ -6,6 +6,10 @@
 #   (optional: the first admin, replacing admin / admin, which must set its own
 #    email and password on the first login anyway)
 #
+# Cognee (ADR-195) runs beside office: recall finds the agents' notes by
+# meaning. Without an LLM key it builds its graph with a local model that
+# needs about 2 GB of RAM to load: give the Docker VM room (colima: --memory 10).
+#
 # Only the dashboard is published. Put a TLS terminator in front for real use
 # and set OFFICE_PUBLIC_URL to the https origin.
 services:
@@ -24,6 +28,9 @@ services:
       - office-data:/data
     environment:
       TZ: ${TZ:-Asia/Ho_Chi_Minh}
+      COGNEE_URL: http://cognee:8000
+    depends_on:
+      - cognee # started, not waited for: recall answers by keywords until it is up
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/healthz"]
       interval: 30s
@@ -40,5 +47,25 @@ services:
     ports:
       - "${DASHBOARD_PORT:-2704}:2704"
 
+  # the same options office gives its own container (internal/cognee/docker.go)
+  cognee:
+    image: cognee/cognee:main
+    restart: unless-stopped
+    volumes:
+      - cognee-data:/cognee-storage
+    environment:
+      HF_HOME: /cognee-storage/huggingface
+      # the notes are mostly Vietnamese: a small multilingual model, local, no key
+      EMBEDDING_PROVIDER: fastembed
+      EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      EMBEDDING_DIMENSIONS: "384"
+      GLINER_INFERENCE_THREADS: "1"
+      # set to extract the graph with an LLM instead of the local model (less RAM)
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      # reached only from the compose network: no login, no tenants
+      REQUIRE_AUTHENTICATION: "false"
+      ENABLE_BACKEND_ACCESS_CONTROL: "false"
+
 volumes:
   office-data:
+  cognee-data:

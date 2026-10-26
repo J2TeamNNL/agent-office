@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/tung1998/agent-office/internal/audit"
@@ -53,12 +54,39 @@ func (s *Service) saveAutomation(ctx context.Context, a storage.Action) error {
 		old := x
 		spec.Apply(&x, now)
 		err = s.store.Automations().UpdateSpec(ctx, x)
+		if err == nil && spec.Enabled != nil && *spec.Enabled != old.Enabled { // turned on or off (ADR-200)
+			if x, err = s.store.Automations().Get(ctx, x.ID); err == nil {
+				x.Enabled = *spec.Enabled
+				if x.Enabled { // on again: a past automatic turn-off is cleared
+					x.Failures, x.DisabledCode, x.DisabledReason = 0, "", ""
+				}
+				err = s.store.Automations().Update(ctx, x)
+			}
+		}
 		_ = audit.Record(ctx, s.store.Audit(), audit.Change{Action: "automation.update", ResourceID: x.ID, ProjectID: x.ProjectID, Before: old, After: x, Err: err})
 		return err
 	}
-	x := storage.Automation{ProjectID: a.ProjectID, Enabled: true, EditMode: "worktree", CreatedBy: a.DecidedBy}
+	x := storage.Automation{ProjectID: a.ProjectID, Enabled: spec.Enabled == nil || *spec.Enabled, EditMode: "worktree", CreatedBy: s.owner(ctx, a)}
 	spec.Apply(&x, now)
 	created, err := s.store.Automations().Create(ctx, x)
 	_ = audit.Record(ctx, s.store.Audit(), audit.Change{Action: "automation.create", ResourceID: created.ID, ProjectID: x.ProjectID, After: created, Err: err})
 	return err
+}
+
+// owner is the person an approved action is done for: who decided it, or for
+// one office did on the agent's own permission, the person its turn spoke for
+// (ADR-194). An automation keeps it as its owner.
+func (s *Service) owner(ctx context.Context, a storage.Action) string {
+	if !strings.HasPrefix(a.DecidedBy, "auto:") {
+		return a.DecidedBy
+	}
+	if p := PrincipalOf(ctx); p != "" {
+		return p
+	}
+	if j, err := s.store.Jobs().Get(ctx, a.JobID); err == nil {
+		if as, ok := storage.SpeaksFor(ctx, s.store, j); ok {
+			return strings.TrimPrefix(as, "human:")
+		}
+	}
+	return a.DecidedBy
 }

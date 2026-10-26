@@ -39,7 +39,12 @@ const maxQuestTitle, maxQuestDetail = 160, 4000
 // AddQuest gives the project's Burn a piece of work to do as given; a
 // running Burn takes it at the next free slot, the oldest first.
 func (s *Service) AddQuest(ctx context.Context, b storage.BurnSession, title, detail string) (storage.BurnItem, error) {
-	title, detail = strings.Join(strings.Fields(title), " "), strings.TrimSpace(detail)
+	return s.addQuest(ctx, b, Quest{Title: title, Detail: detail})
+}
+
+// addQuest is AddQuest with who follows it up (ADR-197).
+func (s *Service) addQuest(ctx context.Context, b storage.BurnSession, q Quest) (storage.BurnItem, error) {
+	title, detail := strings.Join(strings.Fields(q.Title), " "), strings.TrimSpace(q.Detail)
 	switch {
 	case title == "":
 		return storage.BurnItem{}, errors.New("quest cần tên")
@@ -48,7 +53,7 @@ func (s *Service) AddQuest(ctx context.Context, b storage.BurnSession, title, de
 	case len([]rune(detail)) > maxQuestDetail:
 		return storage.BurnItem{}, fmt.Errorf("mô tả quest dài quá %d ký tự", maxQuestDetail)
 	}
-	it, err := s.store.Burn().AddItem(ctx, storage.BurnItem{SessionID: b.ID, Title: title, Kind: KindQuest, Detail: detail, Status: "found"})
+	it, err := s.store.Burn().AddItem(ctx, storage.BurnItem{SessionID: b.ID, Title: title, Kind: KindQuest, Detail: detail, Status: "found", Owner: q.Owner})
 	if err == nil {
 		s.wake(b.ProjectID)
 	}
@@ -90,11 +95,16 @@ func (s *Service) DefaultEnd(ctx context.Context, agentID string) time.Time {
 	return t.UTC()
 }
 
-// Quest is a piece given in a batch (an automation's @@quest lines, ADR-132).
-type Quest struct{ Title, Detail string }
+// Quest is a piece given in a batch (an automation's @@quest lines, ADR-132);
+// Owner is who follows it up (an agent key, "" = the default agent; ADR-197).
+type Quest struct{ Title, Detail, Owner string }
 
 // openStatus: a piece not finished yet (a quest with its title is not given twice).
-var openStatus = map[string]bool{"found": true, "queued": true, "doing": true, "paused": true, "review": true}
+var openStatus = map[string]bool{"found": true, "queued": true, "doing": true, "paused": true, "review": true, StatusHanded: true}
+
+// StatusHanded: a task an agent was handed with delegate (ADR-210): in
+// progress outside the Burn, which never takes it.
+const StatusHanded = "handed"
 
 // questKey is a title as dedupe compares it: case and spaces aside.
 func questKey(title string) string { return strings.ToLower(strings.Join(strings.Fields(title), " ")) }
@@ -134,7 +144,7 @@ func (s *Service) AddQuests(ctx context.Context, projectID string, qs []Quest, s
 		if k == "" || open[k] {
 			continue
 		}
-		if _, e := s.AddQuest(ctx, b, q.Title, q.Detail); e != nil {
+		if _, e := s.addQuest(ctx, b, q); e != nil {
 			addErr = e
 			continue
 		}

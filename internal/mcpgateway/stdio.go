@@ -659,7 +659,7 @@ func (g *Gateway) checkStdio(ctx context.Context, m storage.MCPServer) ([]storag
 // with the legacy initialize, so it answers as a legacy server: a modern
 // (2026-07-28) request gets a 400 without a modern error, and the client
 // falls back to initialize.
-func (g *Gateway) serveStdio(w http.ResponseWriter, r *http.Request, m storage.MCPServer, body []byte) (int, string) {
+func (g *Gateway) serveStdio(w http.ResponseWriter, r *http.Request, m storage.MCPServer, body []byte, c Caller, size *callSize) (int, string) {
 	switch r.Method {
 	case http.MethodGet:
 		w.Header().Set("Allow", "POST, DELETE")
@@ -730,6 +730,11 @@ func (g *Gateway) serveStdio(w http.ResponseWriter, r *http.Request, m storage.M
 				if em := callErrMsg(resp); em != "" && errMsg == "" {
 					errMsg = em
 				}
+				if res, ok := resp["result"]; ok && !batch {
+					var n int
+					resp["result"], n = g.cutResult(c, m.Name, tool, res)
+					size.cut += int64(n)
+				}
 			}
 			resp["id"] = id // the client's own id back
 			b, _ := json.Marshal(resp)
@@ -745,9 +750,11 @@ func (g *Gateway) serveStdio(w http.ResponseWriter, r *http.Request, m storage.M
 	if batch {
 		b, _ := json.Marshal(out)
 		_, _ = w.Write(b)
+		size.out = int64(len(b))
 		return http.StatusOK, errMsg
 	}
 	_, _ = w.Write(out[0])
+	size.out = int64(len(out[0]))
 	return http.StatusOK, errMsg
 }
 

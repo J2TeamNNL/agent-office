@@ -1,9 +1,11 @@
 # templates/library
 
-Thư viện khởi đầu của office gồm agent và skill. Agent là một file Markdown, frontmatter của office ở đầu (`key`, `name`, `role`, `description`, `category`, `model_tier`, `level`, `featured`, `source`, `emoji`), phần còn lại là hướng dẫn. Danh sách chỉ đọc frontmatter; hướng dẫn đọc khi mở một agent.
+Thư viện khởi đầu của office gồm agent và skill. Agent là một file Markdown, frontmatter của office ở đầu (`key`, `name`, `role`, `description`, `category`, `model_tier`, `level`, `caps` khi cần chọn riêng quyền, `featured`, `source`, `emoji`), phần còn lại là hướng dẫn. Danh sách chỉ đọc frontmatter; hướng dẫn đọc khi mở một agent.
 
-- `office/`: viết cho office (tiếng Việt, ngắn), hiện ở mục **Đề xuất**. Thêm mẫu: tạo file `<key>.md`, `go test ./internal/team/` kiểm.
+- `office/`: viết cho office (tiếng Việt, ngắn), hiện ở mục **Đề xuất**. Thêm mẫu: tạo file `<key>.md`, `go test ./internal/team/` kiểm. Agent của mẫu project (`templates/packs`) đều có bản ở đây cùng key (`ceo`, `thuc-thi`, `kiem-soat`, `nghien-cuu`, `truong-don-vi`): sửa agent của mẫu thì sửa cả bản ở đây; `go test ./internal/transfer/` kiểm.
 - `agency/`: nhập từ [agency-agents](https://github.com/msitarzewski/agency-agents) (MIT, © 2025 AgentLand Contributors) bằng `node scripts/sync-agency-library.mjs [sha]`, đã bỏ code mẫu, quyền `read`. Không sửa tay: lần đồng bộ sau sẽ ghi đè.
+- `ecc/`: nhập từ [ECC](https://github.com/affaan-m/ECC) (MIT, © 2026 Affaan Mustafa) bằng `node scripts/sync-ecc-library.mjs [--sha=<commit>]`, đã bỏ mục "Prompt Defense Baseline" lặp ở mọi agent, quyền `read`, `model` gốc đổi thành `model_tier`. Không sửa tay. Script này cũng chép skill của ECC vào thư viện máy (xem `docs/research/references.md`).
+- `aitmpl/`: nhập từ [Claude Code Templates](https://github.com/davila7/claude-code-templates) (MIT, © 2025 Daniel Ávila, web aitmpl.com) bằng `node scripts/sync-aitmpl-library.mjs [--sha=<commit>]`, quyền `read`, mô tả bỏ khối `<example>`. Không sửa tay. Script này cũng chép skill vào thư viện máy (xem `docs/research/references.md`).
 - `skills/`: các skill nền tảng được seed vào thư viện machine-wide khi office khởi động lần đầu; mỗi skill có `SKILL.md` với frontmatter `name` và `description`. Skill chỉ được seed khi chưa có cùng tên, nên chỉnh sửa của người dùng không bị ghi đè.
 
 `category`: `code`, `design`, `plan`, `customer`, `content`. Không agent nào được có `full_access`/`extra_dirs` (ADR-074).

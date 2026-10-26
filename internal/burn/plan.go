@@ -212,3 +212,18 @@ func (s *Service) TurnOn(ctx context.Context, projectID, who string, now time.Ti
 	}
 	return s.Begin(ctx, projectID, who)
 }
+
+// CheckSetup refuses settings a Burn could not run on: a pack's (ADR-196),
+// as the dashboard's are checked.
+func CheckSetup(b storage.BurnSession) error {
+	if b.Template != "" && !ValidTemplate(b.Template) {
+		return fmt.Errorf("không có mẫu Burn %q", b.Template)
+	}
+	if b.Order != "" && b.Order != "roadmap" && b.Order != "bugs" && b.Order != "auto" {
+		return fmt.Errorf("không có thứ tự tìm việc %q", b.Order)
+	}
+	if err := ValidVerify(b.Verify); err != nil {
+		return err
+	}
+	return CheckPlan(b.Plan)
+}

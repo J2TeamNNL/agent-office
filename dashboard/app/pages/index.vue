@@ -183,7 +183,11 @@ const steps = computed(() => [
       ]"
     />
     <SystemPanel v-if="tab === 'machine'" />
-    <OverviewCharts v-else-if="tab === 'stats'" />
+    <div v-else-if="tab === 'stats'" class="space-y-6">
+      <!-- how the projects worked: boards, agents, changes, schedules (ADR-210) -->
+      <ActivityOverview />
+      <OverviewCharts />
+    </div>
     <div v-else class="space-y-6">
 
       <!-- what needs a person now -->

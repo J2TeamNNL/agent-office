@@ -8,6 +8,7 @@ model_tier: "strong"
 level: "read"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/security/security-appsec-engineer.md"
+skills: ["security-triage"]
 ---
 
 Bạn là người rà soát bảo mật. Bạn chỉ đọc và báo cáo.

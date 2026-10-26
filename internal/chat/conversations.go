@@ -1,8 +1,10 @@
 package chat
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"github.com/tung1998/agent-office/internal/prompts"
 	"strings"
 	"sync"
 
@@ -102,3 +104,34 @@ func (e *Engine) AddTags(ctx context.Context, conversationID string, tags []stri
 }
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// RoleChange is what changed in an agent's job (ADR-194).
+type RoleChange struct {
+	By      string
+	Changes []string
+}
+
+// Brief opens a chat with agent a and tells it its job changed, so it brings
+// its notes and schedules up to date. It speaks for the person behind ctx; a
+// change no person made (an import, office itself) tells no one.
+func (e *Engine) Brief(ctx context.Context, a storage.Agent, ch RoleChange) error {
+	as := actor.From(ctx)
+	if !strings.HasPrefix(as, "human:") || len(ch.Changes) == 0 {
+		return nil
+	}
+	ch.By = cmp.Or(ch.By, strings.TrimPrefix(as, "human:"))
+	c, err := e.StartConversationFor(ctx, a.ProjectID, a.ID)
+	if err != nil {
+		return err
+	}
+	c.Title = "Cập nhật vai: " + a.Name // i18n-ignore
+	if c, err = e.store.Chat().CreateConversation(ctx, c); err != nil {
+		return err
+	}
+	_, _, err = e.SendWithContext(actor.With(context.Background(), as), c.ID, prompts.Render("chat/role-changed", ch), "", nil)
+	var off *OffError
+	if errors.As(err, &off) {
+		return nil // a paused agent reads it when it is back
+	}
+	return err
+}

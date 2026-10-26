@@ -6,12 +6,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 func TestAntigravityRunner(t *testing.T) {
 	tmp := t.TempDir()
 	bin, log := filepath.Join(tmp, "agy"), filepath.Join(tmp, "log")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 in=$(cat)
 echo "ARGS $*" >> `+log+`
 echo "STDIN $in" >> `+log+`
@@ -24,7 +26,7 @@ echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":
 echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":2,"state":"DONE","step_type":"tool","tool_name":"read_file"}}'
 echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"chào"}}'
 echo '{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Xin chào","num_turns":1,"usage":{"input_tokens":10,"output_tokens":4,"thinking_tokens":2,"cache_read_tokens":5}}}'
-`), 0o755)
+`))
 	hist := []HistoryItem{{Role: "user", Content: "câu cũ"}, {Role: "assistant", Content: "trả lời cũ"}}
 	req := RunRequest{Bin: bin, System: "HƯỚNG DẪN", History: hist, Prompt: "mới", WorkDir: tmp, Effort: "high", ExtraDirs: []string{"/x"}}
 	var text strings.Builder
@@ -77,11 +79,11 @@ echo '{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","res
 func TestAntigravityRunnerSignedOut(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "agy")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat >/dev/null
 echo "Error: authentication required. Run 'agy' to log in, then retry." >&2
 echo '{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out"}}'
-`), 0o755)
+`))
 	_, err := antigravityRunner{}.Run(context.Background(), RunRequest{Bin: bin, Prompt: "x", WorkDir: tmp}, func(Event) {})
 	if err == nil || !strings.Contains(err.Error(), "chưa đăng nhập") {
 		t.Fatalf("err = %v", err)
@@ -94,11 +96,11 @@ echo '{"event":"result","result":{"conversation_id":"","status":"ERROR","respons
 func TestAntigravityDeniedCommand(t *testing.T) {
 	tmp := t.TempDir()
 	bin, log := filepath.Join(tmp, "agy"), filepath.Join(tmp, "log")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat >> `+log+`
 echo '{"event":"step_update","step_update":{"conversation_id":"c1","step_index":2,"state":"ERROR","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"git status"},"error":{"type":"TOOL_ERROR","message":"permission check failed"}}}}'
 echo '{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":""}}'
-`), 0o755)
+`))
 	_, err := antigravityRunner{}.Run(context.Background(), RunRequest{Bin: bin, System: "S", Prompt: "x", WorkDir: tmp}, func(Event) {})
 	if err == nil || !strings.Contains(err.Error(), `run_command "git status": permission check failed`) {
 		t.Fatalf("err = %v", err)
@@ -119,7 +121,7 @@ cat >/dev/null
 echo '{"event":"init","init":{"model":"m"}}'
 python3 -c 'print("{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"c1\",\"step_index\":0,\"state\":\"ACTIVE\",\"step_type\":\"agent_response\",\"text_delta\":\"" + "x"*(17*1024*1024) + "\"}}")'
 `
-	os.WriteFile(bin, []byte(script), 0o755)
+	fakebin.Write(bin, []byte(script))
 	res, err := antigravityRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
 	if err == nil {
 		t.Fatalf("expected an error for an oversized line, got res = %+v", res)

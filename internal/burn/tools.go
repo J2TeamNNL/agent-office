@@ -1,6 +1,7 @@
 package burn
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -20,7 +21,9 @@ func (s *Service) Tool(ctx context.Context, sc actions.Scope, name string, in To
 	case "burn_quest":
 		return s.giveQuest(ctx, sc, in)
 	case "burn_quests":
-		return s.quests(ctx, sc.ProjectID)
+		return s.quests(ctx, sc.ProjectID, in.Owner)
+	case "burn_assign":
+		return s.assign(ctx, sc.ProjectID, in)
 	}
 	b, err := s.store.Burn().SessionByConversation(ctx, sc.ConversationID)
 	if err != nil || sc.ConversationID == "" {
@@ -102,7 +105,14 @@ func (s *Service) giveQuest(ctx context.Context, sc actions.Scope, in ToolInput)
 	if strings.TrimSpace(in.Detail) == "" {
 		return "", errors.New("quest cần mô tả (detail) đủ để làm mà không phải hỏi lại")
 	}
-	added, _, err := s.AddQuests(ctx, sc.ProjectID, []Quest{{Title: in.Title, Detail: in.Detail}}, false, "agent:"+sc.Agent)
+	owner, err := s.ownerKey(ctx, sc.ProjectID, in.Owner)
+	if err != nil {
+		return "", err
+	}
+	if in.Owner == "" { // the caller, when it is one of the project's agents
+		owner, _ = s.ownerKey(ctx, sc.ProjectID, sc.Agent)
+	}
+	added, _, err := s.AddQuests(ctx, sc.ProjectID, []Quest{{Title: in.Title, Detail: in.Detail, Owner: owner}}, false, "agent:"+sc.Agent)
 	if err != nil {
 		return "", err
 	}
@@ -115,8 +125,10 @@ func (s *Service) giveQuest(ctx context.Context, sc actions.Scope, in ToolInput)
 	return "Quest added to the board; it waits there for the person to give it to an agent (or for the Burn to be turned on).", nil
 }
 
-// quests is burn_quests: the Burn's state and its quests, latest last.
-func (s *Service) quests(ctx context.Context, projectID string) (string, error) {
+// quests is burn_quests: the Burn's state, its run's work not merged yet
+// and what it found on its own (ADR-196), and its quests, latest last, with
+// who follows each up; owner keeps only theirs (ADR-197).
+func (s *Service) quests(ctx context.Context, projectID, owner string) (string, error) {
 	b, err := s.Session(ctx, projectID)
 	if err != nil {
 		return "", err
@@ -127,7 +139,29 @@ func (s *Service) quests(ctx context.Context, projectID string) (string, error) 
 	if b.ID != "" {
 		items, _ = s.store.Burn().Items(ctx, b.ID)
 	}
-	items = slices.DeleteFunc(items, func(it storage.BurnItem) bool { return it.Kind != KindQuest })
+	if r, err := s.store.Repos().Get(ctx, projectID); err == nil {
+		if n := unmerged(ctx, r.Path, b.RunBranch); n > 0 {
+			fmt.Fprintf(&sb, "Run branch %s: %d commits not merged into the project's branch yet; once reviewed, merge with propose_action git_merge.\n", b.RunBranch, n)
+		}
+	}
+	own := map[string]int{}
+	for _, it := range items {
+		if it.Kind != KindQuest && it.Kind != "" {
+			own[it.Status]++
+		}
+	}
+	if len(own) > 0 {
+		fmt.Fprintf(&sb, "Its own finds: %d open, %d done, %d failed, %d skipped.\n",
+			own["found"]+own["queued"]+own["doing"]+own["paused"]+own["review"]+own[StatusHanded], own["done"], own["failed"], own["skipped"])
+	}
+	if owner != "" {
+		key, err := s.ownerKey(ctx, projectID, owner)
+		if err != nil {
+			return "", err
+		}
+		owner = key
+	}
+	items = slices.DeleteFunc(items, func(it storage.BurnItem) bool { return it.Kind != KindQuest || (owner != "" && it.Owner != owner) })
 	if len(items) > maxQuestList {
 		items = items[len(items)-maxQuestList:]
 	}
@@ -135,13 +169,90 @@ func (s *Service) quests(ctx context.Context, projectID string) (string, error) 
 		return sb.String() + "No quests.", nil
 	}
 	for _, it := range items {
-		fmt.Fprintf(&sb, "- %s [%s] %s", it.ID, it.Status, it.Title)
+		fmt.Fprintf(&sb, "- %s [%s] (%s) %s", it.ID, it.Status, cmp.Or(it.Owner, "default agent"), it.Title)
 		if it.Summary != "" {
 			fmt.Fprintf(&sb, ": %s", it.Summary)
 		}
 		sb.WriteString("\n")
 	}
 	return sb.String(), nil
+}
+
+// ownerKey is the key of the project's agent ref names (its key or its
+// name, case aside); "" stays "" (the default agent).
+func (s *Service) ownerKey(ctx context.Context, projectID, ref string) (string, error) {
+	if ref = strings.TrimSpace(ref); ref == "" {
+		return "", nil
+	}
+	agents, err := s.store.Agents().List(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	for _, a := range agents {
+		if strings.EqualFold(a.Key, ref) || strings.EqualFold(a.Name, ref) {
+			return a.Key, nil
+		}
+	}
+	return "", fmt.Errorf("project không có agent %q để phụ trách quest", ref)
+}
+
+// assign is burn_assign: a quest (item), or every open quest of an owner
+// (from), goes to another owner: a handover (ADR-197).
+func (s *Service) assign(ctx context.Context, projectID string, in ToolInput) (string, error) {
+	to, err := s.ownerKey(ctx, projectID, in.Owner)
+	if err != nil {
+		return "", err
+	}
+	if (in.Item == "") == (in.From == "") {
+		return "", errors.New("burn_assign cần item (một quest) hoặc from (mọi quest đang mở của một người)")
+	}
+	from := ""
+	if in.From != "" {
+		if from, err = s.ownerKey(ctx, projectID, in.From); err != nil {
+			return "", err
+		}
+	}
+	b, err := s.Session(ctx, projectID)
+	if err != nil || b.ID == "" {
+		return "", errors.New("bảng việc chưa có quest nào")
+	}
+	items, err := s.store.Burn().Items(ctx, b.ID)
+	if err != nil {
+		return "", err
+	}
+	n := 0
+	for _, it := range items {
+		if it.Kind != KindQuest || it.Owner == to {
+			continue
+		}
+		if in.Item != "" && it.ID != strings.TrimSpace(in.Item) || in.From != "" && (it.Owner != from || !openStatus[it.Status]) {
+			continue
+		}
+		if err := s.setOwner(ctx, it, to); err != nil {
+			return "", err
+		}
+		n++
+	}
+	if in.Item != "" && n == 0 {
+		return "", fmt.Errorf("không có quest %q để giao (hoặc đã là của %s)", in.Item, cmp.Or(to, "agent mặc định"))
+	}
+	return fmt.Sprintf("%d quest now followed up by %s.", n, cmp.Or(to, "the default agent")), nil
+}
+
+// setOwner changes only its owner: a Burn moving it meanwhile is not undone
+// (compare-and-swap on its status, read again on a race).
+func (s *Service) setOwner(ctx context.Context, it storage.BurnItem, owner string) error {
+	for range 5 {
+		cur, err := s.store.Burn().Item(ctx, it.ID) // as it is now, not as listed
+		if err != nil {
+			return err
+		}
+		cur.Owner = owner
+		if err = s.store.Burn().UpdateItemFrom(ctx, cur, cur.Status); !errors.Is(err, storage.ErrConflict) {
+			return err
+		}
+	}
+	return storage.ErrConflict
 }
 
 // maxQuestList: the latest quests burn_quests shows.
@@ -170,6 +281,8 @@ type ToolInput struct {
 	Lessons                                    string // burn_scan_done: the lessons, updated (ADR-131)
 	Coverage                                   string // burn_scan_done: the coverage plan, updated (ADR-141)
 	Priority                                   string // burn_add: high | normal | low
+	Owner                                      string // burn_quest, burn_assign: who follows it up; burn_quests: only theirs (ADR-197)
+	From                                       string // burn_assign: every open quest of this owner
 }
 
 // list is what burn_list gives (ADR-121): the Burn's data kept out of the

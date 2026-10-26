@@ -147,3 +147,32 @@ func TestForeground(t *testing.T) {
 		t.Fatalf("foreground hook missing: %v", a)
 	}
 }
+
+func TestPushesProtected(t *testing.T) {
+	on := func(branch, up string) func(string) (string, string) {
+		return func(string) (string, string) { return branch, up }
+	}
+	feature, main := on("feat/x", "origin/feat/x"), on("main", "origin/main")
+	for _, c := range []struct {
+		cmd    string
+		branch func(string) (string, string)
+		want   bool
+	}{
+		{"git push", feature, false},
+		{"git push", main, true},
+		{"git push", on("feat/x", "origin/master"), true},
+		{"git push origin feat/x", main, false},
+		{"git push origin main", feature, true},
+		{"git push origin HEAD:master", feature, true},
+		{"git push -f origin +refs/heads/main", feature, true},
+		{"git push origin HEAD", main, true},
+		{"git push --all origin", feature, true},
+		{"go test ./... && git -C ../repo push", main, true},
+		{"git status && git log", main, false},
+		{"echo git push", main, false},
+	} {
+		if got := pushesProtected(c.cmd, "/repo", c.branch); got != c.want {
+			t.Errorf("%q: %v, want %v", c.cmd, got, c.want)
+		}
+	}
+}

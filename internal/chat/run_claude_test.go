@@ -3,7 +3,6 @@ package chat
 import (
 	"context"
 	"encoding/json"
-	"github.com/tung1998/agent-office/internal/storage"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tung1998/agent-office/internal/fakebin"
+	"github.com/tung1998/agent-office/internal/storage"
 )
 
 // The user's own MCP servers (their Claude Code setup) are allowed only when
@@ -60,7 +62,7 @@ func TestClaudeReportsLimitsAndContext(t *testing.T) {
 	fixture := filepath.Join(dir, "out.jsonl")
 	os.WriteFile(fixture, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 	bin := filepath.Join(dir, "claude")
-	os.WriteFile(bin, []byte("#!/bin/sh\ncat >/dev/null\ncat "+fixture+"\n"), 0o755)
+	fakebin.Write(bin, []byte("#!/bin/sh\ncat >/dev/null\ncat "+fixture+"\n"))
 	res, err := claudeRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +131,7 @@ cat >/dev/null
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 python3 -c 'print("{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"" + "x"*(17*1024*1024) + "\"}]}}")'
 `
-	os.WriteFile(bin, []byte(script), 0o755)
+	fakebin.Write(bin, []byte(script))
 	res, err := claudeRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
 	if err == nil {
 		t.Fatalf("expected an error for an oversized line, got res = %+v", res)
@@ -151,7 +153,7 @@ func TestClaudeShowsItsSubagents(t *testing.T) {
 	fixture := filepath.Join(dir, "out.jsonl")
 	os.WriteFile(fixture, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
 	bin := filepath.Join(dir, "claude")
-	os.WriteFile(bin, []byte("#!/bin/sh\ncat >/dev/null\ncat "+fixture+"\n"), 0o755)
+	fakebin.Write(bin, []byte("#!/bin/sh\ncat >/dev/null\ncat "+fixture+"\n"))
 	res, err := claudeRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +217,7 @@ func TestClaudeRunsInTheConnectionsAccount(t *testing.T) {
 cat >/dev/null
 echo '{"type":"result","subtype":"success","result":"'"$CLAUDE_CONFIG_DIR"'","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
 `
-	os.WriteFile(bin, []byte(script), 0o755)
+	fakebin.Write(bin, []byte(script))
 	home := filepath.Join(dir, "prv_2")
 	p := storage.Provider{Kind: storage.ProviderClaudeCLI, CLIHome: home}
 	res, err := claudeRunner{}.Run(context.Background(), RunRequest{Provider: p, Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
@@ -224,5 +226,18 @@ echo '{"type":"result","subtype":"success","result":"'"$CLAUDE_CONFIG_DIR"'","se
 	}
 	if cliEnv(storage.Provider{Kind: storage.ProviderClaudeCLI}) != nil {
 		t.Fatal("the machine's account must keep the office's environment")
+	}
+}
+
+// ADR-192: web search and fetch only for an agent that picked tools.web.
+func TestClaudeArgsWeb(t *testing.T) {
+	var r claudeRunner
+	toolsOf := func(a []string) string { return a[slices.Index(a, "--tools")+1] }
+	if off := r.args(RunRequest{}, false); strings.Contains(toolsOf(off), "Web") {
+		t.Fatalf("web without the capability: %v", toolsOf(off))
+	}
+	on := r.args(RunRequest{Web: true, Write: true}, false)
+	if !strings.Contains(toolsOf(on), "WebSearch") || !strings.Contains(toolsOf(on), "WebFetch") {
+		t.Fatalf("web missing: %v", toolsOf(on))
 	}
 }

@@ -47,13 +47,36 @@ func overAnswers(who string, total int32, report bool) (int, bool) {
 
 // delegation is a task an agent gave another with the delegate tool.
 type delegation struct {
-	agent storage.Agent
-	task  string
+	agent  storage.Agent
+	task   string
+	effort string // how hard it thinks ("" = the agent's own)
+	board  string // the work board's task it is (ADR-210; "" = none)
+}
+
+// BoardEvent: a hand-off tied to a task of the work board started or ended
+// (ADR-210); the board follows it.
+type BoardEvent struct {
+	ProjectID, ConversationID string
+	Task                      string // the board's task id
+	Agent                     string // who works on it
+	Done                      bool   // false = started
+	Failed                    bool   // ended without an answer
+	Result                    string // its answer, when done
+}
+
+// SetBoardHook: fn hears of hand-offs tied to the work board.
+func (e *Engine) SetBoardHook(fn func(ctx context.Context, ev BoardEvent)) { e.boardHook = fn }
+
+func (e *Engine) board(ev BoardEvent) {
+	if e.boardHook != nil && ev.Task != "" {
+		fn := e.boardHook
+		safeGo("boardHook", func() { fn(context.Background(), ev) })
+	}
 }
 
 // Delegate records a hand-off asked by the agent answering in sc (the
 // delegate tool): it starts in the background once that answer is done.
-func (e *Engine) Delegate(ctx context.Context, sc officetools.Scope, agentName, task string) (string, error) {
+func (e *Engine) Delegate(ctx context.Context, sc officetools.Scope, agentName, task, effort string) (string, error) {
 	task = strings.TrimSpace(task)
 	if sc.ConversationID == "" || sc.TaskID != "" {
 		return "", errors.New("chỉ giao việc được trong Chat")
@@ -64,6 +87,9 @@ func (e *Engine) Delegate(ctx context.Context, sc officetools.Scope, agentName, 
 	}
 	if task == "" {
 		return "", errors.New("hãy ghi rõ việc cần làm")
+	}
+	if !storage.ValidEffort(effort) {
+		return "", fmt.Errorf("effort %q không hợp lệ (có: %s)", effort, strings.Join(storage.Efforts, ", "))
 	}
 	if _, inRun := e.WorkflowScope(sc); inRun {
 		return "", errors.New("đang trong một quy trình: giao việc bằng workflow_delegate / workflow_send (chỉ agent điều phối)")
@@ -88,7 +114,7 @@ func (e *Engine) Delegate(ctx context.Context, sc officetools.Scope, agentName, 
 		return "", &OffError{Notice: storage.OffNotice(agents[i].Name) + " Tell the person."}
 	}
 	e.mu.Lock()
-	e.handed[sc.RunRef] = append(e.handed[sc.RunRef], delegation{agent: agents[i], task: task})
+	e.handed[sc.RunRef] = append(e.handed[sc.RunRef], delegation{agent: agents[i], task: task, effort: effort, board: officetools.BoardTaskOf(ctx)})
 	e.mu.Unlock()
 	return prompts.Render("handoff/handed", map[string]any{"Agent": agents[i].Name}), nil
 }
@@ -158,6 +184,7 @@ type turnSpec struct {
 	replace    *Turn         // the finishing turn it takes the chat from ("" = the chat must be free)
 	total      *atomic.Int32 // replies to the person's message so far, hand-offs included
 	tier       string        // model tier for this turn ("" = the agent's)
+	effort     string        // how hard it thinks, as its delegator asked ("" = the agent's own)
 	ceiling    string        // the most the person's message may have run (ADR-081)
 	tree       treeOpt       // the worktree it runs in ("" = the chat's)
 	limit      time.Duration // how long it may take (0: none; <0: a chat's default, none) — the message's, ADR-082
@@ -167,6 +194,7 @@ type turnSpec struct {
 	wfVote        bool
 	wfWatch       bool   // the run's supervisor checking it
 	wfStep        string // a step of a graph of steps (ADR-108)
+	board         string // a hand-off's work board task (ADR-210)
 }
 
 // startTurn starts an agent's answer; nil and why when it cannot: the agent
@@ -195,9 +223,9 @@ func (e *Engine) startTurn(conv storage.Conversation, project storage.Repo, s tu
 	}
 	runCtx, cancel := withTimeout(WithModelTier(base, s.tier), limit)
 	t := &Turn{ID: turnID, ConversationID: conv.ID, wake: make(chan struct{}), cancel: cancel,
-		queue: s.queue, hops: s.hops, answered: s.answered, actor: s.actor, total: s.total, tier: s.tier, ceiling: s.ceiling, tree: s.tree, limit: limit,
+		queue: s.queue, hops: s.hops, answered: s.answered, actor: s.actor, total: s.total, tier: s.tier, effort: s.effort, ceiling: s.ceiling, tree: s.tree, limit: limit,
 		agentID: s.agent.ID, agentName: s.agent.Name, background: s.background, delegator: s.delegator,
-		wfRun: s.wfRun, wfRole: s.wfRole, wfVote: s.wfVote, wfWatch: s.wfWatch, wfStep: s.wfStep}
+		wfRun: s.wfRun, wfRole: s.wfRole, wfVote: s.wfVote, wfWatch: s.wfWatch, wfStep: s.wfStep, board: s.board}
 	e.mu.Lock()
 	if e.stopping.Load() { // under e.mu, as in SendWithContext
 		e.mu.Unlock()
@@ -290,13 +318,14 @@ func (e *Engine) nextTurn(ctx context.Context, prev *Turn, conv storage.Conversa
 				notes = append(notes, fmt.Sprintf("Đã dừng giao việc cho %s: quá %d lượt agent giao việc cho nhau trong một tin nhắn. Hãy tag lại nếu cần.", d.agent.Name, most))
 				continue
 			}
-			started, why := e.startTurn(conv, project, turnSpec{agent: d.agent, background: true, delegator: agent.ID, hops: hops + 1, actor: prev.actor, total: prev.total, tier: prev.tier, ceiling: prev.ceiling, tree: prev.tree, limit: prev.limit,
+			started, why := e.startTurn(conv, project, turnSpec{agent: d.agent, effort: d.effort, background: true, delegator: agent.ID, hops: hops + 1, actor: prev.actor, total: prev.total, tier: prev.tier, ceiling: prev.ceiling, tree: prev.tree, limit: prev.limit, board: d.board,
 				title:  agent.Name + " → " + d.agent.Name,
 				prompt: prompts.Handoff{From: agent.Name, Task: d.task}.String()})
 			if started == nil {
 				notes = append(notes, why)
 				continue
 			}
+			e.board(BoardEvent{ProjectID: conv.ProjectID, ConversationID: conv.ID, Task: d.board, Agent: d.agent.Name})
 			hops++
 		}
 		for _, n := range notes {
@@ -304,6 +333,7 @@ func (e *Engine) nextTurn(ctx context.Context, prev *Turn, conv storage.Conversa
 		}
 	}
 	if prev.background {
+		e.board(BoardEvent{ProjectID: conv.ProjectID, ConversationID: conv.ID, Task: prev.board, Agent: agent.Name, Done: true, Failed: prev.err != "", Result: reply})
 		if i := slices.IndexFunc(agents, func(a storage.Agent) bool { return a.ID == prev.delegator }); i >= 0 {
 			// the report only sums up: a strong agent writes it with the balanced model
 			tier := prev.tier

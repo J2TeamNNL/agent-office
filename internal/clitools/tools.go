@@ -1,4 +1,4 @@
-// Package clitools installs and signs in the AI command-line tools the office
+// Package clitools installs, updates and signs in the AI command-line tools the office
 // can use (Claude Code, Codex, Gemini CLI) on the machine that runs the office server.
 // Only commands defined here can run: the API never accepts a command string.
 package clitools
@@ -29,6 +29,7 @@ type Method struct {
 	Available   bool   `json:"available"` // Requires found on this machine
 	Recommended bool   `json:"recommended"`
 	argv        []string
+	update      []string // brings a tool installed this way to its latest version
 }
 
 // Tool is a CLI the office can drive.
@@ -85,6 +86,8 @@ type Status struct {
 	Version   string   `json:"version,omitempty"`
 	Auth      Auth     `json:"auth"`
 	Methods   []Method `json:"methods"`
+	// UpdateCmd updates the tool the way it was installed ("" when that is unknown)
+	UpdateCmd string   `json:"update_command,omitempty"`
 	Job       *JobView `json:"job,omitempty"` // running or last job
 }
 
@@ -100,11 +103,11 @@ var tools = []Tool{
 		share: shared{src: claudeDir, links: []string{"settings.json", "skills", "agents", "commands", "plugins", "hooks", "output-styles", "projects"}},
 		methods: []Method{
 			{ID: "native", Label: "Trình cài chính thức", Command: "curl -fsSL https://claude.ai/install.sh | bash", Requires: "curl", Recommended: true,
-				argv: []string{"/bin/sh", "-c", "curl -fsSL https://claude.ai/install.sh | bash"}},
+				argv: []string{"/bin/sh", "-c", "curl -fsSL https://claude.ai/install.sh | bash"}, update: []string{"claude", "update"}},
 			{ID: "brew", Label: "Homebrew", Command: "brew install --cask claude-code", Requires: "brew",
-				argv: []string{"brew", "install", "--cask", "claude-code"}},
+				argv: []string{"brew", "install", "--cask", "claude-code"}, update: []string{"brew", "upgrade", "--cask", "claude-code"}},
 			{ID: "npm", Label: "npm (cần Node 22+)", Command: "npm install -g @anthropic-ai/claude-code", Requires: "npm",
-				argv: []string{"npm", "install", "-g", "@anthropic-ai/claude-code"}},
+				argv: []string{"npm", "install", "-g", "@anthropic-ai/claude-code"}, update: []string{"npm", "install", "-g", "@anthropic-ai/claude-code@latest"}},
 		},
 		status: claudeStatus,
 	},
@@ -118,9 +121,10 @@ var tools = []Tool{
 			// like Antigravity: a quarantined cask binary hangs on a Gatekeeper
 			// check when the office (no window) runs it
 			{ID: "brew", Label: "Homebrew", Command: "brew install --cask codex", Requires: "brew", Recommended: true,
-				argv: []string{"/bin/sh", "-c", `brew install --cask codex && { xattr -dr com.apple.quarantine "$(brew --prefix)/Caskroom/codex" 2>/dev/null || true; }`}},
+				argv:   []string{"/bin/sh", "-c", `brew install --cask codex && { xattr -dr com.apple.quarantine "$(brew --prefix)/Caskroom/codex" 2>/dev/null || true; }`},
+				update: []string{"/bin/sh", "-c", `brew upgrade --cask codex && { xattr -dr com.apple.quarantine "$(brew --prefix)/Caskroom/codex" 2>/dev/null || true; }`}},
 			{ID: "npm", Label: "npm (cần Node 22+)", Command: "npm install -g @openai/codex", Requires: "npm",
-				argv: []string{"npm", "install", "-g", "@openai/codex"}},
+				argv: []string{"npm", "install", "-g", "@openai/codex"}, update: []string{"npm", "install", "-g", "@openai/codex@latest"}},
 		},
 		status: codexStatus,
 	},
@@ -138,9 +142,9 @@ var tools = []Tool{
 		loginEnv: []string{"NO_BROWSER=true", "GEMINI_CLI_TRUST_WORKSPACE=true"},
 		methods: []Method{
 			{ID: "npm", Label: "npm (cần Node 20+)", Command: "npm install -g @google/gemini-cli", Requires: "npm", Recommended: true,
-				argv: []string{"npm", "install", "-g", "@google/gemini-cli"}},
+				argv: []string{"npm", "install", "-g", "@google/gemini-cli"}, update: []string{"npm", "install", "-g", "@google/gemini-cli@latest"}},
 			{ID: "brew", Label: "Homebrew", Command: "brew install gemini-cli", Requires: "brew",
-				argv: []string{"brew", "install", "gemini-cli"}},
+				argv: []string{"brew", "install", "gemini-cli"}, update: []string{"brew", "upgrade", "gemini-cli"}},
 		},
 		status:       geminiStatus,
 		prepareLogin: geminiPrepareLogin,
@@ -164,7 +168,8 @@ var tools = []Tool{
 			// a cask straight from the internet waits on a Gatekeeper dialog
 			// nobody at the dashboard can click; Google signs the binary
 			{ID: "brew", Label: "Homebrew", Command: "brew install --cask antigravity-cli", Requires: "brew", Recommended: true,
-				argv: []string{"/bin/sh", "-c", `brew install --cask antigravity-cli && xattr -dr com.apple.quarantine "$(brew --prefix)/Caskroom/antigravity-cli"`}},
+				argv:   []string{"/bin/sh", "-c", `brew install --cask antigravity-cli && xattr -dr com.apple.quarantine "$(brew --prefix)/Caskroom/antigravity-cli"`},
+				update: []string{"/bin/sh", "-c", `brew upgrade --cask antigravity-cli && xattr -dr com.apple.quarantine "$(brew --prefix)/Caskroom/antigravity-cli"`}},
 		},
 		status: antigravityStatus,
 		loginDone: func(ctx context.Context, bin string, env []string) bool {
@@ -401,11 +406,21 @@ func (m *Manager) find(id string) (Tool, bool) {
 
 // ErrUnknownTool / ErrBusy / ErrUnknownMethod are returned to the API.
 var (
-	ErrUnknownTool   = errors.New("công cụ không được hỗ trợ")
-	ErrUnknownMethod = errors.New("cách cài không hợp lệ hoặc máy chưa có công cụ cần thiết")
-	ErrBusy          = errors.New("đang có một tác vụ chạy cho công cụ này")
-	ErrNotInstalled  = errors.New("chưa cài công cụ này")
+	ErrUnknownTool    = errors.New("công cụ không được hỗ trợ")
+	ErrUnknownMethod  = errors.New("cách cài không hợp lệ hoặc máy chưa có công cụ cần thiết")
+	ErrBusy           = errors.New("đang có một tác vụ chạy cho công cụ này")
+	ErrNotInstalled   = errors.New("chưa cài công cụ này")
+	ErrUnknownInstall = errors.New("không rõ công cụ được cài bằng cách nào, hãy cập nhật bằng tay")
 )
+
+// IDs are the tools the office knows, in the dashboard's order.
+func (m *Manager) IDs() []string {
+	ids := make([]string, 0, len(m.tools))
+	for _, t := range m.tools {
+		ids = append(ids, t.ID)
+	}
+	return ids
+}
 
 // List returns every tool's status.
 func (m *Manager) List(ctx context.Context) []Status {
@@ -445,6 +460,9 @@ func (m *Manager) StatusIn(ctx context.Context, id, home string) (Status, error)
 		v, _ := runOut(ctx, m.env, path, "--version")
 		s.Version = strings.TrimSpace(strings.SplitN(v, "\n", 2)[0])
 		s.Auth = t.status(ctx, path, env)
+		if meth, ok := updateMethod(t, path); ok {
+			s.UpdateCmd = displayCommand(meth.update)
+		}
 	}
 	m.mu.Lock()
 	if j := m.last[jobKey(id, home)]; j != nil {
@@ -490,6 +508,49 @@ func (m *Manager) Install(id, method string) (*Job, error) {
 		return m.start(id, id, "install", meth.argv, 15*time.Minute, term{}, "HOMEBREW_NO_ASK=1", "HOMEBREW_ASK=")
 	}
 	return nil, ErrUnknownMethod
+}
+
+// Update starts a job that brings the tool to its latest version, the way it
+// was installed (official installer, Homebrew or npm).
+func (m *Manager) Update(id string) (*Job, error) {
+	t, ok := m.find(id)
+	if !ok {
+		return nil, ErrUnknownTool
+	}
+	path := m.lookPath(t.Bin)
+	if path == "" {
+		return nil, ErrNotInstalled
+	}
+	meth, ok := updateMethod(t, path)
+	if !ok {
+		return nil, ErrUnknownInstall
+	}
+	return m.start(id, id, "update", meth.update, 15*time.Minute, term{}, "HOMEBREW_NO_ASK=1", "HOMEBREW_ASK=")
+}
+
+// updateMethod is the method the tool at path was installed with, read from
+// where its binary really lives: an npm package (or a Volta shim), Homebrew
+// (its Cellar/Caskroom, or a cask binary copied into its prefix), else the
+// official installer.
+func updateMethod(t Tool, path string) (Method, bool) {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		real = path
+	}
+	id := "native"
+	switch {
+	case strings.Contains(real, "/node_modules/") || strings.Contains(real, "/.volta/"):
+		id = "npm"
+	case strings.Contains(real, "/Caskroom/") || strings.Contains(real, "/Cellar/") ||
+		strings.HasPrefix(real, "/opt/homebrew/") || strings.HasPrefix(real, "/home/linuxbrew/"):
+		id = "brew"
+	}
+	for _, meth := range t.methods {
+		if meth.ID == id && len(meth.update) > 0 {
+			return meth, true
+		}
+	}
+	return Method{}, false
 }
 
 // Login starts the tool's sign-in flow.

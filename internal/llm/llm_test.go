@@ -7,11 +7,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/storage"
 )
@@ -107,7 +107,7 @@ func TestOpenAIAndCompatible(t *testing.T) {
 func fakeBin(t *testing.T, name, script string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+	if err := fakebin.Write(p, []byte("#!/bin/sh\n"+script)); err != nil {
 		t.Fatal(err)
 	}
 	return p

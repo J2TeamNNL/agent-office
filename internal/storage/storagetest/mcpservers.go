@@ -81,7 +81,7 @@ func testMCPCalls(t *testing.T, s storage.Store) {
 	old := time.Now().UTC().Add(-48 * time.Hour)
 	for _, c := range []storage.MCPCall{
 		{ServerID: "m1", ServerName: "a", Tool: "t1", Status: "ok", CreatedAt: old},
-		{ServerID: "m1", ServerName: "a", Tool: "t2", Status: "error", Error: "boom"},
+		{ServerID: "m1", ServerName: "a", Tool: "t2", Status: "error", Error: "boom", BytesIn: 10, BytesOut: 300, BytesCut: 7000},
 		{ServerID: "m1", ServerName: "a", Tool: "t3", Status: "proposed", ActionID: "act_1"},
 		{ServerID: "m2", ServerName: "b", Tool: "t1", Status: "ok", Caller: "Dev", CallerKind: "claude"},
 	} {
@@ -92,6 +92,9 @@ func testMCPCalls(t *testing.T, s storage.Store) {
 	list, err := r.List(ctx, "m1", 10)
 	if err != nil || len(list) != 3 || list[2].Tool != "t1" {
 		t.Fatalf("List m1 = %+v %v", list, err)
+	}
+	if list[1].BytesIn != 10 || list[1].BytesOut != 300 || list[1].BytesCut != 7000 {
+		t.Fatalf("bytes = %+v", list[1])
 	}
 	if all, _ := r.List(ctx, "", 2); len(all) != 2 {
 		t.Fatalf("List limit = %+v", all)
@@ -104,7 +107,7 @@ func testMCPCalls(t *testing.T, s storage.Store) {
 	for _, st := range stats {
 		by[st.ServerID] = st
 	}
-	if st := by["m1"]; st.Calls != 2 || st.Errors != 1 || st.Proposed != 1 || st.LastAt == nil {
+	if st := by["m1"]; st.Calls != 2 || st.Errors != 1 || st.Proposed != 1 || st.BytesOut != 300 || st.BytesCut != 7000 || st.LastAt == nil {
 		t.Fatalf("stats m1 = %+v", st)
 	}
 	if n, _ := r.Prune(ctx, time.Now().UTC().Add(-24*time.Hour)); n != 1 {

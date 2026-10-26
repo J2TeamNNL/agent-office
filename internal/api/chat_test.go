@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 func TestChatAPIWithSSE(t *testing.T) {
@@ -21,10 +23,10 @@ func TestChatAPIWithSSE(t *testing.T) {
 
 	bin := filepath.Join(t.TempDir(), "claude")
 	result := `{"type":"result","subtype":"success","is_error":false,"result":"Đề xuất:\n` + "```" + `diff\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+ONE\n` + "```" + `","session_id":"s1","total_cost_usd":0.01,"usage":{"input_tokens":3,"output_tokens":4}}`
-	os.WriteFile(bin, []byte("#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n"+
+	fakebin.Write(bin, []byte("#!/bin/sh\ncat >/dev/null\ncat <<'JSON'\n"+
 		`{"type":"system","subtype":"init","session_id":"s1"}`+"\n"+
 		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Đề xuất:"}}}`+"\n"+
-		result+"\nJSON\n"), 0o755)
+		result+"\nJSON\n"))
 	do(t, admin, "POST", e.srv.URL+"/api/providers", map[string]any{"name": "CC", "kind": "claude_cli", "base_url": bin}, nil)
 
 	dir := t.TempDir()

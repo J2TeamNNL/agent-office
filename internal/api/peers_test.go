@@ -115,6 +115,55 @@ func TestPeerPairing(t *testing.T) {
 	if out, isErr := a.office.CallOther(ctx, sc, "read_chat", json.RawMessage(`{"chat":"`+link+`"}`)); isErr || !strings.Contains(out, "làm trang shop") {
 		t.Fatalf("read_chat: %v %s", isErr, out)
 	}
+	// chats lists what A may read: the chat between the two; every chat of shop
+	// once B makes A administrator (ADR-211)
+	chats := json.RawMessage(`{"office":"office-b","project":"shop"}`)
+	if out, isErr := a.office.CallOther(ctx, sc, "chats", chats); isErr || !strings.Contains(out, link) || strings.Contains(out, other.ID) {
+		t.Fatalf("chats: %v %s", isErr, out)
+	}
+	bpeer, _ := b.peers.List(ctx)
+	b.peers.SetAdmin(ctx, bpeer[0].ID, true)
+	if out, isErr := a.office.CallOther(ctx, sc, "chats", chats); isErr || !strings.Contains(out, other.ID) {
+		t.Fatalf("chats as administrator: %v %s", isErr, out)
+	}
+	if text, _, err := a.peers.ReadChat(ctx, pa, shop.ID, other.ID, ""); err != nil || !strings.Contains(text, "bí mật") {
+		t.Fatalf("read as administrator: %q %v", text, err)
+	}
+	if _, err := a.peers.ListChats(ctx, pa, private.ID, 7); err == nil {
+		t.Fatal("chats of a project not shared were listed")
+	}
+	// tools and call (ADR-212): as administrator, A reads and changes shop's settings
+	if out, isErr := a.office.CallOther(ctx, sc, "tools", chats); isErr || !strings.Contains(out, "as administrator") || !strings.Contains(out, "propose_change") {
+		t.Fatalf("tools as administrator: %v %s", isErr, out)
+	}
+	agents, _ := b.st.Agents().List(ctx, shop.ID)
+	change := `{"office":"office-b","project":"shop","tool":"propose_change","args":{"resource":"agent","op":"update","id":"` + agents[0].ID + `","patch":{"instructions":"Làm cẩn thận."},"reason":"x"}}`
+	if out, isErr := a.office.CallOther(ctx, sc, "call", json.RawMessage(change)); isErr {
+		t.Fatalf("propose_change as administrator: %s", out)
+	}
+	if x, _ := b.st.Agents().Get(ctx, agents[0].ID); x.Instructions != "Làm cẩn thận." {
+		t.Fatalf("the change was not done: %q", x.Instructions)
+	}
+	// an agent's notes: written and read for the agent the call names
+	note := `{"office":"office-b","project":"shop","tool":"remember","args":{"agent":"` + agents[0].Name + `","note":"Chạy npm test trước khi báo xong","reason":"x"}}`
+	if out, isErr := a.office.CallOther(ctx, sc, "call", json.RawMessage(note)); isErr {
+		t.Fatalf("remember: %s", out)
+	}
+	recall := json.RawMessage(`{"office":"office-b","project":"shop","tool":"recall","args":{"agent":"` + agents[0].Name + `","query":"npm test"}}`)
+	if out, isErr := a.office.CallOther(ctx, sc, "call", recall); isErr || !strings.Contains(out, "npm test") {
+		t.Fatalf("recall: %v %s", isErr, out)
+	}
+	b.peers.SetAdmin(ctx, bpeer[0].ID, false)
+	// not administrator: read only
+	if out, isErr := a.office.CallOther(ctx, sc, "tools", chats); isErr || strings.Contains(out, "propose_change") || !strings.Contains(out, "list") {
+		t.Fatalf("tools read only: %v %s", isErr, out)
+	}
+	if out, isErr := a.office.CallOther(ctx, sc, "call", json.RawMessage(`{"office":"office-b","project":"shop","tool":"list","args":{"resource":"agent"}}`)); isErr || !strings.Contains(out, agents[0].Name) {
+		t.Fatalf("list read only: %v %s", isErr, out)
+	}
+	if _, isErr := a.office.CallOther(ctx, sc, "call", json.RawMessage(change)); !isErr {
+		t.Fatal("a change was made without administrator")
+	}
 	// the old tools point to it
 	if out, isErr := a.office.Call(ctx, sc, "search_history", json.RawMessage(`{"query":"shop","project":"office-b/shop"}`)); !isErr || !strings.Contains(out, "other_office") {
 		t.Fatalf("search_history: %v %s", isErr, out)

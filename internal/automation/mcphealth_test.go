@@ -1,10 +1,11 @@
 package automation
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 const sampleList = `Checking MCP server health…
@@ -40,7 +41,7 @@ func TestMCPHealthCheck(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "claude")
 	script := "#!/bin/sh\necho 'Checking MCP server health…'\necho \"x: $(pwd) - ✔ Connected\"\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+	if err := fakebin.Write(bin, []byte(script)); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan MCPCheck, 1)

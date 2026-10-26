@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/llm"
 )
 
@@ -22,7 +23,7 @@ printf '%s\n' "$@" > "$CODEX_TEST_ARGS"
 cat >/dev/null
 echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
 `
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+	if err := fakebin.Write(bin, []byte(script)); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CODEX_TEST_ARGS", argsFile)
@@ -69,7 +70,7 @@ cat >/dev/null
 echo '{"type":"thread.started","thread_id":"s1"}'
 python3 -c 'print("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"" + "x"*(17*1024*1024) + "\"}}")'
 `
-	os.WriteFile(bin, []byte(script), 0o755)
+	fakebin.Write(bin, []byte(script))
 	res, err := codexRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
 	if err == nil {
 		t.Fatalf("expected an error for an oversized line, got res = %+v", res)
@@ -117,7 +118,7 @@ echo '{"type":"turn.started"}'
 echo '{"type":"turn.failed","error":{"message":"workspace routing discovery unauthorized (401)"}}'
 exit 1
 `
-	os.WriteFile(bin, []byte(script), 0o755)
+	fakebin.Write(bin, []byte(script))
 	_, err := codexRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
 	if !errors.Is(err, llm.ErrNeedsLogin) {
 		t.Fatalf("err = %v, want ErrNeedsLogin", err)

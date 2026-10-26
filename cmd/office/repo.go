@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/tung1998/agent-office/internal/repos"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/team"
+	"github.com/tung1998/agent-office/internal/transfer"
 )
 
 func repoCmd() *cobra.Command {
@@ -123,7 +126,55 @@ func repoCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.AddCommand(add, list, rm)
+	var (
+		out     string
+		include []string
+	)
+	pack := &cobra.Command{
+		Use:   "pack <đường-dẫn|tên>",
+		Short: "Ghi gói project (JSON) để repo mang theo: clone về là có sẵn agent, quy trình, lịch, ghi nhớ",
+		Long: `Ghi gói project dạng JSON (ADR-190). Mặc định ghi vào <thư mục project>/` + transfer.RepoPackFile + `, gồm config (agent, quy trình, tự động hóa theo lịch, quyền, bảng dữ liệu) và ghi nhớ.
+Thêm một thư mục, hoặc clone một repo, có file này làm project (office init, Thêm project) là nhập gói.`,
+		Example: `  office project pack ~/code/acme
+  office project pack acme --include config --out /tmp/acme.pack.json`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withApp(cmd.Context(), func(a *app) error {
+				r, err := findProject(cmd, a, args[0])
+				if err != nil {
+					return err
+				}
+				file := out
+				if file == "" {
+					if r.Path == "" {
+						return errors.New("project không có thư mục: cần --out")
+					}
+					file = filepath.Join(r.Path, transfer.RepoPackFile)
+				}
+				p, err := newTransfers(a).ExportPack(cmd.Context(), r.ID, include, nil)
+				if err != nil {
+					return err
+				}
+				raw, err := json.MarshalIndent(p, "", "  ")
+				if err != nil {
+					return err
+				}
+				if err := os.WriteFile(file, append(raw, '\n'), 0o644); err != nil {
+					return err
+				}
+				burn := ""
+				if p.Burn != nil {
+					burn = fmt.Sprintf(", Burn (%d hồ sơ review)", len(p.Burn.ReviewProfiles))
+				}
+				fmt.Printf("✓ Đã ghi gói %s (%s): %d tự động hóa, %d bảng dữ liệu, %d ghi nhớ%s\n", file, strings.Join(p.Include, ", "),
+					len(p.Automations), len(p.Collections), len(p.Memories), burn)
+				return nil
+			})
+		},
+	}
+	pack.Flags().StringVar(&out, "out", "", "file đích (mặc định <thư mục project>/"+transfer.RepoPackFile+")")
+	pack.Flags().StringSliceVar(&include, "include", []string{transfer.IncludeConfig, transfer.IncludeMemory}, "phần mang theo: config, memory, chats")
+	cmd.AddCommand(add, list, rm, pack)
 	return cmd
 }
 

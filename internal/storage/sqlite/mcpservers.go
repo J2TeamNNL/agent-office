@@ -158,9 +158,9 @@ func (r mcpCallRepo) Add(ctx context.Context, c storage.MCPCall) error {
 		c.CreatedAt = time.Now().UTC()
 	}
 	_, err := r.db.ExecContext(ctx, `INSERT INTO mcp_calls (id, server_id, server_name, tool, caller, caller_kind, project_id, conversation_id, job_id, action_id,
-		status, error, duration_ms, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		status, error, duration_ms, bytes_in, bytes_out, bytes_cut, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		c.ID, c.ServerID, c.ServerName, c.Tool, c.Caller, c.CallerKind, c.ProjectID, c.ConversationID, c.JobID, c.ActionID,
-		c.Status, c.Error, c.DurationMS, fmtTime(c.CreatedAt))
+		c.Status, c.Error, c.DurationMS, c.BytesIn, c.BytesOut, c.BytesCut, fmtTime(c.CreatedAt))
 	return err
 }
 
@@ -169,7 +169,7 @@ func (r mcpCallRepo) List(ctx context.Context, serverID string, limit int) ([]st
 		limit = 100
 	}
 	q := `SELECT id, server_id, server_name, tool, caller, caller_kind, project_id, conversation_id, job_id, action_id,
-		status, error, duration_ms, created_at FROM mcp_calls`
+		status, error, duration_ms, bytes_in, bytes_out, bytes_cut, created_at FROM mcp_calls`
 	args := []any{}
 	if serverID != "" {
 		q += ` WHERE server_id=?`
@@ -186,7 +186,7 @@ func (r mcpCallRepo) List(ctx context.Context, serverID string, limit int) ([]st
 		var c storage.MCPCall
 		var created string
 		if err := rows.Scan(&c.ID, &c.ServerID, &c.ServerName, &c.Tool, &c.Caller, &c.CallerKind, &c.ProjectID, &c.ConversationID, &c.JobID, &c.ActionID,
-			&c.Status, &c.Error, &c.DurationMS, &created); err != nil {
+			&c.Status, &c.Error, &c.DurationMS, &c.BytesIn, &c.BytesOut, &c.BytesCut, &created); err != nil {
 			return nil, err
 		}
 		if err := parseTimes([]*time.Time{&c.CreatedAt}, created); err != nil {
@@ -200,7 +200,7 @@ func (r mcpCallRepo) List(ctx context.Context, serverID string, limit int) ([]st
 func (r mcpCallRepo) Stats(ctx context.Context, since time.Time) ([]storage.MCPCallStat, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT server_id, COUNT(*),
 		SUM(CASE WHEN status IN ('error','denied') THEN 1 ELSE 0 END),
-		SUM(CASE WHEN status='proposed' THEN 1 ELSE 0 END), MAX(created_at)
+		SUM(CASE WHEN status='proposed' THEN 1 ELSE 0 END), SUM(bytes_out), SUM(bytes_cut), MAX(created_at)
 		FROM mcp_calls WHERE created_at >= ? GROUP BY server_id`, fmtTime(since))
 	if err != nil {
 		return nil, err
@@ -210,7 +210,7 @@ func (r mcpCallRepo) Stats(ctx context.Context, since time.Time) ([]storage.MCPC
 	for rows.Next() {
 		var s storage.MCPCallStat
 		var last sql.NullString
-		if err := rows.Scan(&s.ServerID, &s.Calls, &s.Errors, &s.Proposed, &last); err != nil {
+		if err := rows.Scan(&s.ServerID, &s.Calls, &s.Errors, &s.Proposed, &s.BytesOut, &s.BytesCut, &last); err != nil {
 			return nil, err
 		}
 		if s.LastAt, err = optParse(last); err != nil {

@@ -98,7 +98,7 @@ function projectSections(id: string): NavigationMenuItem[] {
           { label: t('files.section'), icon: 'i-lucide-folder-tree', to: to('files'), exactQuery: 'partial' as const },
           { label: t('project.sectionSkill'), icon: 'i-lucide-sparkles', to: to('skill'), exactQuery: 'partial' as const },
           { label: t('project.sectionMcp'), icon: 'i-lucide-plug-zap', to: to('mcp'), exactQuery: 'partial' as const },
-          { label: t('project.sectionBurn'), icon: 'i-lucide-flame', to: to('burn'), exactQuery: 'partial' as const },
+          { label: t('project.sectionBurn'), icon: 'i-lucide-list-checks', to: to('burn'), exactQuery: 'partial' as const }, // the work board; Burn runs it (ADR-210)
           { label: t('nav.log'), icon: 'i-lucide-scroll-text', to: to('log'), exactQuery: 'partial' as const }
         ]
       : []),
@@ -115,6 +115,9 @@ function withParent(parent: string | undefined, items: NavigationMenuItem[]): Na
 // what needs a person across the office: its count on "Sự cố" (pushed as it changes)
 const { data: incData } = useLiveFetch<{ count: number }>('/api/incidents', { key: 'incidents', lazy: true })
 const attention = computed(() => incData.value?.count ?? 0)
+// connections failing (signed out, their CLI stuck): marked on "Kết nối AI", seen from any page
+const { data: provData } = useLiveFetch<{ providers: Provider[] }>('/api/providers', { lazy: true })
+const brokenProviders = computed(() => provData.value?.providers.filter(p => p.enabled && p.status === 'error').length ?? 0)
 
 // the watch dashboards sit under "Theo dõi" (at most 5, ADR-159), + for a new one
 const watchLayout = useWatchLayout()
@@ -140,7 +143,10 @@ const items = computed<NavigationMenuItem[][]>(() => {
     { value: 'watch', label: t('watch.title'), icon: 'i-lucide-layout-grid', to: '/watch', children: watchBoards.value },
     { label: t('nav.overview'), icon: 'i-lucide-layout-dashboard', to: '/', badge: attention.value || undefined },
     { label: t('nav.jobs'), icon: 'i-lucide-list-checks', to: '/jobs' },
-    { label: t('nav.providers'), icon: 'i-lucide-plug', to: '/providers' }
+    {
+      label: t('nav.providers'), icon: 'i-lucide-plug', to: '/providers',
+      badge: brokenProviders.value ? { label: String(brokenProviders.value), color: 'error' as const, variant: 'solid' as const } : undefined
+    }
   ]
   // what projects pick from: agents (ADR-153), skills, MCP servers, workflows
   const library: NavigationMenuItem[] = [
@@ -151,6 +157,7 @@ const items = computed<NavigationMenuItem[][]>(() => {
           { label: t('tools.skillsTab'), icon: 'i-lucide-sparkles', to: '/skills' },
           { label: t('tools.mcpTab'), icon: 'i-lucide-plug-zap', to: '/mcp' },
           { label: t('nav.automationTemplates'), icon: 'i-lucide-zap', to: '/automations/templates' },
+          { label: t('packs.title'), icon: 'i-lucide-building-2', to: '/packs' },
           { label: t('wf.section'), icon: 'i-lucide-workflow', to: '/workflows' }
         ]
       : [])

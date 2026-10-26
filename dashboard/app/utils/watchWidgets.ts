@@ -3,7 +3,7 @@
 // from these, the widget reads them with their defaults.
 export type WidgetKind = 'chat' | 'process' | 'container' | 'monitor' | 'stat' | 'jobs' | 'chart' | 'incidents' | 'approvals' | 'system'
   | 'budget' | 'lights' | 'note' | 'git' | 'controls' | 'automations' | 'breakdown' | 'limits' | 'preview' | 'consoles' | 'provider' | 'agent'
-  | 'burn' | 'burnwork'
+  | 'burn' | 'burnwork' | 'tasks' | 'changes' | 'team' | 'officemap'
 import type { SizeRule } from './watchGrid'
 
 // a box's room in grid cells (a cell is about 90px square): the size it starts
@@ -113,6 +113,22 @@ export const widgetDefs: WidgetDef[] = [
   {
     kind: 'burnwork', group: 'agents', grid: { w: 4, h: 4, minW: 3, minH: 2, maxW: 8, maxH: 10 }, icon: 'i-lucide-list-todo', project: 'required', admin: true,
     fields: [{ key: 'done', type: 'switch' }], defaults: { done: false }
+  },
+  // how the work went (ADR-210): of the box's project and those it links to,
+  // or of every project
+  {
+    kind: 'tasks', group: 'agents', grid: { w: 4, h: 3, minW: 2, minH: 2, maxW: 8, maxH: 8 }, icon: 'i-lucide-list-checks', project: 'optional',
+    fields: [{ key: 'days', type: 'select', options: [1, 7, 30] }], defaults: { days: 1 }
+  },
+  {
+    kind: 'team', group: 'agents', grid: { w: 3, h: 3, minW: 2, minH: 2, maxW: 6, maxH: 8 }, icon: 'i-lucide-users', project: 'optional',
+    fields: [{ key: 'days', type: 'select', options: [1, 7, 30] }], defaults: { days: 1 }
+  },
+  // a company's office map: the startup pack's own app (ban-do/), shown in the box
+  { kind: 'officemap', group: 'agents', grid: { w: 8, h: 5, minW: 3, minH: 3, maxW: 12, maxH: 12 }, icon: 'i-lucide-map', project: 'required', fields: [], defaults: {} },
+  {
+    kind: 'changes', group: 'other', grid: { w: 4, h: 4, minW: 2, minH: 2, maxW: 8, maxH: 10 }, icon: 'i-lucide-history', project: 'optional',
+    fields: [{ key: 'days', type: 'select', options: [1, 7, 30] }], defaults: { days: 7 }
   },
   {
     kind: 'consoles', feature: 'ops', group: 'run', grid: { w: 8, h: 5, minW: 4, minH: 3, maxW: 12, maxH: 12 }, icon: 'i-lucide-panels-top-left', project: 'required',

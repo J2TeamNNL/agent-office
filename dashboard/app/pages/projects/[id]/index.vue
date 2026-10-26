@@ -117,6 +117,7 @@ async function removeRepo() {
               </div>
             </UCard>
               <FeaturePacks :project-id="project.id" @changed="refresh()" />
+              <PackSync v-if="isAdmin" :project-id="project.id" @changed="refresh()" />
               <ProjectBudget :project-id="project.id" />
             </div>
             <PolicyPanel v-else-if="tab === 'perm'" :project-id="project.id" />

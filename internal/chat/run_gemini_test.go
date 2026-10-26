@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 func TestGeminiRunnerStreams(t *testing.T) {
@@ -19,7 +21,7 @@ func TestGeminiRunnerStreams(t *testing.T) {
 	t.Setenv("GEMINI_CLI_HOME", real)
 
 	bin, seen := filepath.Join(tmp, "gemini"), filepath.Join(tmp, "seen")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 { echo "$GEMINI_CLI_HOME"; echo "$*"; echo "token=$OFFICE_MCP_TOKEN"; cat "$GEMINI_CLI_HOME/.gemini/settings.json"; echo;
   test -e "$GEMINI_CLI_HOME/.gemini/oauth_creds.json" && echo creds-linked; } > `+seen+`
 cat >/dev/null
@@ -32,7 +34,7 @@ echo '{"type":"tool_use","tool_name":"mcp_office_ops_overview","tool_id":"2","pa
 echo '{"type":"tool_use","tool_name":"mcp_my_srv_list","tool_id":"3","parameters":{}}'
 echo '{"type":"message","role":"assistant","content":"chào","delta":true}'
 echo '{"type":"result","status":"success","stats":{"input_tokens":12,"output_tokens":3}}'
-`), 0o755)
+`))
 
 	req := RunRequest{Bin: bin, Prompt: "chào", WorkDir: tmp, Write: true,
 		Office: &OfficeAccess{MCPURL: "http://127.0.0.1:1/mcp", Token: "tok", Gateway: []string{"my srv"}}}
@@ -100,7 +102,7 @@ cat >/dev/null
 echo '{"type":"init","session_id":"s1"}'
 python3 -c 'print("{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"" + "x"*(17*1024*1024) + "\"}")'
 `
-	os.WriteFile(bin, []byte(script), 0o755)
+	fakebin.Write(bin, []byte(script))
 	res, err := geminiRunner{}.Run(context.Background(), RunRequest{Bin: bin, WorkDir: dir, Prompt: "hi"}, func(Event) {})
 	if err == nil {
 		t.Fatalf("expected an error for an oversized line, got res = %+v", res)
@@ -113,11 +115,11 @@ python3 -c 'print("{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"" 
 func TestGeminiRunnerError(t *testing.T) {
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "gemini")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat >/dev/null
 echo 'Please set an Auth method in your settings.json' >&2
 exit 41
-`), 0o755)
+`))
 	_, err := geminiRunner{}.Run(context.Background(), RunRequest{Bin: bin, Prompt: "x", WorkDir: tmp}, func(Event) {})
 	if err == nil || !strings.Contains(err.Error(), "Auth method") {
 		t.Fatalf("err = %v", err)

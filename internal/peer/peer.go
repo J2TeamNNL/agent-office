@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -611,6 +612,86 @@ func (s *Service) ReadChat(ctx context.Context, id, project, chat, message strin
 	}
 	err = s.call(ctx, p, http.MethodGet, path, nil, &out)
 	return out.Text, out.Project, err
+}
+
+// ChatInfo is a chat of a shared project the other office lists (ADR-211).
+type ChatInfo struct {
+	Chat      string    `json:"chat"`
+	Project   string    `json:"project"`
+	Title     string    `json:"title,omitempty"`
+	Agent     string    `json:"agent,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ListChats lists the chats of project in the paired office id that this
+// office may read, the latest first, updated in the last days.
+func (s *Service) ListChats(ctx context.Context, id, project string, days int) ([]ChatInfo, error) {
+	p, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, errors.New("office liên kết không còn (đã gỡ ghép nối?)")
+	}
+	var out struct {
+		Chats []ChatInfo `json:"chats"`
+	}
+	path := "/api/peer/projects/" + url.PathEscape(project) + "/chats?days=" + strconv.Itoa(days)
+	if err := s.call(ctx, p, http.MethodGet, path, nil, &out); err != nil {
+		return nil, older(err)
+	}
+	return out.Chats, nil
+}
+
+// RemoteTool is an office tool another office may call on a project shared
+// with it (ADR-212).
+type RemoteTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Schema      map[string]any `json:"schema,omitempty"`
+	ReadOnly    bool           `json:"read_only,omitempty"`
+}
+
+// ToolResult is what a RemoteTool call answered.
+type ToolResult struct {
+	Text  string `json:"text"`
+	Error bool   `json:"error,omitempty"`
+}
+
+// Tools lists the tools this office may call on project in office id, and
+// whether it calls them as administrator there.
+func (s *Service) Tools(ctx context.Context, id, project string) ([]RemoteTool, bool, error) {
+	p, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, false, errors.New("office liên kết không còn (đã gỡ ghép nối?)")
+	}
+	var out struct {
+		Tools []RemoteTool `json:"tools"`
+		Admin bool         `json:"admin"`
+	}
+	if err := s.call(ctx, p, http.MethodGet, "/api/peer/projects/"+url.PathEscape(project)+"/tools", nil, &out); err != nil {
+		return nil, false, older(err)
+	}
+	return out.Tools, out.Admin, nil
+}
+
+// CallTool calls tool on project in office id with args (a JSON object).
+func (s *Service) CallTool(ctx context.Context, id, project, tool string, args json.RawMessage) (ToolResult, error) {
+	p, err := s.Get(ctx, id)
+	if err != nil {
+		return ToolResult{}, errors.New("office liên kết không còn (đã gỡ ghép nối?)")
+	}
+	if len(args) == 0 || string(args) == "null" {
+		args = json.RawMessage("{}")
+	}
+	var out ToolResult
+	err = s.call(ctx, p, http.MethodPost, "/api/peer/projects/"+url.PathEscape(project)+"/tools/"+url.PathEscape(tool), args, &out)
+	return out, older(err)
+}
+
+// older: a 404 from the other office means it predates the call.
+func older(err error) error {
+	if err != nil && strings.Contains(err.Error(), "(404)") {
+		return errors.New("office bên kia chưa có lệnh này: cần cập nhật office ở đó")
+	}
+	return err
 }
 
 // FetchPack asks office id for a pack (.zip, ADR-170) of its project, with

@@ -67,36 +67,65 @@ func TestMemory(t *testing.T) {
 	}
 }
 
-// A note being compacted can be edited by a person while the model call is
-// in flight; the edit must survive, not be overwritten by a summary built
-// from the note's pre-edit text (ADR-068 concurrency).
-func TestCompactTopicKeepsConcurrentEdit(t *testing.T) {
+// ADR-215: notes are kept right, not only added to: Revise drops, rewrites
+// and adds in one go (what they were kept as a revision); recall shows ids.
+func TestRevise(t *testing.T) {
 	ctx := context.Background()
 	st, pid := open(t)
-	a, _ := st.Memories().Create(ctx, storage.Memory{ProjectID: pid, AgentID: "agt_1", Text: "note a", Topic: "t"})
-	st.Memories().Create(ctx, storage.Memory{ProjectID: pid, AgentID: "agt_1", Text: "note b", Topic: "t"})
-
-	svc := memory.New(st, func(_ context.Context, _, _ string, items []storage.Memory) ([]string, error) {
-		// Simulate a person editing note a mid-compaction, before the model returns.
-		cur, _ := st.Memories().Get(ctx, a.ID)
-		cur.Text = "note a EDITED"
-		if err := st.Memories().Update(ctx, cur); err != nil {
-			t.Fatalf("concurrent edit failed: %v", err)
-		}
-		return []string{"gộp " + items[0].Text + " " + items[1].Text}, nil
-	})
-
-	if err := svc.CompactTopic(ctx, pid, "agt_1", "t", "test"); err != nil {
-		t.Fatal(err)
+	svc := memory.New(st, nil)
+	old, _ := svc.Add(ctx, pid, "agt_1", "repo cũ ở /tmp/a, đã xoá ngày 25/10", "agent", "a")
+	keep, _ := svc.Add(ctx, pid, "agt_1", "chạy go test ./... trước khi báo xong", "agent", "a")
+	other, _ := svc.Add(ctx, pid, "agt_2", "ghi nhớ của agent khác", "agent", "a")
+	n, err := svc.Revise(ctx, pid, "agt_1", []storage.Memory{{Text: "mẫu nằm ở templates/packs/startup", Topic: "Company pack", Summary: "mẫu công ty"}},
+		map[string]string{keep.ID: "chạy go test ./... và gofmt -l . trước khi báo xong"}, []string{old.ID, other.ID}, "dọn")
+	if err != nil || n != 1 {
+		t.Fatalf("revise = %d %v", n, err)
 	}
 	list, _ := st.Memories().List(ctx, pid, "agt_1")
-	var foundEdit bool
-	for _, m := range list {
-		if m.Text == "note a EDITED" && m.Source == "person" {
-			foundEdit = true
-		}
+	if len(list) != 2 || list[0].Text != "chạy go test ./... và gofmt -l . trước khi báo xong" || list[1].Topic != "company-pack" {
+		t.Fatalf("notes = %+v", list)
 	}
-	if !foundEdit {
-		t.Fatalf("concurrent edit lost or overwritten by stale compaction, list = %+v", list)
+	if x, _ := st.Memories().List(ctx, pid, "agt_2"); len(x) != 1 {
+		t.Fatal("another agent's note was dropped")
+	}
+	if revs, _ := st.Memories().Revisions(ctx, pid, "agt_1"); len(revs) != 1 || len(revs[0].Items) != 2 {
+		t.Fatalf("revisions = %+v", revs)
+	}
+	out, _ := memory.Recall(ctx, st, pid, "agt_1", "core", "")
+	if !strings.Contains(out, "["+keep.ID+"]") || strings.Contains(out, "templates/packs") {
+		t.Fatalf("recall core = %q", out)
+	}
+}
+
+// ADR-215: after a turn, a review keeps the notes up to date: within its
+// bounds, only the agent's own notes, nothing when the project keeps notes
+// by hand.
+func TestReview(t *testing.T) {
+	ctx := context.Background()
+	st, pid := open(t)
+	svc := memory.New(st, nil)
+	stale, _ := svc.Add(ctx, pid, "agt_1", "đồng bộ public 15/10: private f30c1b6 → public 6fec5da", "agent", "a")
+	other, _ := svc.Add(ctx, pid, "agt_2", "ghi nhớ của agent khác", "agent", "a")
+	var asked string
+	svc.SetReviewer(func(_ context.Context, _, _ string, notes []storage.Memory, q, _ string) ([]memory.Op, error) {
+		asked = q
+		return []memory.Op{{Op: "drop", ID: stale.ID}, {Op: "drop", ID: other.ID},
+			{Op: "add", Text: "repo là bản private, không đồng bộ sang public nữa"}, {Op: "add", Text: "điều thứ hai đủ dài để ghi lại"}, {Op: "add", Text: "điều thứ ba quá giới hạn mỗi lượt"}}, nil
+	})
+	if err := svc.Review(ctx, pid, "agt_1", "repo đã private chưa?", "rồi"); err != nil || asked != "repo đã private chưa?" {
+		t.Fatalf("review = %v (asked %q)", err, asked)
+	}
+	list, _ := st.Memories().List(ctx, pid, "agt_1")
+	if len(list) != memory.ReviewAdds || list[0].Source != "review" || strings.Contains(list[0].Text, "f30c1b6") {
+		t.Fatalf("notes = %+v", list)
+	}
+	if x, _ := st.Memories().List(ctx, pid, "agt_2"); len(x) != 1 {
+		t.Fatal("another agent's note was dropped")
+	}
+	svc.SetAuto(ctx, pid, false)
+	asked = ""
+	svc.Review(ctx, pid, "agt_1", "lượt khác", "x")
+	if asked != "" {
+		t.Fatal("reviewed while the project keeps notes by hand")
 	}
 }

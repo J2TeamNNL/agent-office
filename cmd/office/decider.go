@@ -11,6 +11,7 @@ import (
 	"github.com/tung1998/agent-office/internal/actor"
 	"github.com/tung1998/agent-office/internal/audit"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/officetools"
 	"github.com/tung1998/agent-office/internal/storage"
 )
 
@@ -162,4 +163,51 @@ func (d chatDecider) RunQueued(ctx context.Context, kind, id, by string) string 
 		return "⚠️ Đã duyệt (xếp hàng) " + label + " — " + err.Error()
 	}
 	return "✅ Đã duyệt (xếp hàng) " + label + " — " + detail
+}
+
+// AdminDecide decides a waiting card for an administrator's run (ADR-188):
+// of its own project (any, for the office assistant), never a push to
+// master/main. The card's agent goes on as after a person's decision.
+func (d chatDecider) AdminDecide(ctx context.Context, sc officetools.Scope, kind, id string, approve bool) (string, error) {
+	var conv, project, label string
+	switch kind {
+	case "patch":
+		p, err := d.store.Chat().GetPatch(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		conv, label = p.ConversationID, "diff: "+strings.Join(p.Files, ", ")
+		project, _ = d.placeOf(ctx, conv)
+	case "action":
+		a, err := d.store.Actions().Get(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		if approve && a.Kind == "git_push" && d.acts.PushesProtected(ctx, a) {
+			return "", errors.New("push lên master/main phải do người duyệt")
+		}
+		conv, project, label = a.ConversationID, a.ProjectID, cmp.Or(actions.Kinds[a.Kind], a.Kind)+": "+a.Target
+	default:
+		return "", errors.New("kind là action hoặc patch")
+	}
+	if !sc.Office && project != sc.ProjectID {
+		return "", errors.New("thẻ này không thuộc project của bạn")
+	}
+	by := "auto:" + sc.Agent + " (administrator)"
+	if sc.AdminBy != "" {
+		ctx = actions.WithPrincipal(ctx, sc.AdminBy)
+	}
+	detail, err := d.Decide(ctx, kind, id, approve, by)
+	if err != nil {
+		return "", err
+	}
+	line := "❌ Đã từ chối " + label
+	if approve {
+		line = "✅ Đã duyệt " + label + " — " + detail
+	}
+	if conv != "" && conv != sc.ConversationID { // its agent goes on; one's own card it knows already
+		d.chat.Decided(conv, by, line)
+		go d.chat.Drain(conv)
+	}
+	return line, nil
 }

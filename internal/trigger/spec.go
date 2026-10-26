@@ -13,7 +13,9 @@ import (
 // Spec is an automation as an agent proposes it (ADR-041): flat, validated
 // before anyone is asked to approve it.
 type Spec struct {
-	AutomationID string                     `json:"automation_id,omitempty"` // update: which one
+	AutomationID string `json:"automation_id,omitempty"` // update: which one
+	// Enabled turns it on or off (ADR-200); nil = a new one on, an edited one as it is.
+	Enabled      *bool                      `json:"enabled,omitempty"`
 	Name         string                     `json:"name"`
 	Source       string                     `json:"source"` // schedule | webhook
 	EveryMinutes int                        `json:"every_minutes,omitempty"`
@@ -28,6 +30,10 @@ type Spec struct {
 	Goal         *storage.AutomationGoal    `json:"goal,omitempty"`    // chat/workflow: run until it is reached (ADR-132)
 	Tags         []string                   `json:"tags,omitempty"`    // on each run's chat (none = the ones it has)
 	EndsAt       *time.Time                 `json:"ends_at,omitempty"` // schedule: it stops then (none = the one it has)
+	// OnlyIf: a schedule runs only when its data says there is work (ADR-194)
+	OnlyIf *storage.AutomationCondition `json:"only_if,omitempty"`
+	// Limits: its guards (none = the ones it has)
+	Limits *storage.AutomationLimits `json:"limits,omitempty"`
 }
 
 // Check rejects what could not run: a bad schedule, an unknown language, a
@@ -70,6 +76,20 @@ func (s *Spec) Check() error {
 			return err
 		}
 	}
+	if c := s.OnlyIf; c != nil {
+		c.Collection, c.Board = strings.TrimSpace(c.Collection), strings.TrimSpace(c.Board)
+		switch {
+		case s.Source != "schedule":
+			return errors.New("điều kiện chạy (only_if) chỉ dành cho lịch chạy")
+		case c.Board != "" && c.Board != storage.BoardOpen && c.Board != storage.BoardChanged && c.Board != storage.BoardAny:
+			return errors.New("điều kiện theo bảng việc (board) là open, changed hoặc any")
+		case c.Collection == "" && c.Board == "":
+			return errors.New("điều kiện chạy cần bảng dữ liệu (collection) hoặc bảng việc (board)")
+		}
+	}
+	if l := s.Limits; l != nil && (l.DailyCostUSD < 0 || l.MaxMinutes < 0 || l.MaxRunsPerHour < 0) {
+		return errors.New("giới hạn không được âm")
+	}
 	if s.Action == "script" {
 		if !ValidLang(s.Script.Lang) {
 			return fmt.Errorf("ngôn ngữ script %q không hỗ trợ (bash, node, python)", s.Script.Lang)
@@ -108,6 +128,13 @@ func (s Spec) Apply(a *storage.Automation, now time.Time) {
 	}
 	if len(s.Tags) > 0 {
 		cfg.Tags = s.Tags
+	}
+	cfg.OnlyIf = nil
+	if s.Source == "schedule" {
+		cfg.OnlyIf = s.OnlyIf
+	}
+	if s.Limits != nil {
+		a.Limits = *s.Limits
 	}
 	cfg.EndsAt = a.Config.EndsAt
 	if s.EndsAt != nil {

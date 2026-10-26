@@ -2,12 +2,14 @@
 // agents a person adds to a project, or reads as a model when writing their
 // own. One Markdown file per agent: office frontmatter, then the instructions.
 // office/ is written for office; agency/ is imported from agency-agents by
-// scripts/sync-agency-library.mjs. Never edit agency/ by hand.
+// scripts/sync-agency-library.mjs, ecc/ from ECC by scripts/sync-ecc-library.mjs,
+// aitmpl/ from Claude Code Templates by scripts/sync-aitmpl-library.mjs.
+// Never edit agency/, ecc/ or aitmpl/ by hand.
 package library
 
 import "embed"
 
 // FS holds the shipped agent and skill library.
 //
-//go:embed office/*.md agency/*.md skills/*/SKILL.md
+//go:embed office/*.md agency/*.md ecc/*.md aitmpl/*.md skills/*/SKILL.md
 var FS embed.FS

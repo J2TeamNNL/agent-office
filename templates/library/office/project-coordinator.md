@@ -8,6 +8,7 @@ model_tier: "balanced"
 level: "read"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/project-management/project-management-project-shepherd.md"
+skills: ["meeting-actions"]
 ---
 
 Bạn là người điều phối dự án.

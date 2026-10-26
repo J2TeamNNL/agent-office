@@ -16,6 +16,8 @@ import (
 
 	"github.com/tung1998/agent-office/internal/actions"
 	"github.com/tung1998/agent-office/internal/actor"
+	"github.com/tung1998/agent-office/internal/agentskills"
+	"github.com/tung1998/agent-office/internal/automation"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/trigger"
@@ -81,7 +83,9 @@ func inputsFrom(d workflow.Def, text string) map[string]string {
 			}
 		}
 	}
-	if len(d.Inputs) > 0 && out[d.Inputs[0].Key] == "" { // one declared input: the whole text is it
+	// one declared input: the whole text is it, unless it is a number or a
+	// boolean (free text there only fails the step: `--days "look at X"`)
+	if len(d.Inputs) > 0 && out[d.Inputs[0].Key] == "" && (d.Inputs[0].Type == "" || d.Inputs[0].Type == "string") {
 		out[d.Inputs[0].Key] = out["text"]
 	}
 	return out
@@ -380,6 +384,17 @@ func (e *Engine) stepAgent(ctx context.Context, own storage.Conversation, projec
 	if err != nil {
 		return "", err
 	}
+	if s.Skill != "" { // the step's skill goes with its prompt, counted as the agent's use (ADR-185)
+		skill, err := agentskills.Use(ctx, e.store, userHome(), project.Path, a.ID, s.Skill, workflow.StepLabel(s))
+		switch {
+		case errors.Is(err, automation.ErrUnknownSkill): // the step still runs, without it
+			e.post(own, s, "Project chưa có skill `"+s.Skill+"`: bước chạy không có hướng dẫn của skill (cài ở trang Tự động hóa).") // i18n-ignore
+		case err != nil:
+			return "", err
+		default:
+			prompt = skill + "\n\n" + prompt
+		}
+	}
 	level := accessLevel(d.Access)
 	if run.ceiling != "" {
 		level = perm.Min(level, run.ceiling)
@@ -406,7 +421,7 @@ func (e *Engine) stepAgent(ctx context.Context, own storage.Conversation, projec
 		e.wf.mu.Unlock()
 		e.saveRun(run, rec, seq)
 	}
-	t, why := e.startTurn(own, project, turnSpec{agent: a, background: true, actor: run.rec.Actor, tier: run.tier, ceiling: level, tree: run.tree, limit: time.Until(run.deadline),
+	t, why := e.startTurn(own, project, turnSpec{agent: a, background: true, actor: run.rec.Actor, tier: run.tier, ceiling: level, tree: run.tree,
 		title: run.def.Name + " → " + a.Name + " (" + workflow.StepLabel(s) + ")", prompt: prompt + "\n\n" + workflow.AccessNote(d.Access),
 		wfRun: run.rec.ID, wfStep: s.ID})
 	if t == nil {
@@ -493,7 +508,7 @@ func (e *Engine) runChild(ctx context.Context, own storage.Conversation, project
 	child.parent = run
 	child.rec.CallerConversationID, child.rec.ParentRunID, child.rec.Depth = own.ID, run.rec.ID, run.rec.Depth+1
 	sub, err := e.store.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: project.ID, AgentID: run.coord.ID, AgentName: run.coord.Name, CreatedBy: run.rec.Actor,
-		Purpose: RunPurpose, Title: truncate(title, 80), Mode: own.Mode, EditMode: own.EditMode, Effort: own.Effort})
+		Purpose: RunPurpose, Title: truncate(title, 80), Mode: own.Mode, EditMode: own.EditMode})
 	if err != nil {
 		return storage.WorkflowRun{}, err
 	}

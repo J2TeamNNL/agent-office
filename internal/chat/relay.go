@@ -29,8 +29,7 @@ type relayInfo struct {
 	Agent          string `json:"relayed_by_agent,omitempty"`
 	Project        string `json:"relayed_from_project,omitempty"` // another project's chat: its name
 	// Hops: relays so far in a chain between linked projects (hand-off,
-	// report back, answer…): with another office, past maxRelayHops nothing
-	// goes on its own
+	// report back, answer…), for information: no cap
 	Hops      int    `json:"relay_hops,omitempty"`
 	Report    bool   `json:"relay_report,omitempty"`            // the linked chat's agent reporting back
 	ProjectID string `json:"relayed_from_project_id,omitempty"` // its project's id (a link to its chat)
@@ -89,10 +88,6 @@ func (e *Engine) fillRelay(ctx context.Context, r *Relay, names map[string]strin
 	r.Project = cmp.Or(r.Project, names[c.ProjectID])
 }
 
-// maxRelayHops caps a chain with another office's chats, like a group
-// chat's hand-offs with a person around (maxHopsPerson).
-const maxRelayHops = maxHopsPerson
-
 // relayOrigin is the relayed message a chat's current work answers: the last
 // message a person sent, past office's own "[office] … decided" ones; who is
 // the person it speaks for.
@@ -110,6 +105,18 @@ func relayOrigin(msgs []storage.Message) (info relayInfo, who string, ok bool) {
 	return relayInfo{}, "", false
 }
 
+// peerOrigin is the last hand-off another office sent into the chat (not a
+// report back) and the person it speaks for.
+func peerOrigin(msgs []storage.Message) (relayInfo, string, bool) {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		var info relayInfo
+		if m := msgs[i]; m.Role == "user" && json.Unmarshal([]byte(m.Context), &info) == nil && info.Peer != "" && !info.Report {
+			return info, m.Author, true
+		}
+	}
+	return relayInfo{}, "", false
+}
+
 // Relay sends an approved send_message action: a.Args.Message to the chat
 // a.TargetID, as the person whose message started the run (a.JobID). Only a
 // person's run can speak for them, and only in chats they may open.
@@ -119,9 +126,9 @@ func (e *Engine) Relay(ctx context.Context, a storage.Action) (string, string, e
 	if err != nil {
 		return "", "", errors.New("không rõ lượt chat gửi tin này")
 	}
-	as := job.CreatedBy
-	if !strings.HasPrefix(as, "human:") {
-		return "", "", errors.New("chỉ gửi thay được khi lượt chat do một người gửi (không phải bot hay tự động hóa)")
+	as, ok := storage.SpeaksFor(ctx, e.store, job)
+	if !ok {
+		return "", "", errors.New("chỉ gửi thay được khi lượt chat do một người gửi, hoặc tự động hóa theo lịch có người chịu trách nhiệm (không phải bot hay webhook)")
 	}
 	if a.Args.Peer != "" {
 		return e.relayPeer(ctx, a)
@@ -134,6 +141,11 @@ func (e *Engine) Relay(ctx context.Context, a storage.Action) (string, string, e
 		c, err := e.StartConversationFor(actor.With(ctx, as), a.Args.Project, "")
 		if err != nil {
 			return "", "", err
+		}
+		// the work goes on as the person let it run where it came from: a
+		// unit's chat its board opens runs at that chat's mode (ADR-207)
+		if src, err := e.store.Chat().GetConversation(ctx, a.ConversationID); err == nil && perm.Valid(src.Mode) {
+			c.Mode = src.Mode
 		}
 		if target, err = e.store.Chat().CreateConversation(ctx, c); err != nil {
 			return "", "", err
@@ -194,18 +206,6 @@ func (e *Engine) Relayed(ctx context.Context, conversationID string) bool {
 	return false
 }
 
-// RelayLimit: the chat's work comes from a chain with another office that
-// reached maxRelayHops — sending on waits for a person (chains between this
-// office's own projects have no cap).
-func (e *Engine) RelayLimit(ctx context.Context, conversationID string) bool {
-	msgs, err := e.store.Chat().ListMessages(ctx, conversationID)
-	if err != nil {
-		return true
-	}
-	o, _, ok := relayOrigin(msgs)
-	return ok && o.Peer != "" && o.Hops >= maxRelayHops
-}
-
 // reportBack: an agent answered in a chat a linked project's agent opened or
 // sent to (send_to_chat): its answer goes back to that chat in the person's
 // name, and the agent there goes on from it (answers what it can, asks the
@@ -221,6 +221,9 @@ func (e *Engine) reportBack(conv storage.Conversation, project storage.Repo, age
 		return
 	}
 	origin, as, ok := relayOrigin(msgs)
+	if !ok && as != "" { // a person here went on (a workflow, a follow-up): another office's hand-off still hears back
+		origin, as, ok = peerOrigin(msgs)
+	}
 	// only a linked project's hand-off: never a report itself (the agent that
 	// asked answers on with send_to_chat when it has to)
 	if !ok || origin.Project == "" || origin.Report || !strings.HasPrefix(as, "human:") {

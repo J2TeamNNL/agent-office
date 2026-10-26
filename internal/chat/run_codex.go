@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -70,8 +71,9 @@ func codexEffortArgs(e string) []string {
 
 func (r codexRunner) Run(ctx context.Context, req RunRequest, emit func(Event)) (RunResult, error) {
 	res, err := r.run(ctx, req, emit)
-	// a session Codex no longer has: start over with the transcript
-	if err != nil && req.SessionID != "" && res.Text == "" {
+	// a session Codex no longer has: start over with the transcript (not a
+	// Codex that never answered: it would hang just as long again)
+	if err != nil && req.SessionID != "" && res.Text == "" && !errors.Is(err, ErrSilent) {
 		req.SessionID = ""
 		return r.run(ctx, req, emit)
 	}
@@ -113,7 +115,9 @@ func (codexRunner) run(ctx context.Context, req RunRequest, emit func(Event)) (R
 		args = append(args, "--image", strings.Join(images, ","))
 	}
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, bin, args...)
+	runCtx, quiet, stop := watchSilence(ctx)
+	defer stop()
+	cmd := exec.CommandContext(runCtx, bin, args...)
 	ownGroup(cmd)
 	cmd.Dir = req.WorkDir
 	cmd.Env = cliEnv(req.Provider)
@@ -140,7 +144,7 @@ func (codexRunner) run(ctx context.Context, req RunRequest, emit func(Event)) (R
 	res.Usage.Model = req.Model
 	var answer []string
 	var failed []string // turn.failed / error lines: why a run that answered nothing failed
-	sc := bufio.NewScanner(out)
+	sc := bufio.NewScanner(quiet.out(out))
 	sc.Buffer(make([]byte, 1<<20), 16<<20)
 	for sc.Scan() {
 		var ev struct {
@@ -196,6 +200,9 @@ func (codexRunner) run(ctx context.Context, req RunRequest, emit func(Event)) (R
 	res.Usage.DurationMS = time.Since(start).Milliseconds()
 	res.Text = strings.TrimSpace(strings.Join(answer, "\n\n"))
 	res.Limits = codexLimits(home, res.SessionID, time.Now())
+	if err := quiet.err("Codex"); err != nil {
+		return res, err
+	}
 	if scanErr != nil {
 		return res, scanErr
 	}

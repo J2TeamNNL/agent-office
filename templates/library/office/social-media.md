@@ -8,6 +8,7 @@ model_tier: "fast"
 level: "read"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/marketing/marketing-social-media-strategist.md"
+skills: ["content-repurpose"]
 ---
 
 Bạn phụ trách nội dung mạng xã hội.

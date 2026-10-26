@@ -50,7 +50,7 @@ func (s *server) cliStarted(w http.ResponseWriter, r *http.Request, j *clitools.
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	case errors.Is(err, clitools.ErrUnknownTool), errors.Is(err, clitools.ErrUnknownMethod), errors.Is(err, clitools.ErrNotInstalled),
-		errors.Is(err, clitools.ErrNoHome):
+		errors.Is(err, clitools.ErrNoHome), errors.Is(err, clitools.ErrUnknownInstall):
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	case err != nil:
@@ -71,6 +71,11 @@ func (s *server) cliInstall(w http.ResponseWriter, r *http.Request) {
 	}
 	j, err := s.cfg.CLITools.Install(r.PathValue("id"), in.Method)
 	s.cliStarted(w, r, j, err, "install")
+}
+
+func (s *server) cliUpdate(w http.ResponseWriter, r *http.Request) {
+	j, err := s.cfg.CLITools.Update(r.PathValue("id"))
+	s.cliStarted(w, r, j, err, "update")
 }
 
 func (s *server) cliLogin(w http.ResponseWriter, r *http.Request) {

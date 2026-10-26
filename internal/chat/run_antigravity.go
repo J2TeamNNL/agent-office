@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/proctrack"
 	"github.com/tung1998/agent-office/internal/storage"
 )
@@ -59,7 +60,8 @@ func (r antigravityRunner) Run(ctx context.Context, req RunRequest, emit func(Ev
 	// a conversation agy no longer has: start over with the transcript; not
 	// when the first attempt already acted (a tool call), since restarting
 	// would repeat that action for real, not just its display
-	if err != nil && req.SessionID != "" && res.Text == "" && stepErr == "" && len(res.Tools) == 0 && ctx.Err() == nil {
+	if err != nil && req.SessionID != "" && res.Text == "" && stepErr == "" && len(res.Tools) == 0 && ctx.Err() == nil &&
+		!errors.Is(err, ErrSilent) && !errors.Is(err, llm.ErrNeedsLogin) {
 		req.SessionID = ""
 		res, stepErr, err = r.run(ctx, req, emit)
 	}
@@ -123,7 +125,9 @@ func (antigravityRunner) run(ctx context.Context, req RunRequest, emit func(Even
 		}
 	}
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, bin, args...)
+	runCtx, quiet, stop := watchSilence(ctx)
+	defer stop()
+	cmd := exec.CommandContext(runCtx, bin, args...)
 	ownGroup(cmd)
 	cmd.Dir = req.WorkDir
 	cmd.Stdin = strings.NewReader(strings.ToValidUTF8(prompt, "�")) // a stray cut byte must not make the CLI refuse the whole turn
@@ -141,7 +145,7 @@ func (antigravityRunner) run(ctx context.Context, req RunRequest, emit func(Even
 	var answer strings.Builder
 	var failure, final string
 	seenTool := map[int]bool{}
-	sc := bufio.NewScanner(out)
+	sc := bufio.NewScanner(quiet.out(out))
 	sc.Buffer(make([]byte, 1<<20), 16<<20)
 	for sc.Scan() {
 		var ev agyEvent
@@ -191,6 +195,9 @@ func (antigravityRunner) run(ctx context.Context, req RunRequest, emit func(Even
 		res.Text = strings.TrimSpace(final)
 		emit(Event{Type: "text", Text: res.Text})
 	}
+	if err := quiet.err("Antigravity CLI"); err != nil {
+		return res, stepErr, err
+	}
 	if scanErr != nil {
 		return res, stepErr, scanErr
 	}
@@ -200,7 +207,7 @@ func (antigravityRunner) run(ctx context.Context, req RunRequest, emit func(Even
 			msg = werr.Error()
 		}
 		if strings.Contains(msg, "authentication") {
-			msg += " — Antigravity CLI chưa đăng nhập: bấm Đăng nhập ở kết nối AI"
+			return res, stepErr, fmt.Errorf("%w: Antigravity CLI chưa đăng nhập (%s), bấm Đăng nhập ở Kết nối AI", llm.ErrNeedsLogin, truncate(msg, 200))
 		}
 		return res, stepErr, fmt.Errorf("agy: %s", truncate(msg, 500))
 	}

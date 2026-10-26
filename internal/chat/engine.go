@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/tung1998/agent-office/internal/actions"
+	"github.com/tung1998/agent-office/internal/agentskills"
 	"github.com/tung1998/agent-office/internal/assistant"
 	"github.com/tung1998/agent-office/internal/attach"
 	"github.com/tung1998/agent-office/internal/audit"
@@ -144,6 +145,7 @@ type Turn struct {
 	answered int           // replies given so far
 	actor    string        // who sent the message
 	tier     string        // the model tier asked for ("" = each agent's)
+	effort   string        // how hard its agent thinks, as its delegator asked ("" = the agent's own)
 	ceiling  string        // the most the message's sender may have run ("" = none): its hand-offs keep it (ADR-081)
 	tree     treeOpt       // the worktree it runs in, not the chat's (a Burn piece's): its hand-offs and workflow roles too
 	limit    time.Duration // how long each of its turns may take (0: no limit), its hand-offs too (ADR-082)
@@ -160,6 +162,7 @@ type Turn struct {
 	wfWatch       bool   // the run's supervisor checking it (wfRole is its seat)
 	wfStep        string // a step of a graph of steps: its answer goes to the run's runner (ADR-108)
 	err           string // why it failed ("" = it answered)
+	board         string // a hand-off's work board task (ADR-210)
 
 	mu     sync.Mutex
 	events []Event
@@ -221,6 +224,7 @@ type Engine struct {
 	files       attach.Store
 	onRunning   func(conversationID string)                // an answer started or ended there (the dashboard's live data)
 	onRunWait   func(ctx context.Context, callerID string) // a workflow's turn ended: what it waits on a person for goes to the chat that called it (a bot's)
+	onAnswered  func(ctx context.Context, a Answered)      // an agent answered a turn: its notes are kept up to date (ADR-215)
 	decided     decisions                                  // proposals a person decided on the dashboard: the agent goes on (ADR-084)
 	queueRun    QueueRunner                                // carries out a queued proposal (Drain)
 	draining    sync.Map                                   // conversation id → *sync.Mutex: one Drain at a time
@@ -246,8 +250,10 @@ type Engine struct {
 	active map[string]*Turn        // conversation id → running turn (the one the person waits for)
 	bg     map[string]*Turn        // conversation id + "/" + agent id → a hand-off running in the background
 	handed map[string][]delegation // turn id → tasks its agent gave others with the delegate tool
-	turns  map[string]*Turn        // turn id → turn (kept a while for replay)
-	direct map[string]bool         // projects with a chat editing the project folder right now
+	// boardHook hears of hand-offs tied to the work board (ADR-210; nil = none)
+	boardHook func(ctx context.Context, ev BoardEvent)
+	turns     map[string]*Turn // turn id → turn (kept a while for replay)
+	direct    map[string]bool  // projects with a chat editing the project folder right now
 }
 
 // NewEngine builds an Engine.
@@ -412,6 +418,8 @@ type ActionDTO struct {
 	Seq    int    `json:"seq,omitempty"` // its number among the chat's proposals (numberCards)
 	// Deciding: who is deciding it right now (it says pending until done)
 	Deciding string `json:"deciding,omitempty"`
+	// AfterDiff: a commit that comes after its answer's diff (ADR-189)
+	AfterDiff bool `json:"after_diff,omitempty"`
 }
 
 // ToActionDTO converts a stored action.
@@ -423,7 +431,7 @@ func ToActionDTO(a storage.Action) ActionDTO {
 	by, _ := deciding.Is(a.ID)
 	return ActionDTO{ID: a.ID, MessageID: a.MessageID, TaskID: a.TaskID, Kind: a.Kind, Label: actions.Kinds[a.Kind], Target: a.Target, TargetID: a.TargetID,
 		Reason: a.Reason, Message: a.Args.Message, Files: a.Args.Files, Automation: a.Args.Automation, Change: a.Args.Change, Status: a.Status, Detail: a.Detail, By: a.ProposedBy, DecidedBy: a.DecidedBy, DecidedAt: a.DecidedAt,
-		Always: always, Deciding: by}
+		Always: always, Deciding: by, AfterDiff: a.Args.AfterDiff}
 }
 
 // SetAttachments sets where attached files are stored.
@@ -742,7 +750,11 @@ func (e *Engine) SendWithContext(ctx context.Context, conversationID, text, page
 		prompt = wfPrompt
 	} else if name, _, isCall := automation.ParseSkillCall(text); !isCall || conv.Purpose != "channel" || name == skillOf(ctx) {
 		// a bot's conversation (outsiders write it) expands only the skill its command names
-		prompt, _, err = automation.ExpandSkillCall(userHome(), project.Path, text)
+		var skill *automation.SkillRef
+		prompt, skill, err = automation.ExpandSkillCall(userHome(), project.Path, text)
+		if skill != nil && conv.Purpose == "" { // the person reached for it: the agent keeps it at hand (ADR-185)
+			agentskills.Called(ctx, e.store, userHome(), project.Path, agent.ID, skill.Name)
+		}
 	} else {
 		prompt = "Message: " + text // not a skill call
 	}
@@ -1115,8 +1127,11 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 	req := RunRequest{
 		WorkDir: pl.dir, Prompt: text,
 		System: systemPrompt(project, agent, e.office != nil, promptKeywords(ctx, e.store, project.ID, policy), acc, pl, LoadLanguage(ctx, e.store), power), History: hist, Attachments: files,
-		Write: pl.write, DenyPaths: policy.DenyPaths, ExtraDirs: agentExtraDirs, UserMCP: acc.Can(perm.CapUserMCP) && !consult, QuickCheck: policy.QuickCheck, QuickChecks: policy.QuickChecks,
+		Write: pl.write, DenyPaths: policy.DenyPaths, ExtraDirs: agentExtraDirs, UserMCP: acc.Can(perm.CapUserMCP) && !consult, Web: acc.Can(perm.CapWeb) && !consult, QuickCheck: policy.QuickCheck, QuickChecks: policy.QuickChecks,
 		Effort: cmp.Or(conv.Effort, agent.Effort), // the chat's own choice, else its agent's
+	}
+	if turn.delegator != "" { // given work: as its delegator asked, else the agent's own, never the chat's
+		req.Effort = cmp.Or(turn.effort, agent.Effort)
 	}
 	if agentFull {
 		req.FullAccess = true
@@ -1127,6 +1142,9 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 		req.System += automationGuide
 	}
 	req.System += memory.Block(ctx, e.store, project.ID, agent.ID) // what it keeps from before (ADR-068), core and the topics (ADR-134)
+	if !consult && conv.Purpose != "channel" && !e.isAssistant(ctx, project.ID) {
+		req.System += agentskills.Block(ctx, e.store, userHome(), project.Path, agent.ID) // its skills at hand, read when needed (ADR-185)
+	}
 	if conv.Purpose == "workflow" {
 		req.System += workflowGuide
 	}
@@ -1184,9 +1202,18 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 	}
 	if noTools(ctx) { // untrusted text (a scope filter's YES/NO): the conversation only
 		// a bot's chats are not this: they run with their agent's own rights, as chosen
-		req.NoTools, req.UserMCP, req.Write, req.FullAccess = true, false, false, false
+		req.NoTools, req.UserMCP, req.Web, req.Write, req.FullAccess = true, false, false, false, false
 	} else {
-		office, revoke := e.officeAccess(ctx, officetools.Scope{ProjectID: project.ID, ConversationID: conv.ID, TaskID: conv.TaskID, RunRef: turn.ID, JobID: turn.JobID, Office: e.isAssistant(ctx, project.ID) && !consult, AnswerOnly: power == assistant.ModeAnswer, Consult: consult, Agent: agent.Name, Level: level, Access: acc, Dir: treeDir(pl)})
+		sc := officetools.Scope{ProjectID: project.ID, ConversationID: conv.ID, TaskID: conv.TaskID, RunRef: turn.ID, JobID: turn.JobID, Office: e.isAssistant(ctx, project.ID) && !consult, AnswerOnly: power == assistant.ModeAnswer, Consult: consult, Agent: agent.Name, Level: level, Access: acc, Dir: treeDir(pl)}
+		if req.FullAccess && !consult { // administrator: its office tools act at once too (ADR-188)
+			sc.Admin, sc.Access = true, perm.Admin(acc)
+			sc.AdminBy = agentFullBy
+			if who, ok := strings.CutPrefix(turn.actor, "human:"); ok && sc.AdminBy == "" {
+				sc.AdminBy = who
+			}
+			sc.Level = sc.Access.Level
+		}
+		office, revoke := e.officeAccess(ctx, sc)
 		defer revoke()
 		req.Office = office
 	}
@@ -1247,6 +1274,7 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 			}
 			e.keepLimits(p, res.Limits)
 			e.keepLimits(p, limitsFromError(res.Limits, runErr, time.Now()))
+			e.keepHealth(p, runErr)
 		} else {
 			res, runErr = RunResult{}, kerr
 		}
@@ -1311,10 +1339,15 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 	dto := MessageDTO{ID: msg.ID, Role: msg.Role, Content: msg.Content, Tools: msg.Tools, Attachments: []storage.Attachment{}, Author: msg.Author, CreatedAt: msg.CreatedAt, CostUSD: cost, Provider: msg.Provider, Model: msg.Model, Patches: []PatchDTO{}, Actions: []ActionDTO{}}
 	// operations the agent proposed during this run belong to its answer
 	seq := e.cardsBefore(context.Background(), conv.ID, msg.ID)
+	var deferred []storage.Action // commits that come after this answer's diff (ADR-189)
 	if acts, err := e.store.Actions().List(context.Background(), "", "", turn.ID); err == nil {
 		for _, a := range acts {
 			a.MessageID = msg.ID
 			_ = e.store.Actions().Update(context.Background(), a)
+			if a.Args.AfterDiff {
+				deferred = append(deferred, a)
+				continue
+			}
 			ad := ToActionDTO(a)
 			seq++
 			ad.Seq = seq
@@ -1365,13 +1398,49 @@ func (e *Engine) run(ctx context.Context, turn *Turn, conv storage.Conversation,
 			}
 		}
 	}
+	for _, a := range deferred {
+		// the diff merged (or nothing left to merge): the commit runs as the
+		// agent may; a diff still waiting for a person: it is queued behind it
+		if e.acts != nil {
+			sc := actions.Scope{ProjectID: project.ID, ConversationID: conv.ID, TaskID: conv.TaskID, RunRef: turn.ID, JobID: turn.JobID,
+				Agent: agent.Name, Level: level, Access: acc, Dir: treeDir(pl)}
+			blocked := e.CheckOrder(context.Background(), conv.ID, a.ID) != nil
+			if done, err := e.acts.RunDeferred(context.Background(), sc, a.ID, blocked); err == nil {
+				a = done
+			} else {
+				slog.Warn("chat: deferred commit", "action", a.ID, "err", err)
+			}
+		}
+		ad := ToActionDTO(a)
+		seq++
+		ad.Seq = seq
+		dto.Actions = append(dto.Actions, ad)
+		turn.emit(Event{Type: "action", Action: &ad})
+	}
 	if !handoff {
 		mem.LastMessageID = msg.ID // it has seen everything up to its answer
 	}
 	_ = e.store.Chat().UpsertMember(context.Background(), mem)
 	e.endJob(turn.JobID, msg.ID, nil, nil)
+	if e.onAnswered != nil && conv.Purpose != consultPurpose && (len(msg.Tools) > 0 || len(res.Text) >= minReviewed) {
+		a := Answered{ProjectID: project.ID, AgentID: agent.ID, ConversationID: conv.ID, Asked: text, Answer: res.Text}
+		safeGo("onAnswered", func() { e.onAnswered(context.Background(), a) })
+	}
 	turn.emit(Event{Type: "done", Message: &dto, NextTurnID: e.nextTurn(ctx, turn, conv, project, agent, res.Text)})
 }
+
+// Answered is a turn an agent answered: what it was asked and what it said.
+type Answered struct {
+	ProjectID, AgentID, ConversationID string
+	Asked, Answer                      string
+}
+
+// minReviewed: an answer shorter than this, with no tool used, taught nothing
+// worth a note (a greeting, a one-line reply).
+const minReviewed = 300
+
+// SetOnAnswered is called after each turn an agent answered (ADR-215).
+func (e *Engine) SetOnAnswered(fn func(ctx context.Context, a Answered)) { e.onAnswered = fn }
 
 func treeDir(pl place) string {
 	if pl.tree != "" {
@@ -1563,10 +1632,10 @@ func (e *Engine) Invoke(ctx context.Context, project storage.Repo, agent storage
 		return InvokeResult{}, err
 	}
 	req := RunRequest{WorkDir: pl.dir, Prompt: prompt, Effort: agent.Effort,
-		Attachments: files, Write: pl.write, DenyPaths: policy.DenyPaths, UserMCP: acc.Can(perm.CapUserMCP), QuickCheck: policy.QuickCheck, QuickChecks: policy.QuickChecks}
+		Attachments: files, Write: pl.write, DenyPaths: policy.DenyPaths, UserMCP: acc.Can(perm.CapUserMCP), Web: acc.Can(perm.CapWeb), QuickCheck: policy.QuickCheck, QuickChecks: policy.QuickChecks}
 	req.System = systemPrompt(project, agent, e.office != nil, promptKeywords(ctx, e.store, project.ID, policy), acc, pl, LoadLanguage(ctx, e.store), "")
 	if noTools(ctx) { // untrusted text (a channel's scope filter): a plain answer
-		req.NoTools, req.UserMCP, req.Write, req.Effort = true, false, false, "" // a YES/NO needs no deep thought
+		req.NoTools, req.UserMCP, req.Web, req.Write, req.Effort = true, false, false, false, "" // a YES/NO needs no deep thought
 	} else {
 		office, revoke := e.officeAccess(ctx, officetools.Scope{ProjectID: project.ID, RunRef: fmt.Sprintf("inv-%d", time.Now().UnixNano()), JobID: usage.JobFrom(ctx), Agent: agent.Name, Level: acc.Level, Access: acc, Dir: treeDir(pl)})
 		defer revoke()
@@ -1587,6 +1656,7 @@ func (e *Engine) Invoke(ctx context.Context, project storage.Repo, agent storage
 			res.Usage.CostUSD = e.turnCost(ctx, p.Kind, req.SessionID, res.SessionID, res.Usage.CostUSD)
 			e.keepLimits(p, res.Limits)
 			e.keepLimits(p, limitsFromError(res.Limits, runErr, time.Now()))
+			e.keepHealth(p, runErr)
 			out.Text, out.Tools, out.Model = res.Text, res.Tools, firstNonEmpty(res.Usage.Model, model)
 			if e.usage != nil {
 				if r, err := e.usage.Record(ctx, usage.Meta{Kind: kind, ProjectID: project.ID, AgentID: agent.ID}, p, model, res.Usage, runErr); err == nil {

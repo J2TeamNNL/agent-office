@@ -111,6 +111,15 @@ func (r automationRepo) SetNextRun(ctx context.Context, id string, nextRunAt *ti
 		optTime(nextRunAt), fmtTime(time.Now()), id)
 }
 
+// SetWake writes next_run_at and config.wake_at (see AutomationRepo.SetWake).
+func (r automationRepo) SetWake(ctx context.Context, id string, at *time.Time) error {
+	if at == nil {
+		return execOne(ctx, r.db, `UPDATE automations SET config=json_remove(config, '$.wake_at'), updated_at=? WHERE id=?`, fmtTime(time.Now()), id)
+	}
+	return execOne(ctx, r.db, `UPDATE automations SET next_run_at=?, config=json_set(config, '$.wake_at', ?), updated_at=? WHERE id=?`,
+		optTime(at), at.UTC().Format(time.RFC3339Nano), fmtTime(time.Now()), id)
+}
+
 // Disable turns an automation off with a reason (see AutomationRepo.Disable).
 func (r automationRepo) Disable(ctx context.Context, id, code, reason string, nextRunAt *time.Time) error {
 	return execOne(ctx, r.db, `UPDATE automations SET enabled=0, disabled_code=?, disabled_reason=?, next_run_at=?, updated_at=? WHERE id=?`,

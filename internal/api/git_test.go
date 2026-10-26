@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tung1998/agent-office/internal/api"
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 // Fetch refreshes the remote so the bar under the title shows "behind".
@@ -69,7 +70,7 @@ func TestGitPushBackground(t *testing.T) {
 	remote, a := filepath.Join(base, "r.git"), filepath.Join(base, "a")
 	run(base, "init", "-q", "--bare", "-b", "main", remote)
 	hook := filepath.Join(remote, "hooks", "pre-receive")
-	os.WriteFile(hook, []byte("#!/bin/sh\nsleep 1\n"), 0o755) // a slow remote
+	fakebin.Write(hook, []byte("#!/bin/sh\nsleep 1\n")) // a slow remote
 	run(base, "clone", "-q", remote, a)
 	os.WriteFile(filepath.Join(a, "x"), []byte("1"), 0o644)
 	run(a, "add", ".")

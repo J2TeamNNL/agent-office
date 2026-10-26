@@ -91,6 +91,7 @@ type RunRole struct {
 	Turns     int     `json:"turns"`
 	SessionID string  `json:"session_id,omitempty"` // its own session, resumed by follow-ups
 	Runtime   string  `json:"runtime,omitempty"`
+	Effort    string  `json:"effort,omitempty"`   // how hard the coordinator asked it to think ("" = the agent's own)
 	Result    string  `json:"result,omitempty"`   // its last answer (cut)
 	Workflow  string  `json:"workflow,omitempty"` // a sub-workflow fills it (its key)
 	RunID     string  `json:"run_id,omitempty"`   // that one's latest run

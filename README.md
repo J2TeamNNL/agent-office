@@ -38,7 +38,7 @@ AI coding tools are great one chat at a time. Real work is more than that: sever
 | | |
 |---|---|
 | 💬 **Chat with your team** · stream, `@mention` agents into a group chat, `/skills`, attach images/PDF/logs, tags, search history | ![Chat](docs/guide/images/04-chat.png) |
-| 🧑‍🤝‍🧑 **Workflows** · type `/handoff`, `/advisor`, `/council`, `/feature`… to have several agents work together under rules (roles, access, a different model family, approval gates, votes); write your own by chat | ![Team model](docs/guide/images/06-team-model.png) |
+| 🧑‍🤝‍🧑 **Workflows** · type `/handoff`, `/advisor`, `/council`, `/feature`, `/website`… to have several agents work together under rules (roles, access, a different model family, approval gates, votes); write your own by chat | ![Team model](docs/guide/images/06-team-model.png) |
 | ✅ **Review before merge** · each chat has a git worktree; diffs, actions and setting changes wait for *Approve / Reject / Skip* (or "approve & always allow"), numbered and approved in order; the agent goes on once every card is decided | ![Diff card](docs/guide/images/34-dark-chat.png) |
 | ⚙️ **Operations** · detect project commands, run/stop/auto-restart like pm2, live logs, CPU/RAM/ports, docker compose, "ask the agent about this log" | ![Operations](docs/guide/images/11-operations.png) |
 | 🤖 **Automations** · schedule (cron + timezone), webhook, Discord/Telegram message; run a script for free and call an AI only on failure or `@@agent:` | ![Automations](docs/guide/images/09-automations.png) |
@@ -46,7 +46,7 @@ AI coding tools are great one chat at a time. Real work is more than that: sever
 | 🔌 **One MCP gateway** · the office holds MCP servers (HTTP, stdio, OAuth login) and forwards them to every AI with per-tool permissions and a call log | ![MCP](docs/guide/images/15-mcp.png) |
 | 💸 **Costs & limits** · every AI call logged with real or estimated cost, daily budgets per office/project/automation, fallback connections when one fails | ![Costs](docs/guide/images/27-stats.png) |
 
-More: **data collections** (structured data kept in the office; agents read and write it with `data_*` tools, scripts with `office data`), **linked projects** (an agent hands work to another project's agent in a chat there, hears back on its own, and you approve the other side's cards from your chat), a notification bell and browser notifications with Approve / Skip buttons, long-term agent memory, office assistant across projects, **Watch** dashboards (a grid of 20 widgets: chats, consoles, figures, charts, approvals…), change log of who did what and who approved it, Files tab with an editor, users & roles, personal API tokens, export/import config, backup, self-update from source, light/dark, English/Vietnamese.
+More: **data collections** (structured data kept in the office; agents read and write it with `data_*` tools, scripts with `office data`), **linked projects** (an agent hands work to another project's agent in a chat there, hears back on its own, and you approve the other side's cards from your chat), a notification bell and browser notifications with Approve / Skip buttons, long-term agent memory, **skills each agent keeps at hand** (its prompt lists only names; the agent loads one when a task needs it, finds more in the office library and asks you to install them), office assistant across projects, **Watch** dashboards (a grid of 20 widgets: chats, consoles, figures, charts, approvals…), change log of who did what and who approved it, Files tab with an editor, users & roles, personal API tokens, export/import config, backup, self-update from source, light/dark, English/Vietnamese.
 
 ## An office that upgrades itself
 
@@ -116,6 +116,23 @@ docker compose exec office office user create --email you@example.com   # option
 ```
 
 Sign in with `admin` / `admin` and set your own, or skip it with the command above. Later accounts are added on the dashboard (Administration → Accounts); `office user passwd --email …` resets a forgotten password.
+
+
+### Memory by meaning (optional, Cognee)
+
+Agents' notes stay in SQLite; with [Cognee](https://github.com/topoteretes/cognee) running, `recall` also finds the notes of every agent of the project by meaning (ADR-195). It runs in Docker and wants **8 GB+ of RAM for Docker** (without an LLM key it loads a ~2 GB local model).
+
+```bash
+scripts/install.sh --with-cognee     # install + build, then start Cognee (127.0.0.1:18765); LLM_API_KEY=… in the environment: graph by an LLM, less RAM
+./bin/office cognee status | down    # down: removes the container, keeps its data
+```
+
+**Already installed?** No reinstall, no restart:
+
+- Office on the machine: `git pull && make build && ./bin/office cognee up` (or **Update** on the dashboard, then `office cognee up`). The running office picks Cognee up within 2 minutes and starts it again after a reboot.
+- Office in `docker compose`: `git pull && docker compose up -d --build` adds the `cognee` service; office's data volume is kept.
+
+With `docker compose`, the `cognee` service already runs beside office (`LLM_API_KEY` in `.env`: build the graph with an LLM instead, less RAM). A Cognee server elsewhere: `COGNEE_URL` (+ `COGNEE_API_KEY`).
 
 ## How it works
 

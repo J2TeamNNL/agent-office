@@ -36,6 +36,8 @@ const en: Record<keyof typeof vi, string> = {
   'team.lib.source': 'Original',
   'team.lib.use': 'Use this one',
   'team.lib.from': 'Based on {name}: with its description, instructions and permissions',
+  'team.lib.skills': 'Comes with skills:',
+  'team.lib.skillsHelp': 'The agent keeps these skills at hand. Ones the project lacks are installed from the office library into the project\'s skills folder.',
   'team.lib.back': 'Pick another',
   'team.rev.library': 'added from the library: {arg}',
   'team.rev.setup': 'AI setup: {arg}',

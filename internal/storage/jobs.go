@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,41 @@ type Job struct {
 	// ExtraDirs: extra directories this run may read, computed once at job
 	// start (an automation's override replaces the agent's own, never adds to it).
 	ExtraDirs []string
+}
+
+// SendsAs is who a run speaks for when it sends into another chat: the person
+// who started it, or, for a scheduled automation run as administrator, the
+// admin who gave the agent that right (ADR-191). Bots and webhooks: nobody.
+// SpeaksFor also knows an automation's owner (ADR-194).
+func (j Job) SendsAs() (string, bool) {
+	if strings.HasPrefix(j.CreatedBy, "human:") {
+		return j.CreatedBy, true
+	}
+	if j.scheduled() && j.FullAccess && j.FullAccessBy != "" {
+		return "human:" + j.FullAccessBy, true
+	}
+	return "", false
+}
+
+func (j Job) scheduled() bool {
+	return j.Origin == "automation" && (j.Trigger == "schedule" || j.Trigger == "manual")
+}
+
+// SpeaksFor is SendsAs, and for a scheduled automation the person who owns
+// it (ADR-194): the account that saved it, or for one an agent made, the
+// person its turn spoke for. A disabled or unknown account: nobody.
+func SpeaksFor(ctx context.Context, st Store, j Job) (string, bool) {
+	if as, ok := j.SendsAs(); ok || !j.scheduled() {
+		return as, ok
+	}
+	a, err := st.Automations().Get(ctx, j.OriginID)
+	if err != nil || !strings.Contains(a.CreatedBy, "@") || strings.ContainsAny(a.CreatedBy, " :") {
+		return "", false
+	}
+	if u, err := st.Users().GetByEmail(ctx, a.CreatedBy); err != nil || u.Disabled {
+		return "", false
+	}
+	return "human:" + a.CreatedBy, true
 }
 
 // JobFilter narrows a job listing; empty fields match everything.
@@ -211,7 +247,34 @@ type AutomationConfig struct {
 	EndsAt *time.Time `json:"ends_at,omitempty"`
 	// Goal: action chat/workflow runs until it is reached (ADR-132; nil = one turn).
 	Goal *AutomationGoal `json:"goal,omitempty"`
+	// OnlyIf: a schedule runs only when its data says there is work (ADR-194; nil = always).
+	OnlyIf *AutomationCondition `json:"only_if,omitempty"`
+	// WakeAt: the next run one of its runs asked for (ADR-202); that run
+	// goes even when OnlyIf finds nothing, then the schedule resumes.
+	WakeAt *time.Time `json:"wake_at,omitempty"`
 }
+
+// AutomationCondition lets a frequent schedule cost nothing when there is
+// nothing to do: it runs when a record of Collection matches Where, or (with
+// Changed) when one changed since its last run, or when the work board says
+// so (Board, ADR-196). None given: always.
+type AutomationCondition struct {
+	Collection string `json:"collection,omitempty"`
+	Where      []Cond `json:"where,omitempty"`
+	Changed    bool   `json:"changed,omitempty"`
+	// Board: the project's work board (its Burn's). open = work no one is
+	// doing (the Burn off with pieces left, or a piece waiting for review);
+	// changed = a piece added, started or finished since its last run;
+	// any = either.
+	Board string `json:"board,omitempty"`
+}
+
+// Board conditions of a schedule (ADR-196).
+const (
+	BoardOpen    = "open"
+	BoardChanged = "changed"
+	BoardAny     = "any"
+)
 
 // AutomationGoal is "run until a condition is true" (ADR-132): after each
 // turn, the check and/or the judge; not reached, the chat goes on with what
@@ -307,6 +370,9 @@ type AutomationRepo interface {
 	// SetNextRun writes next_run_at only, so a schedule tick computing the
 	// next run doesn't clobber a concurrent admin edit to the rest of the row.
 	SetNextRun(ctx context.Context, id string, nextRunAt *time.Time) error
+	// SetWake writes next_run_at and config.wake_at only (ADR-202): a run
+	// of the schedule asks for its next run at; nil clears the request.
+	SetWake(ctx context.Context, id string, at *time.Time) error
 	// Disable turns an automation off with a reason (a safety stop: a daily
 	// cost cap or a schedule's end time), touching only enabled, the disabled
 	// fields and next_run_at — so it can't be undone by a concurrent admin

@@ -3,9 +3,13 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"github.com/tung1998/agent-office/internal/attach"
 	"github.com/tung1998/agent-office/internal/officetools"
+	"io"
 	"os/exec"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,6 +73,8 @@ type RunRequest struct {
 	// UserMCP lets it use the MCP servers of the person's own setup
 	// (perm.CapUserMCP); otherwise only office's tools.
 	UserMCP bool
+	// Web lets it search and read the web (perm.CapWeb, ADR-192; Claude Code).
+	Web bool
 	// QuickCheck: each edited file is checked at once, what is wrong goes
 	// back to the agent (perm.Policy.QuickCheck, ADR-133; Claude Code only)
 	QuickCheck bool
@@ -158,4 +164,52 @@ func ownGroup(cmd *exec.Cmd) {
 		return syscall.Kill(-pid, syscall.SIGTERM)
 	}
 	cmd.WaitDelay = 6 * time.Second // its pipes closed even if a child keeps them
+}
+
+// ErrSilent: an agent's CLI started but printed nothing at all. Every CLI
+// office drives prints its first line within seconds, so one that does not
+// is stuck before any work (signed out and waiting on a login, held by the
+// system, no network): the turn fails with a cause instead of hanging.
+var ErrSilent = errors.New("không phản hồi")
+
+// silentLimit is how long a CLI may print nothing after it started.
+var silentLimit = 2 * time.Minute
+
+// silence watches a CLI for its first line of output.
+type silence struct {
+	timer *time.Timer
+	fired atomic.Bool
+}
+
+// watchSilence gives the context to start a CLI with: it ends when the CLI
+// prints nothing within silentLimit; output passes through out.
+func watchSilence(ctx context.Context) (context.Context, *silence, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	s := &silence{}
+	s.timer = time.AfterFunc(silentLimit, func() { s.fired.Store(true); cancel() })
+	return ctx, s, func() { s.timer.Stop(); cancel() }
+}
+
+// out reads the CLI's output, its first byte ending the watch.
+func (s *silence) out(r io.Reader) io.Reader { return silentReader{r, s} }
+
+// err is why the run ended when the watch stopped it, else nil.
+func (s *silence) err(name string) error {
+	if !s.fired.Load() {
+		return nil
+	}
+	return fmt.Errorf("%s %w sau %s (chưa đăng nhập, bị hệ điều hành chặn hoặc mất mạng): vào Kết nối AI bấm Kiểm tra", name, ErrSilent, silentLimit)
+}
+
+type silentReader struct {
+	r io.Reader
+	s *silence
+}
+
+func (x silentReader) Read(p []byte) (int, error) {
+	n, err := x.r.Read(p)
+	if n > 0 {
+		x.s.timer.Stop()
+	}
+	return n, err
 }

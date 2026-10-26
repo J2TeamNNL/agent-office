@@ -10,7 +10,7 @@ const base = computed(() => `/api/projects/${projectId.value}/burn`)
 const { data, error, refresh } = useLiveFetch<{ burn: { run_branch?: string }, items: ItemLite[] }>(base, { lazy: true, server: false })
 
 const finished = ['done', 'failed', 'skipped']
-const rank: Record<string, number> = { doing: 0, review: 1, queued: 2, paused: 3, found: 4 }
+const rank: Record<string, number> = { doing: 0, handed: 0, review: 1, queued: 2, paused: 3, found: 4 }
 const open = computed(() => (data.value?.items ?? [])
   .filter(i => !finished.includes(i.status))
   .sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || b.priority - a.priority))
@@ -24,6 +24,7 @@ const list = computed(() => [...open.value, ...closed.value])
 
 const statusIcon: Record<string, [string, string]> = {
   doing: ['i-lucide-loader-circle', 'animate-spin text-(--ui-warning)'],
+  handed: ['i-lucide-user-round-cog', 'text-(--ui-warning)'],
   review: ['i-lucide-scan-eye', 'text-(--ui-info)'],
   queued: ['i-lucide-clock', 'text-(--ui-text-muted)'],
   paused: ['i-lucide-circle-pause', 'text-(--ui-text-muted)'],
@@ -32,7 +33,7 @@ const statusIcon: Record<string, [string, string]> = {
   failed: ['i-lucide-circle-x', 'text-(--ui-error)'],
   skipped: ['i-lucide-circle-slash', 'text-(--ui-text-dimmed)']
 }
-const statusLabel = (s: string) => ({ doing: t('burn.col.doing'), review: t('burn.review.waiting'), paused: t('burn.col.paused'), found: t('burn.col.found'), done: t('burn.col.done') } as Record<string, string>)[s] ?? s
+const statusLabel = (s: string) => ({ doing: t('burn.col.doing'), handed: t('burn.handed'), review: t('burn.review.waiting'), paused: t('burn.col.paused'), found: t('burn.col.found'), done: t('burn.col.done') } as Record<string, string>)[s] ?? s
 
 // a quest in one line: done as given before the Burn looks for more
 const title = ref('')

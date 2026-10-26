@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tung1998/agent-office/internal/harness"
@@ -73,5 +74,34 @@ func TestCollect(t *testing.T) {
 	}
 	if r := ev.Commands.Refused; len(r) != 1 || r[0].Key != "run_command: rm -rf x" {
 		t.Fatalf("refused = %+v", r)
+	}
+}
+
+// ADR-185: the bundle shows each agent's skills at hand and their use.
+func TestCollectAgentSkills(t *testing.T) {
+	ctx := context.Background()
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := st.Repos().Create(ctx, storage.Repo{Name: "site"})
+	a, err := st.Agents().Create(ctx, storage.Agent{ProjectID: p.ID, Key: "dev", Name: "Dev", ModelTier: "balanced"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.AgentSkills().Add(ctx, storage.AgentSkill{AgentID: a.ID, Name: "launch-checklist", Source: "setup"})
+	st.AgentSkills().Add(ctx, storage.AgentSkill{AgentID: a.ID, Name: "design-polish", Source: "agent"})
+	st.AgentSkills().Used(ctx, a.ID, "design-polish")
+	ev, err := harness.Collect(ctx, st, p, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ev.Learning.AgentSkills
+	if len(got) != 2 || !strings.HasPrefix(got[0], "Dev: launch-checklist (setup, never used") || !strings.HasPrefix(got[1], "Dev: design-polish (agent, used 1×") {
+		t.Fatalf("agent skills = %q", got)
 	}
 }

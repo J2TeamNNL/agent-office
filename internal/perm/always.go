@@ -11,7 +11,8 @@ import (
 	"github.com/tung1998/agent-office/internal/storage"
 )
 
-// risky: commands that delete or publish — always asked, never allowed for good.
+// risky: commands that delete or publish. They follow the permissions like any
+// other; a broad "luôn cho phép" pattern that would cover one is narrowed.
 var risky = regexp.MustCompile(`(?i)\brm\s|\bgit\s+(push|reset\s+--hard|clean|branch\s+-D)|\bdrop\s|\bdelete\b|\btruncate\b`)
 
 // Risky reports a command line that deletes or publishes. git's global
@@ -52,16 +53,16 @@ var wrappers = map[string]bool{"sudo": true, "env": true, "xargs": true, "bash":
 func wrapper(prog string) bool { return wrappers[strings.ToLower(filepath.Base(prog))] }
 
 // ErrNotAlways: a command that may not be allowed for good.
-var ErrNotAlways = errors.New("lệnh này không được luôn cho phép (xóa, push, hoặc chạy lệnh khác bên trong)")
+var ErrNotAlways = errors.New("lệnh này không được luôn cho phép (chạy lệnh khác bên trong, như sudo, bash)")
 
 // SuggestPattern is the pattern "luôn cho phép" adds for a command: its first
 // two words with " *" when it has more ("git switch main" → "git switch *"),
 // else the command itself. A flag as second word, or a pattern that would
 // also cover a risky command (git reset * → git reset --hard), keeps the exact
-// command. Risky commands and wrappers get none.
+// command. Wrappers get none.
 func SuggestPattern(line string) (string, bool) {
 	args, err := SplitCommand(line)
-	if err != nil || len(args) == 0 || Risky(line) || wrapper(args[0]) {
+	if err != nil || len(args) == 0 || wrapper(args[0]) {
 		return "", false
 	}
 	exact, err := CleanPattern(strings.Join(args, " "))
@@ -154,7 +155,7 @@ func AllowAlways(ctx context.Context, st storage.Store, projectID, agentID, patt
 	if err != nil {
 		return Allowed{}, err
 	}
-	if CoversRisky(pattern) {
+	if wrapper(program(pattern)) {
 		return Allowed{}, ErrNotAlways
 	}
 	ag, err := st.Agents().Get(ctx, agentID)

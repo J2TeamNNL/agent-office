@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/mcpserver"
 	"github.com/tung1998/agent-office/internal/officetools"
 	"github.com/tung1998/agent-office/internal/proctrack"
@@ -87,6 +88,9 @@ func (claudeRunner) args(req RunRequest, resume bool) []string {
 		return a
 	}
 	tools := append(slices.Clone(claudeReadTools), "Skill")
+	if req.Web { // ADR-192
+		tools = append(tools, "WebSearch", "WebFetch")
+	}
 	// dontAsk: whatever is not allowed is denied, whatever the user's defaultMode
 	a := []string{"-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-mode", "dontAsk",
 		"--setting-sources", "user,project,local"}
@@ -204,7 +208,9 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 			}
 		}
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
+	runCtx, quiet, stop := watchSilence(ctx)
+	defer stop()
+	cmd := exec.CommandContext(runCtx, bin, args...)
 	ownGroup(cmd)
 	cmd.Dir = req.WorkDir
 	cmd.Env = cliEnv(req.Provider)
@@ -230,7 +236,7 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 	pending := map[string]int{}      // tool_use id → index in res.Tools
 	subagents := map[string]string{} // a Task call's id → the subagent's label, for the steps it takes
 	mainModel := ""                  // the model of the last call (its context window is the one shown)
-	sc := bufio.NewScanner(out)
+	sc := bufio.NewScanner(quiet.out(out))
 	sc.Buffer(make([]byte, 1<<20), 16<<20)
 	for sc.Scan() {
 		var ev struct {
@@ -384,10 +390,15 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 	io.Copy(io.Discard, out)
 	werr := cmd.Wait()
 	res.Usage.DurationMS = time.Since(start).Milliseconds()
+	if err := quiet.err("Claude Code"); err != nil {
+		return res, err
+	}
 	// A signed-out CLI fails before any API call: say what to do instead of
-	// leaving the chat with the CLI's own wording.
-	if (resErr != nil || werr != nil) && ctx.Err() == nil && res.Usage.InputTokens == 0 && !claudeSignedIn(bin, cmd.Env) {
-		return res, errors.New("Claude Code trên máy chưa đăng nhập (hoặc phiên hết hạn). Vào Cài đặt → Nhà cung cấp, bấm Kiểm tra rồi Đăng nhập")
+	// leaving the chat with the CLI's own wording. A session the service
+	// rejects (signed out elsewhere) still reads as signed in locally.
+	if (resErr != nil || werr != nil) && ctx.Err() == nil && res.Usage.InputTokens == 0 &&
+		(claudeAuthFailed(resErr) || !claudeSignedIn(bin, cmd.Env)) {
+		return res, fmt.Errorf("%w: Claude Code trên máy chưa đăng nhập hoặc phiên đã hết hạn. Vào Kết nối AI, bấm Kiểm tra rồi Đăng nhập", llm.ErrNeedsLogin)
 	}
 	switch {
 	case resErr != nil:
@@ -402,6 +413,17 @@ func (r claudeRunner) run(ctx context.Context, req RunRequest, emit func(Event),
 		return res, fmt.Errorf("claude: %s", truncate(msg, 500))
 	}
 	return res, nil
+}
+
+// claudeAuthFailed: the service turned the CLI's account down ("Failed to
+// authenticate. API Error: 401 …").
+func claudeAuthFailed(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "failed to authenticate") || strings.Contains(s, "authentication_error") ||
+		strings.Contains(s, "api error: 401") || strings.Contains(s, "/login")
 }
 
 // claudeSignedIn reports whether the CLI has an account; a version too old for

@@ -8,6 +8,7 @@ model_tier: "balanced"
 level: "propose"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/engineering/engineering-frontend-developer.md"
+skills: ["page-builder", "design-polish"]
 ---
 
 Bạn là kỹ sư frontend của project.

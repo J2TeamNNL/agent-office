@@ -8,6 +8,7 @@ import (
 
 	"github.com/tung1998/agent-office/internal/actor"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/team"
@@ -71,6 +72,7 @@ func TestRelayNewChatInLinkedProject(t *testing.T) {
 	admin, _ := f.st.Repos().Create(ctx, storage.Repo{Name: "admin v3", Path: t.TempDir()})
 	team.NewService(f.st, nil).AddFromLibrary(ctx, admin.ID, team.StarterAgent)
 	from, _ := f.engine.StartConversation(ctx, f.project.ID, "")
+	f.engine.SetMode(ctx, from.ID, perm.Operate)
 	now := time.Now().UTC()
 	job, _ := f.st.Jobs().Create(ctx, storage.Job{ProjectID: f.project.ID, Kind: "chat_turn", Origin: "user", CreatedBy: "human:a@b.c", ConversationID: from.ID, Status: "running", StartedAt: &now})
 	a := storage.Action{ProjectID: f.project.ID, ConversationID: from.ID, JobID: job.ID, Kind: "send_message", ProposedBy: "Lead",
@@ -80,7 +82,8 @@ func TestRelayNewChatInLinkedProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	convs, _ := f.st.Chat().ListConversations(ctx, admin.ID, 10)
-	if len(convs) != 1 || convs[0].ID != to || convs[0].CreatedBy != "human:a@b.c" || !strings.Contains(detail, "/projects/"+admin.ID+"?tab=chat&c="+to) {
+	// ADR-207: the new chat runs at the mode of the chat it came from
+	if len(convs) != 1 || convs[0].ID != to || convs[0].CreatedBy != "human:a@b.c" || convs[0].Mode != perm.Operate || !strings.Contains(detail, "/projects/"+admin.ID+"?tab=chat&c="+to) {
 		t.Fatalf("detail %q, chats %+v", detail, convs)
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -111,9 +114,6 @@ func TestRelayNewChatInLinkedProject(t *testing.T) {
 	// the hand-off: no report, but who sent it, from which project and chat
 	if r := chat.RelayOf(msgs[0]); r == nil || r.Report || r.Agent != "Lead" || r.Project != "demo" || r.ProjectID != f.project.ID || r.ConversationID != from.ID {
 		t.Fatalf("hand-off relay = %+v", r)
-	}
-	if f.engine.RelayLimit(ctx, from.ID) {
-		t.Fatal("2 hops is within the chain's cap")
 	}
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
 		if back, _ = f.st.Chat().ListMessages(ctx, from.ID); len(back) >= 2 && len(f.engine.Running(from.ID)) == 0 {
@@ -173,24 +173,5 @@ func TestHistoryFillsOlderRelay(t *testing.T) {
 	}
 	if r := hist[0].Relay; r == nil || r.Project != "demo" || r.ProjectID != f.project.ID || r.Title != "Trang mockup" || r.Agent != "Lead" {
 		t.Fatalf("relay = %+v", r)
-	}
-}
-
-// A chain between this office's projects has no cap; one with another office
-// stops at maxRelayHops for a person.
-func TestRelayLimitOnlyOtherOffice(t *testing.T) {
-	f := setup(t, func(provs *provider.Service) storage.Provider { return storage.Provider{} })
-	ctx := context.Background()
-	linked, _ := f.st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: f.project.ID})
-	f.st.Chat().AddMessage(ctx, storage.Message{ConversationID: linked.ID, Role: "user", Content: "↩ Báo lại",
-		Context: `{"relayed_from":"cnv_x","relayed_from_project":"admin v3","relay_hops":20,"relay_report":true}`})
-	if f.engine.RelayLimit(ctx, linked.ID) {
-		t.Fatal("a chain between linked projects has no cap")
-	}
-	peered, _ := f.st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: f.project.ID})
-	f.st.Chat().AddMessage(ctx, storage.Message{ConversationID: peered.ID, Role: "user", Content: "↩ Báo lại",
-		Context: `{"relayed_from":"cnv_x","relayed_from_project":"admin v3","relayed_from_peer":"peer_1","relay_hops":20,"relay_report":true}`})
-	if !f.engine.RelayLimit(ctx, peered.ID) {
-		t.Fatal("another office's chain stops at its cap")
 	}
 }

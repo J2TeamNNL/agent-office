@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/tung1998/agent-office/internal/actions"
+	"github.com/tung1998/agent-office/internal/activity"
+	"github.com/tung1998/agent-office/internal/agentskills"
 	"github.com/tung1998/agent-office/internal/assistant"
 	"github.com/tung1998/agent-office/internal/attach"
 	"github.com/tung1998/agent-office/internal/automation"
@@ -44,11 +46,11 @@ import (
 	"github.com/tung1998/agent-office/internal/auth"
 	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/clitools"
+	"github.com/tung1998/agent-office/internal/cognee"
 	"github.com/tung1998/agent-office/internal/collections"
 	"github.com/tung1998/agent-office/internal/setup"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/support"
-	"github.com/tung1998/agent-office/internal/transfer"
 )
 
 // worktreeIdle: a chat's worktree untouched this long, with no change
@@ -154,6 +156,12 @@ func serveCmd() *cobra.Command {
 			acts := actions.New(a.store, procs) // agents propose, people approve
 			// agents' long-term notes (ADR-068); too long, a fast model compacts them
 			mem := memory.New(a.store, compactNotes(a.store, chatEngine))
+			mem.SetReviewer(reviewNotes(a.store, chatEngine))
+			chatEngine.SetOnAnswered(func(ctx context.Context, x chat.Answered) { // ADR-215
+				if err := mem.Review(ctx, x.ProjectID, x.AgentID, x.Asked, x.Answer); err != nil {
+					slog.Warn("memory: review", "agent", x.AgentID, "err", err)
+				}
+			})
 			acts.SetMemory(mem)
 			acts.SetSender(chatEngine) // send_to_chat: an agent writes to another chat in its person's name
 			// linked projects in other offices (ADR-167)
@@ -165,8 +173,20 @@ func serveCmd() *cobra.Command {
 			chatEngine.SetQueueRunner(chatDecider{store: a.store, chat: chatEngine, acts: acts}.RunQueued)
 			office := officetools.New(a.store, procs, acts)
 			office.SetPeers(peers) // read_link/search_history in other offices
+			// the notes mirrored into Cognee: recall finds them by meaning too (ADR-195)
+			// (off until `office cognee up` or COGNEE_URL; read again each round)
+			notes := cognee.Auto(a.store)
+			go notes.Run(ctx, 2*time.Minute)
+			office.SetRelated(notes.Related)
+			// agents find skills in the office library and propose installing them (ADR-187)
+			autoSvc := newAutomation(a, h)
+			if autoSvc != nil {
+				skills := agentskills.Installer{Store: a.store, Auto: autoSvc, Home: autoSvc.Home}
+				office.SetSkills(skills)
+				acts.SetSkills(skills)
+			}
 			// the office assistant creates, exports and imports projects (ADR-170)
-			transfers := transfer.New(a.store, a.providers, a.team, a.workflows.Lib)
+			transfers := newTransfers(a)
 			if h.ProjectRoot != "" {
 				transfers.SetCloneRoot(filepath.Dir(h.ProjectRoot)) // as the dashboard clones
 			}
@@ -213,6 +233,7 @@ func serveCmd() *cobra.Command {
 			bots.SetTap(supportPack)
 			office.AddProvider(supportPack)
 			office.AddProvider(collections.NewTools(collections.New(a.store), acts)) // data_* (ADR-172); a delete is a card
+			office.AddProvider(activity.NewTools(a.store))                           // project_report (ADR-210)
 			runner.SetOnReply(bots.Reply)
 			runner.SetOnProgress(bots.Progress)
 			acts.SetAutoApprover(bots.DirectApprover) // a chat in direct mode: approved in the turn, the agent goes on
@@ -231,10 +252,13 @@ func serveCmd() *cobra.Command {
 			office.SetSendFile(bots.SendFileFor)                                       // an agent in a bot's chat posts images and files there (ADR-083)
 			chatEngine.SetOnBotDecided(bots.DecidedOnDashboard)                        // a bot chat's card decided on the dashboard: the bot goes on (ADR-084)
 			chatEngine.SetOnRunWait(bots.AnnounceRun)                                  // a workflow a bot's chat called waits on a person: the chat is told
+			// an administrator's run decides others' cards (ADR-188)
+			office.SetDecide(chatDecider{store: a.store, chat: chatEngine, acts: acts}.AdminDecide)
 			// a project's agent running on its own, finding work (spec 2026-10-01-burn-design)
 			burner := burn.New(a.store, chatEngine, trees)
+			chatEngine.SetBoardHook(burner.OnBoard) // a task handed with delegate follows on the board (ADR-210)
 			office.SetBurn(func(ctx context.Context, sc officetools.Scope, name string, in officetools.BurnInput) (string, error) {
-				return burner.Tool(ctx, sc, name, burn.ToolInput{Title: in.Title, Kind: in.Kind, Detail: in.Detail, Item: in.Item, Summary: in.Summary, Reason: in.Reason, What: in.What, Scanned: in.Scanned, Map: in.Map, Priority: in.Priority, Lessons: in.Lessons, Coverage: in.Coverage})
+				return burner.Tool(ctx, sc, name, burn.ToolInput{Title: in.Title, Kind: in.Kind, Detail: in.Detail, Item: in.Item, Summary: in.Summary, Reason: in.Reason, What: in.What, Scanned: in.Scanned, Map: in.Map, Priority: in.Priority, Lessons: in.Lessons, Coverage: in.Coverage, Owner: in.Owner, From: in.From})
 			})
 			burner.SetNotify(bots.Notify) // a run's summary to the bot's chat its Burn names (ADR-120)
 			// a script's @@quest lines feed the Burn, and may start it (ADR-132)
@@ -290,6 +314,7 @@ func serveCmd() *cobra.Command {
 			defer gateway.Close() // stdio servers office runs (ADR-092)
 			// an approved mcp_call runs through it
 			acts.SetMCP(gateway)
+			office.AddProvider(gatewayRest{st: a.store, gw: gateway}) // mcp_result: what office cut of a long result (ADR-183)
 			chatEngine.SetGateway(gatewayFor(a.store, gateway))
 			handler := api.New(api.Config{
 				Office: office, Channels: bots, Memory: mem, Events: liveBus,
@@ -304,7 +329,7 @@ func serveCmd() *cobra.Command {
 				Burn:       burner,
 				Cleanup:    cleaner,
 				Trigger:    runner,
-				Automation: newAutomation(a, h),
+				Automation: autoSvc,
 				Workflows:  a.workflows,
 				Peers:      peers,
 				Ops:        procs,

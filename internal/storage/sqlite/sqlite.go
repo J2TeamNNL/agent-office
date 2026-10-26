@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/pressly/goose/v3"
@@ -31,6 +32,7 @@ const (
 // Store implements storage.Store on a single SQLite file.
 type Store struct {
 	db      *sql.DB
+	path    string
 	q       dbtx // db, or the open transaction inside InTx
 	onWrite func(table string)
 	onChat  func(storage.Change) // a chat written, with what (ADR-078)
@@ -51,6 +53,14 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("sqlite: create data dir: %w", err)
 		}
 	}
+	db, err := openDB(path)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{db: db, q: db, path: path}, nil
+}
+
+func openDB(path string) (*sql.DB, error) {
 	dsn := path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -63,11 +73,14 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: ping: %w", err)
 	}
-	return &Store{db: db, q: db}, nil
+	return db, nil
 }
 
 // Migrate applies all pending goose migrations.
 func (s *Store) Migrate(ctx context.Context) error {
+	if testing.Testing() && s.fromTemplate(ctx) {
+		return nil
+	}
 	provider, err := goose.NewProvider(goose.DialectSQLite3, s.db, mustSub(migrations.SQLite, "sqlite"))
 	if err != nil {
 		return fmt.Errorf("sqlite: migrate init: %w", err)
@@ -88,6 +101,7 @@ func (s *Store) Sessions() storage.SessionRepo       { return sessionRepo{s.q} }
 func (s *Store) Audit() storage.AuditRepo            { return auditRepo{s.q} }
 func (s *Store) Providers() storage.ProviderRepo     { return providerRepo{s.q} }
 func (s *Store) Agents() storage.AgentRepo           { return agentRepo{s.q} }
+func (s *Store) AgentSkills() storage.AgentSkillRepo { return agentSkillRepo{s.q} }
 func (s *Store) Repos() storage.RepoRepo             { return repoRepo{s.q} }
 func (s *Store) Revisions() storage.RevisionRepo     { return revisionRepo{s.q} }
 func (s *Store) Runs() storage.RunRepo               { return runRepo{s.q} }

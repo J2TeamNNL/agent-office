@@ -88,6 +88,7 @@ export interface WorkflowStep {
   on_error?: '' | 'stop' | 'continue'
   role?: string // agent; coordinate: the role whose agent coordinates (none: the run's coordinator)
   prompt?: string // agent; coordinate: the coordinator's instructions
+  skill?: string // agent: a project skill whose instructions go with the prompt (ADR-185)
   roles?: string[] // coordinate: the roles it hands work to (none: every role)
   workflow?: string // workflow: a sub-workflow's key and its inputs
   inputs?: Record<string, string>

@@ -38,7 +38,7 @@ Công cụ AI viết code rất giỏi, nhưng mỗi lần chỉ một cuộc ch
 | | |
 |---|---|
 | 💬 **Chat với cả đội** · trả lời trực tiếp, `@tên` để kéo agent vào nhóm, gọi `/skill`, đính kèm ảnh/PDF/log, tag, tìm lại chat cũ | ![Chat](docs/guide/images/vi/04-chat.png) |
-| 🧑‍🤝‍🧑 **Quy trình** · gõ `/handoff`, `/advisor`, `/council`, `/feature`… để nhiều agent phối hợp có ràng buộc (vai, quyền, model khác họ, cổng duyệt, biểu quyết); tự soạn bằng chat | ![Mô hình Team](docs/guide/images/vi/06-team-model.png) |
+| 🧑‍🤝‍🧑 **Quy trình** · gõ `/handoff`, `/advisor`, `/council`, `/feature`, `/website`… để nhiều agent phối hợp có ràng buộc (vai, quyền, model khác họ, cổng duyệt, biểu quyết); tự soạn bằng chat | ![Mô hình Team](docs/guide/images/vi/06-team-model.png) |
 | ✅ **Duyệt trước khi gộp** · mỗi chat có git worktree riêng; diff, thao tác và đổi cài đặt chờ *Duyệt / Từ chối / Bỏ qua* (hoặc "duyệt & luôn cho phép") | ![Thẻ diff](docs/guide/images/vi/34-dark-chat.png) |
 | ⚙️ **Vận hành** · tìm lệnh của project, chạy/dừng/tự chạy lại như pm2, log trực tiếp, CPU/RAM/cổng, docker compose, "hỏi agent về log này" | ![Vận hành](docs/guide/images/vi/11-operations.png) |
 | 🤖 **Tự động hóa** · lịch (cron + múi giờ), webhook, tin nhắn Discord/Telegram; chạy script miễn phí, chỉ gọi AI khi lỗi hoặc khi gặp `@@agent:` | ![Tự động hóa](docs/guide/images/vi/09-automations.png) |
@@ -46,7 +46,7 @@ Công cụ AI viết code rất giỏi, nhưng mỗi lần chỉ một cuộc ch
 | 🔌 **Cổng MCP chung** · office giữ các MCP (HTTP, stdio, đăng nhập OAuth) và chuyển tiếp cho mọi AI, có quyền theo từng tool và nhật ký gọi | ![MCP](docs/guide/images/vi/15-mcp.png) |
 | 💸 **Chi phí & giới hạn** · mọi lượt gọi AI được ghi lại kèm chi phí thật hoặc ước tính, ngân sách theo ngày cho office/project/tự động hóa, kết nối dự phòng khi một kết nối lỗi | ![Chi phí](docs/guide/images/vi/27-stats.png) |
 
-Ngoài ra: **bảng dữ liệu** (lưu dữ liệu có cấu trúc trong office, agent đọc/ghi bằng tool `data_*`, script bằng `office data`), trí nhớ dài hạn của agent, trợ lý office dùng chung mọi project, màn **Theo dõi** nhiều khung, nhật ký ai làm gì và ai duyệt, tab Files có trình sửa, tài khoản và vai trò, token cá nhân, xuất/nhập cấu hình, sao lưu, tự cập nhật từ mã nguồn, sáng/tối, tiếng Việt/tiếng Anh.
+Ngoài ra: **bảng dữ liệu** (lưu dữ liệu có cấu trúc trong office, agent đọc/ghi bằng tool `data_*`, script bằng `office data`), trí nhớ dài hạn của agent, **skill hay dùng của từng agent** (prompt chỉ có tên, agent tự nạp khi việc cần, tìm thêm trong thư viện office và xin bạn duyệt cài), trợ lý office dùng chung mọi project, màn **Theo dõi** nhiều khung, nhật ký ai làm gì và ai duyệt, tab Files có trình sửa, tài khoản và vai trò, token cá nhân, xuất/nhập cấu hình, sao lưu, tự cập nhật từ mã nguồn, sáng/tối, tiếng Việt/tiếng Anh.
 
 ## Văn phòng tự nâng cấp chính nó
 
@@ -116,6 +116,23 @@ docker compose exec office office user create --email ban@example.com   # tùy c
 ```
 
 Đăng nhập `admin` / `admin` rồi đặt lại, hoặc bỏ qua bước đó bằng lệnh trên. Tài khoản sau thêm trên dashboard (Quản trị → Tài khoản); quên mật khẩu thì `office user passwd --email …`.
+
+
+### Tìm ghi chú theo nghĩa (tùy chọn, Cognee)
+
+Ghi chú của agent vẫn ở SQLite; có [Cognee](https://github.com/topoteretes/cognee) thì `recall` tìm thêm theo nghĩa trong ghi chú của mọi agent trong project (ADR-195). Cognee chạy trong Docker, cần **Docker có từ 8 GB RAM** (không có LLM key thì nó nạp model local ~2 GB).
+
+```bash
+scripts/install.sh --with-cognee     # cài + build, rồi chạy Cognee (127.0.0.1:18765); có LLM_API_KEY trong môi trường thì dựng đồ thị bằng LLM, đỡ RAM
+./bin/office cognee status | down    # down: gỡ container, giữ dữ liệu
+```
+
+**Đã cài sẵn?** Không cài lại, không cần khởi động lại:
+
+- Office chạy trên máy: `git pull && make build && ./bin/office cognee up` (hoặc bấm **Cập nhật** trên dashboard rồi `office cognee up`). Office đang chạy nhận Cognee trong vòng 2 phút, khởi động lại máy thì tự bật lại.
+- Office chạy bằng `docker compose`: `git pull && docker compose up -d --build` thêm service `cognee`; volume dữ liệu của office giữ nguyên.
+
+Dùng `docker compose` thì service `cognee` đã chạy cạnh office (đặt `LLM_API_KEY` trong `.env` để dựng đồ thị bằng LLM, đỡ RAM). Server Cognee ở nơi khác: `COGNEE_URL` (+ `COGNEE_API_KEY`).
 
 ## Cách hoạt động
 

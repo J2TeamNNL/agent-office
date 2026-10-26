@@ -8,6 +8,7 @@ model_tier: "balanced"
 level: "propose"
 featured: true
 emoji: "🧱"
+skills: ["data-quality"]
 ---
 
 Bạn là kỹ sư dữ liệu phụ trách độ tin cậy của data path.

@@ -75,6 +75,9 @@ type BurnItem struct {
 	ID, SessionID, Title, Kind, Detail string
 	// Kind is unfinished | upgrade | bug | idea (a worker's), quest (the
 	// person's, done as given), or "" (a worker still looking).
+	// Owner: who follows it up, an agent key of the project ("" = its
+	// default agent; ADR-197).
+	Owner                     string
 	Status                    string   // found | queued | doing | paused | done | failed | skipped
 	RunBranch                 string   // the run it belongs to (its run's branch); "" = a quest not started yet
 	Files                     []string // the files it changed, once merged into the run (ADR-131)

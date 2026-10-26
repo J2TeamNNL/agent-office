@@ -1,0 +1,169 @@
+package officetools
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/tung1998/agent-office/internal/actions"
+	"github.com/tung1998/agent-office/internal/agentskills"
+	"github.com/tung1998/agent-office/internal/automation"
+	"github.com/tung1998/agent-office/internal/perm"
+	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/storage/sqlite"
+	"github.com/tung1998/agent-office/internal/team"
+)
+
+func writeSkill(t *testing.T, dir, name, desc string) {
+	t.Helper()
+	d := filepath.Join(dir, ".claude", "skills", name)
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "---\nname: " + name + "\ndescription: " + desc + "\n---\n\n# " + name + "\n\nStep one.\n"
+	if err := os.WriteFile(filepath.Join(d, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ADR-185: an agent keeps a capped list of skills; the prompt lists them with
+// their use, use_skill reads one and counts it, my_skills adds and removes.
+func TestAgentSkills(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, _ := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
+	defer st.Close()
+	st.Migrate(ctx)
+	dir := t.TempDir()
+	for i := range agentskills.Limit + 1 {
+		writeSkill(t, dir, fmt.Sprintf("s%02d", i), "Skill number "+fmt.Sprint(i))
+	}
+	writeSkill(t, dir, "launch-checklist", "Checks before a site goes live")
+	p, _ := st.Repos().Create(ctx, storage.Repo{Name: "site", Path: dir})
+	team.NewService(st, nil).AddFromLibrary(ctx, p.ID, team.StarterAgent)
+	agents, _ := st.Agents().List(ctx, p.ID)
+	a := agents[0]
+	tb := New(st, nil, actions.New(st, nil))
+	sc := Scope{ProjectID: p.ID, RunRef: "r1", Agent: a.Name, Level: perm.Read}
+
+	if got := agentskills.Block(ctx, st, home, dir, a.ID); !strings.Contains(got, "You keep no skills yet. 14 skills") {
+		t.Fatalf("empty block = %q", got)
+	}
+	if out, isErr := tb.Call(ctx, sc, "my_skills", []byte(`{"action":"add","name":"launch-checklist","why":"before a site goes live"}`)); isErr {
+		t.Fatalf("add = %s", out)
+	}
+	if out, isErr := tb.Call(ctx, sc, "my_skills", []byte(`{"action":"add","name":"nope"}`)); !isErr {
+		t.Fatalf("unknown skill added: %s", out)
+	}
+	block := agentskills.Block(ctx, st, home, dir, a.ID)
+	if !strings.Contains(block, "- launch-checklist: Checks before a site goes live Why: before a site goes live (not used yet)") || strings.Contains(block, "Step one") {
+		t.Fatalf("block = %q", block)
+	}
+
+	out, isErr := tb.Call(ctx, sc, "use_skill", []byte(`{"name":"launch-checklist","task":"go live"}`))
+	if isErr || !strings.Contains(out, "Step one.") || strings.Contains(out, "not on your skills") {
+		t.Fatalf("use_skill = %v %s", isErr, out)
+	}
+	if out, _ = tb.Call(ctx, sc, "use_skill", []byte(`{"name":"s00"}`)); !strings.Contains(out, "not on your skills") {
+		t.Fatalf("use_skill off the list = %s", out)
+	}
+	list, _ := st.AgentSkills().List(ctx, a.ID)
+	if len(list) != 1 || list[0].Uses != 1 || list[0].LastUsedAt.IsZero() || list[0].Source != "agent" {
+		t.Fatalf("list = %+v", list)
+	}
+	if block = agentskills.Block(ctx, st, home, dir, a.ID); !strings.Contains(block, "(used 1×, last ") {
+		t.Fatalf("block after use = %q", block)
+	}
+
+	// the person's "/name" adds while there is room, then only counts
+	for i := range agentskills.Limit {
+		agentskills.Called(ctx, st, home, dir, a.ID, fmt.Sprintf("s%02d", i))
+	}
+	list, _ = st.AgentSkills().List(ctx, a.ID)
+	if len(list) != agentskills.Limit || list[1].Source != "call" || list[1].Uses != 1 {
+		t.Fatalf("after calls = %d %+v", len(list), list[1])
+	}
+	if out, isErr = tb.Call(ctx, sc, "my_skills", []byte(`{"action":"add","name":"s12"}`)); !isErr || !strings.Contains(out, "đã đủ") {
+		t.Fatalf("full list = %v %s", isErr, out)
+	}
+	if out, isErr = tb.Call(ctx, sc, "my_skills", []byte(`{"action":"remove","name":"s00"}`)); isErr || !strings.Contains(out, "Removed") {
+		t.Fatalf("remove = %v %s", isErr, out)
+	}
+	if out, isErr = tb.Call(ctx, sc, "my_skills", []byte(`{"action":"add","name":"s12"}`)); isErr {
+		t.Fatalf("add after remove = %s", out)
+	}
+	if tb.Has(Scope{ProjectID: p.ID, Office: true}, "use_skill") {
+		t.Fatal("the office assistant has use_skill")
+	}
+}
+
+// ADR-187: an agent finds a skill of the office library; adding one the
+// project lacks becomes a card, and approving it installs the skill in the
+// project and puts it on the agent's skills.
+func TestAgentSkillFromLibrary(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	st, _ := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
+	defer st.Close()
+	st.Migrate(ctx)
+	lib := automation.Library{Dir: filepath.Join(t.TempDir(), "library"), Trash: filepath.Join(home, "trash")}
+	if _, err := lib.SeedBuiltinSkills(); err != nil {
+		t.Fatal(err)
+	}
+	auto := &automation.Service{Home: home, Library: lib, Installer: automation.Installer{Home: home, Trash: filepath.Join(home, "trash")}}
+	dir := t.TempDir()
+	p, _ := st.Repos().Create(ctx, storage.Repo{Name: "site", Path: dir})
+	team.NewService(st, nil).AddFromLibrary(ctx, p.ID, team.StarterAgent)
+	agents, _ := st.Agents().List(ctx, p.ID)
+	a := agents[0]
+	acts := actions.New(st, nil)
+	skills := agentskills.Installer{Store: st, Auto: auto, Home: home}
+	acts.SetSkills(skills)
+	tb := New(st, nil, acts)
+	tb.SetSkills(skills)
+	sc := Scope{ProjectID: p.ID, RunRef: "r1", Agent: a.Name, Level: perm.Propose}
+
+	out, isErr := tb.Call(ctx, sc, "find_skills", []byte(`{"query":"ra mắt"}`))
+	if isErr || !strings.Contains(out, "- launch-checklist:") || strings.Contains(out, "(in the project)") {
+		t.Fatalf("find = %v %s", isErr, out)
+	}
+	if out, isErr = tb.Call(ctx, sc, "my_skills", []byte(`{"action":"add","name":"launch-checklist","why":"before go-live"}`)); isErr || !strings.Contains(out, "waiting for the person's approval") {
+		t.Fatalf("add from library = %v %s", isErr, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", "launch-checklist")); err == nil {
+		t.Fatal("installed before approval")
+	}
+	pending, _ := st.Actions().Pending(ctx, 10)
+	if len(pending) != 1 || pending[0].Kind != "install_skill" || pending[0].TargetID != a.ID {
+		t.Fatalf("pending = %+v", pending)
+	}
+	if got, err := acts.Decide(ctx, pending[0].ID, true, "human:a@x.io"); err != nil || got.Status != "done" {
+		t.Fatalf("approve = %+v %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", "launch-checklist", "SKILL.md")); err != nil {
+		t.Fatalf("not installed: %v", err)
+	}
+	list, _ := st.AgentSkills().List(ctx, a.ID)
+	if len(list) != 1 || list[0].Name != "launch-checklist" || list[0].Why != "before go-live" {
+		t.Fatalf("agent skills = %+v", list)
+	}
+	if out, _ = tb.Call(ctx, sc, "find_skills", []byte(`{"query":"launch"}`)); !strings.Contains(out, "(in the project)") {
+		t.Fatalf("find after install = %s", out)
+	}
+	if out, isErr = tb.Call(ctx, sc, "my_skills", []byte(`{"action":"add","name":"made-up"}`)); !isErr {
+		t.Fatalf("unknown skill = %s", out)
+	}
+	// the office MCP of the assistant and of people's CLIs: find_skills for any project
+	office := Scope{ProjectID: p.ID, Office: true, Level: perm.Propose}
+	if !tb.Has(office, "find_skills") || tb.Has(office, "my_skills") {
+		t.Fatal("office scope: find_skills only")
+	}
+	if out, isErr = tb.Call(ctx, office, "find_skills", []byte(`{"query":"launch","project":"site"}`)); isErr || !strings.Contains(out, "launch-checklist") {
+		t.Fatalf("office find = %v %s", isErr, out)
+	}
+}

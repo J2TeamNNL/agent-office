@@ -22,7 +22,7 @@ import (
 type JobView struct {
 	ID        string     `json:"id"`
 	Tool      string     `json:"tool"`
-	Action    string     `json:"action"` // install | login
+	Action    string     `json:"action"` // install | update | login
 	Command   string     `json:"command"`
 	State     string     `json:"state"` // running | succeeded | failed | cancelled
 	Output    string     `json:"output"`

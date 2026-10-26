@@ -22,6 +22,8 @@ const (
 	CapMCPWrite  = "tools.mcp.write" // call office MCP tools that write without asking (ADR-093)
 	CapChatSend  = "chat.send"       // send to another chat in the person's name without asking
 	CapChatCross = "chat.cross"      // open/send to a chat of a linked project without asking
+	CapWeb       = "tools.web"       // search and read the web (ADR-192); picked one by one, in no package
+	CapSelf      = "self.manage"     // make and change the project's schedules and workflows on its own, within bounds (ADR-194), and add agents (ADR-204); picked one by one
 )
 
 // Cap describes a capability for the dashboard.
@@ -31,21 +33,25 @@ type Cap struct {
 	Label       string `json:"label"`
 	Description string `json:"description"`
 	Min         string `json:"min"` // lowest level that includes it
+	// OptIn: in no package's preset; an agent has it only when picked.
+	OptIn bool `json:"opt_in,omitempty"`
 }
 
 // Caps lists every capability, grouped, lowest level first within a group.
 var Caps = []Cap{
-	{CapPropose, "code", "Đề xuất", "Đưa diff và đề xuất thao tác, người duyệt mới làm", Propose},
-	{CapApply, "code", "Tự áp diff", "Diff áp được sạch được áp ngay, trừ file cấm", Edit},
-	{CapCommands, "commands", "Tự chạy lệnh", "Chạy ngay các lệnh được chọn; lệnh khác phải đề xuất", Check},
-	{CapUserMCP, "commands", "Dùng MCP của bạn", "Dùng các MCP/connector trong Claude Code của bạn (Graylog, Jira, Discord…); là công cụ nên có ở mọi mức", Read},
-	{CapMCPWrite, "commands", "Tự gọi tool MCP có ghi", "Gọi ngay tool có ghi của MCP qua office; không có thì mỗi lần gọi thành đề xuất chờ duyệt", Operate},
-	{CapChatSend, "commands", "Tự gửi tin sang chat khác", "Gửi ngay tin vào cuộc chat khác dưới tên người đang chat; không có thì mỗi lần gửi thành đề xuất chờ duyệt", Operate},
-	{CapChatCross, "commands", "Tự gửi sang project liên kết", "Mở chat mới hoặc gửi tin vào chat của project liên kết dưới tên người đang chat; không có thì mỗi lần thành đề xuất chờ duyệt", Operate},
-	{CapCommit, "git", "Tự commit", "Commit các file đã sửa với message rõ ràng", Edit},
-	{CapBranch, "git", "Tự tạo nhánh", "Tạo và chuyển sang nhánh mới", Operate},
-	{CapProcess, "ops", "Tự chạy lại tiến trình", "Chạy, chạy lại, dừng tiến trình được phép", Operate},
-	{CapContainer, "ops", "Tự điều khiển container", "Bật, chạy lại, dừng container được phép", Operate},
+	{CapPropose, "code", "Đề xuất", "Đưa diff và đề xuất thao tác, người duyệt mới làm", Propose, false},
+	{CapApply, "code", "Tự áp diff", "Diff áp được sạch được áp ngay, trừ file cấm", Edit, false},
+	{CapCommands, "commands", "Tự chạy lệnh", "Chạy ngay các lệnh được chọn; lệnh khác phải đề xuất", Check, false},
+	{CapUserMCP, "commands", "Dùng MCP của bạn", "Dùng các MCP/connector trong Claude Code của bạn (Graylog, Jira, Discord…); là công cụ nên có ở mọi mức", Read, false},
+	{CapWeb, "commands", "Tra cứu web", "Tìm và đọc trang web (WebSearch, WebFetch của Claude Code): cho agent nghiên cứu. Không có trong gói nào, phải chọn riêng; nội dung web có thể chứa chỉ dẫn độc hại", Read, true},
+	{CapSelf, "commands", "Tự quản lịch, quy trình và agent", "Tự tạo, sửa tự động hóa theo lịch (gửi tin hoặc chạy quy trình, cách nhau ít nhất 30 phút, có trần chi phí ngày) và quy trình của project, xóa lịch và quy trình đó, thêm agent (không phải administrator, tối đa 15), không cần duyệt. Không có trong gói nào, phải chọn riêng", Propose, true},
+	{CapMCPWrite, "commands", "Tự gọi tool MCP có ghi", "Gọi ngay tool có ghi của MCP qua office; không có thì mỗi lần gọi thành đề xuất chờ duyệt", Operate, false},
+	{CapChatSend, "commands", "Tự gửi tin sang chat khác", "Gửi ngay tin vào cuộc chat khác dưới tên người đang chat; không có thì mỗi lần gửi thành đề xuất chờ duyệt", Operate, false},
+	{CapChatCross, "commands", "Tự gửi sang project liên kết", "Mở chat mới hoặc gửi tin vào chat của project liên kết dưới tên người đang chat; không có thì mỗi lần thành đề xuất chờ duyệt", Operate, false},
+	{CapCommit, "git", "Tự commit", "Commit các file đã sửa với message rõ ràng", Edit, false},
+	{CapBranch, "git", "Tự tạo nhánh", "Tạo và chuyển sang nhánh mới", Operate, false},
+	{CapProcess, "ops", "Tự chạy lại tiến trình", "Chạy, chạy lại, dừng tiến trình được phép", Operate, false},
+	{CapContainer, "ops", "Tự điều khiển container", "Bật, chạy lại, dừng container được phép", Operate, false},
 }
 
 func capInfo(id string) (Cap, bool) {
@@ -61,7 +67,7 @@ func capInfo(id string) (Cap, bool) {
 func Preset(level string) []string {
 	out := []string{}
 	for _, c := range Caps {
-		if Rank(c.Min) <= Rank(level) {
+		if Rank(c.Min) <= Rank(level) && !c.OptIn {
 			out = append(out, c.ID)
 		}
 	}
@@ -118,6 +124,17 @@ func Resolve(a storage.Agent, mode string, p Policy) Access {
 	}
 	if a.Permissions.Containers != nil {
 		acc.Containers = *a.Permissions.Containers
+	}
+	return acc
+}
+
+// Admin is acc for a run with administrator access (ADR-074, ADR-188):
+// every capability, at the top level.
+func Admin(acc Access) Access {
+	acc.Level = Operate
+	acc.Caps = []string{}
+	for _, c := range Caps {
+		acc.Caps = append(acc.Caps, c.ID)
 	}
 	return acc
 }

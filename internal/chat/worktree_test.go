@@ -16,6 +16,7 @@ import (
 	"github.com/tung1998/agent-office/internal/actions"
 	"github.com/tung1998/agent-office/internal/actor"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/mcpserver"
 	"github.com/tung1998/agent-office/internal/officetools"
 	"github.com/tung1998/agent-office/internal/perm"
@@ -167,14 +168,14 @@ func TestTwoAgentsEditInTheirOwnTrees(t *testing.T) {
 	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "claude")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat >/dev/null
 who=lead
 case "$*" in *"You are Dev"*) who=dev;; esac
 printf '%s\n' "$who" > "$who.txt"
 echo '{"type":"system","subtype":"init","session_id":"sess-'$who'"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"'$who' sửa xong","session_id":"sess-'$who'","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	f := setup(t, func(provs *provider.Service) storage.Provider {
 		p, _ := provs.Create(context.Background(), provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 		return p

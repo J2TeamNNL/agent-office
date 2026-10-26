@@ -32,7 +32,7 @@ function setCaps(next: string[]) {
 function toggle(id: string, on: boolean) {
   let next = caps.value.filter(c => c !== id)
   if (on) next.push(id)
-  if (on && id !== 'propose' && !next.includes('propose')) next.push('propose') // acting alone implies proposing
+  if (on && permCaps.find(c => c.id === id)?.min !== 'read' && !next.includes('propose')) next.push('propose') // acting alone implies proposing (looking things up does not)
   if (!on && id === 'propose') next = [] // nothing is done alone without proposing
   setCaps(next)
 }

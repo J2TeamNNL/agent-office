@@ -7,13 +7,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/storage"
 )
 
 // choices are the connections a turn of agent may run on, in order: its own
 // one, then its fallbacks top to bottom. One known to be over its limit right
-// now goes to the back (still tried when every other one fails); one past a
+// now or marked broken goes to the back (still tried when every other one fails); one past a
 // stop threshold the person set is left out (ADR-136), and when that leaves
 // none the turn does not start (a *CapError, read as out of tokens).
 func (e *Engine) choices(ctx context.Context, agent storage.Agent) ([]provider.Choice, error) {
@@ -35,7 +36,7 @@ func (e *Engine) choices(ctx context.Context, agent storage.Agent) ([]provider.C
 			}
 			continue
 		}
-		if has && overNow(l, now) {
+		if (has && overNow(l, now)) || c.Provider.Status == "error" { // a broken one too: its fallbacks answer first
 			over = append(over, c)
 		} else {
 			ok = append(ok, c)
@@ -154,4 +155,23 @@ func choiceName(c, other provider.Choice) string {
 		return c.Provider.Name + " · " + c.Model
 	}
 	return c.Provider.Name
+}
+
+// connectionBroken: a run failed on the connection itself, not on the task:
+// its account is signed out or its CLI never answered.
+func connectionBroken(err error) bool {
+	return errors.Is(err, llm.ErrNeedsLogin) || errors.Is(err, ErrSilent)
+}
+
+// keepHealth writes what a run showed of its connection onto it, so Kết nối
+// AI and the chat say it is broken instead of the last good check; a run that
+// answers on a connection marked broken clears the mark.
+func (e *Engine) keepHealth(p storage.Provider, err error) {
+	ctx := context.Background()
+	switch {
+	case connectionBroken(err):
+		_ = e.store.Providers().SetStatus(ctx, p.ID, "error", err.Error(), nil, time.Now())
+	case err == nil && p.Status == "error":
+		_ = e.store.Providers().SetStatus(ctx, p.ID, "ok", "lượt chạy gần nhất trả lời được", nil, time.Now())
+	}
 }

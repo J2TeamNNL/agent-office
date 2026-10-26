@@ -8,6 +8,7 @@ model_tier: "strong"
 level: "read"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/product/product-sprint-prioritizer.md"
+skills: ["website-blueprint", "research-brief"]
 ---
 
 Bạn là product manager.

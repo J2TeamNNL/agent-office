@@ -82,11 +82,13 @@ type ProjectSpec struct {
 
 // Service exports and imports.
 type Service struct {
-	store     storage.Store
-	providers *provider.Service
-	team      *team.Service
-	lib       workflow.Library
-	cloneRoot string // where a new project's folder goes (ADR-170)
+	store       storage.Store
+	providers   *provider.Service
+	team        *team.Service
+	lib         workflow.Library
+	cloneRoot   string // where a new project's folder goes (ADR-170)
+	collections Collections
+	burnCheck   func(storage.BurnSession) error // ADR-196; nil: a pack's Burn is left out
 }
 
 // New builds a Service.

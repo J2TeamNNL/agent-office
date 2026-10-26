@@ -11,9 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"github.com/tung1998/agent-office/internal/actions"
+	"github.com/tung1998/agent-office/internal/agentskills"
+	"github.com/tung1998/agent-office/internal/automation"
 	"github.com/tung1998/agent-office/internal/gitops"
 	"github.com/tung1998/agent-office/internal/memory"
 	"github.com/tung1998/agent-office/internal/perm"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -39,14 +42,19 @@ type Toolbox struct {
 	store   storage.Store
 	ops     *ops.Manager
 	actions *actions.Service
+	// skills is the office's skill library (find_skills, ADR-187; nil = off)
+	skills SkillLibrary
 	// delegate hands a task to another agent of the chat (ADR-044), set by the chat engine
-	delegate func(ctx context.Context, sc Scope, agent, task string) (string, error)
+	delegate func(ctx context.Context, sc Scope, agent, task, effort string) (string, error)
 	// askExpert asks an expert of a linked project (ADR-177); hasExperts:
 	// the project has one to ask (set by the chat engine)
 	askExpert  func(ctx context.Context, sc Scope, expert, question string) (string, error)
 	hasExperts func(ctx context.Context, projectID string) bool
 	sendFile   func(ctx context.Context, sc Scope, path, caption string) (string, error)
-	burn       func(ctx context.Context, sc Scope, name string, in BurnInput) (string, error)
+	// decide approves or rejects a waiting card (kind action | patch) for an
+	// administrator's run (ADR-188), set by the office binary
+	decide func(ctx context.Context, sc Scope, kind, id string, approve bool) (string, error)
+	burn   func(ctx context.Context, sc Scope, name string, in BurnInput) (string, error)
 	// config reads settings for describe/list/get (the API's registry, ADR-045)
 	config ConfigReader
 	// assistant is the office assistant's own project (hidden from the list)
@@ -60,6 +68,9 @@ type Toolbox struct {
 	home     string
 	// providers: feature packs' tools (support, ADR-171)
 	providers []Provider
+	// related: the project's notes nearest a query by meaning (Cognee,
+	// ADR-195; nil = keywords only)
+	related func(ctx context.Context, projectID, query, skip string, n int) ([]string, error)
 }
 
 // Provider is a feature pack's tools (support, ADR-171): Tools lists none
@@ -82,6 +93,12 @@ func (t *Toolbox) provider(sc Scope, name string) Provider {
 		}
 	}
 	return nil
+}
+
+// SetRelated lets recall also find notes by meaning, of every agent of the
+// project (ADR-195).
+func (t *Toolbox) SetRelated(fn func(ctx context.Context, projectID, query, skip string, n int) ([]string, error)) {
+	t.related = fn
 }
 
 // SetPeers gives the MCP other_office (ADR-169) the paired offices.
@@ -115,8 +132,35 @@ type ConfigReader interface {
 // SetConfig turns on describe, list, get and propose_change.
 func (t *Toolbox) SetConfig(c ConfigReader) { t.config = c }
 
+// SkillLibrary is the office library of skills an agent may find and
+// propose for its project (ADR-187).
+type SkillLibrary interface {
+	Find(ctx context.Context, projectID, query string) (string, error)
+	Has(name string) bool
+}
+
+// SetSkills turns on find_skills, and lets my_skills propose installing a
+// library skill the project lacks.
+func (t *Toolbox) SetSkills(l SkillLibrary) { t.skills = l }
+
+type boardTaskKey struct{}
+
+// WithBoardTask: the hand-off is the work board's task id (ADR-210).
+func WithBoardTask(ctx context.Context, id string) context.Context {
+	if id = strings.TrimSpace(id); id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, boardTaskKey{}, id)
+}
+
+// BoardTaskOf is the task id WithBoardTask set ("" = none).
+func BoardTaskOf(ctx context.Context) string {
+	v, _ := ctx.Value(boardTaskKey{}).(string)
+	return v
+}
+
 // SetDelegate turns on the delegate tool (the chat engine runs hand-offs).
-func (t *Toolbox) SetDelegate(fn func(ctx context.Context, sc Scope, agent, task string) (string, error)) {
+func (t *Toolbox) SetDelegate(fn func(ctx context.Context, sc Scope, agent, task, effort string) (string, error)) {
 	t.delegate = fn
 }
 
@@ -130,7 +174,7 @@ func (t *Toolbox) SetAskExpert(fn func(ctx context.Context, sc Scope, expert, qu
 var ConsultTools = []string{"recall", "data_collections", "data_query", "data_get"}
 
 // BurnInput is what the burn_* tools take.
-type BurnInput struct{ Title, Kind, Detail, Item, Summary, Reason, What, Scanned, Map, Priority, Lessons, Coverage string }
+type BurnInput struct{ Title, Kind, Detail, Item, Summary, Reason, What, Scanned, Map, Priority, Lessons, Coverage, Owner, From string }
 
 // SetBurn turns on the burn_* tools (a Burn's conversation only).
 func (t *Toolbox) SetBurn(fn func(ctx context.Context, sc Scope, name string, in BurnInput) (string, error)) {
@@ -138,6 +182,11 @@ func (t *Toolbox) SetBurn(fn func(ctx context.Context, sc Scope, name string, in
 }
 
 // SetSendFile turns on the send_file tool (a bot's chat posts the file, ADR-083).
+// SetDecide lets an administrator's run decide the project's waiting cards (ADR-188).
+func (t *Toolbox) SetDecide(fn func(ctx context.Context, sc Scope, kind, id string, approve bool) (string, error)) {
+	t.decide = fn
+}
+
 func (t *Toolbox) SetSendFile(fn func(ctx context.Context, sc Scope, path, caption string) (string, error)) {
 	t.sendFile = fn
 }
@@ -161,6 +210,10 @@ func obj(props map[string]any, required ...string) map[string]any {
 }
 
 var linesProp = map[string]any{"type": "integer", "description": "Number of last log lines (default 200, max 1000)"}
+
+// effortParam is how hard an agent given work thinks (delegate, workflow_delegate).
+var effortParam = map[string]any{"type": "string", "enum": storage.Efforts,
+	"description": "How hard it thinks (empty = the agent's own). low/medium: lookups, routine edits, summaries; high/xhigh: tricky code, many edge cases, security, careful review; max: rarely. A misread request needs a clearer task, not more effort; careful work still wrong needs a stronger agent."}
 
 // Tools lists the tools (names are stable: agents and the UI refer to them).
 func (t *Toolbox) Tools() []Tool {
@@ -188,12 +241,12 @@ func (t *Toolbox) Tools() []Tool {
 			}, "command", "reason")})
 		list = append(list, Tool{Name: "propose_action", Description: "Propose an action for the person to approve (runs on its own if your permissions allow; git_push always needs approval). Use it to re-run build/test after a fix, restart a stuck service, or commit/push when asked.",
 			Schema: obj(map[string]any{
-				"action":  map[string]any{"type": "string", "enum": []string{"run_process", "restart_process", "stop_process", "start_container", "restart_container", "stop_container", "git_commit", "git_branch", "git_push"}},
+				"action":  map[string]any{"type": "string", "enum": []string{"run_process", "restart_process", "stop_process", "start_container", "restart_container", "stop_container", "git_commit", "git_branch", "git_merge", "git_push"}},
 				"target":  map[string]any{"type": "string", "description": "*_process: process name; *_container: docker compose service"},
 				"reason":  map[string]any{"type": "string", "description": "Why this action is needed"},
 				"message": map[string]any{"type": "string", "description": "git_commit: commit message following the repo's conventions"},
 				"files":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "git_commit: files to commit (empty = all changes)"},
-				"branch":  map[string]any{"type": "string", "description": "git_branch: new branch name"},
+				"branch":  map[string]any{"type": "string", "description": "git_branch: new branch name; git_merge: the local branch to merge into the current one (e.g. a Burn run's burn/<when>, once reviewed)"},
 			}, "action", "reason")})
 		list = append(list, Tool{Name: "send_to_chat", Description: "Send a message into ANOTHER chat of this office as the person you chat with, for its agent to carry on, when they ask to pass work there. Find the chat with search_history or a link they pasted. To hand work to a linked project (one this project links to in its settings), give project and no chat: a new chat opens there; read its progress later with read_link on the link returned.",
 			Schema: obj(map[string]any{
@@ -202,22 +255,46 @@ func (t *Toolbox) Tools() []Tool {
 				"text":    map[string]any{"type": "string", "description": "Message text, clear enough for the agent there to act without asking back"},
 				"reason":  map[string]any{"type": "string", "description": "Why it needs sending"},
 			}, "text", "reason")})
-		list = append(list, Tool{Name: "remember", Description: "Save one short point worth keeping long term to your notes for this project: conventions, decisions, the person's preferences, fixes. Nothing one-off, no secrets. A durable rule for the whole project: no topic (core, in every later chat). Details about one area (a module, a flow, a service): give a topic and a one-line summary; only the summary is in every chat, the details are read with recall.",
+		list = append(list, Tool{Name: "remember", Description: "Save one short point to your notes for this project, kept at once: only what saves you time next time, i.e. something you had to dig for or were corrected on and would otherwise look up again (where a thing lives, the command that works, a non-obvious convention or pitfall, the person's preference or decision). Not: what you just did or its progress, what the code, README, docs or git history already say, anything one-off, secrets. Rarely more than one per turn; a note already in your notes is refused. When it corrects or updates notes you have, give their ids in replaces: they go and this one takes their place. A durable rule for the whole project: no topic (core, in every later chat). Details about one area (a module, a flow, a service): give a topic and a one-line summary; only the summary is in every chat, the details are read with recall.",
 			Schema: obj(map[string]any{
-				"note":    map[string]any{"type": "string", "description": "What to remember, e.g. The repo uses pnpm; run pnpm test before reporting done"},
-				"topic":   map[string]any{"type": "string", "description": "Optional short slug of the area, e.g. payments or deploy (reuse a topic from your index when it fits); empty = core"},
-				"summary": map[string]any{"type": "string", "description": "With a topic: one line saying what its notes cover, e.g. PayPal/Stripe refunds, webhooks, test keys"},
-				"reason":  map[string]any{"type": "string", "description": "Why it is worth remembering"},
-			}, "note")})
-		list = append(list, Tool{Name: "recall", Description: "Read your notes on a topic from the index in your notes (they are not in the prompt), or search all your notes by keywords, ignoring accents. With no arguments, lists your topics.",
+				"note":     map[string]any{"type": "string", "description": "What to remember, e.g. The repo uses pnpm; run pnpm test before reporting done"},
+				"topic":    map[string]any{"type": "string", "description": "Optional short slug of the area, e.g. payments or deploy (reuse a topic from your index when it fits); empty = core"},
+				"summary":  map[string]any{"type": "string", "description": "With a topic: one line saying what its notes cover, e.g. PayPal/Stripe refunds, webhooks, test keys"},
+				"reason":   map[string]any{"type": "string", "description": "What it saves next time, e.g. took 10 minutes to find where refunds are retried"},
+				"replaces": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Ids of your notes this one corrects or updates (recall shows ids); they are dropped"},
+			}, "note", "reason")})
+		list = append(list, Tool{Name: "forget", Description: "Drop notes of yours that are wrong, outdated, repeated or no longer of use (recall shows their ids; topic core = the notes with no topic). Kept as a revision the person can put back. Keep your notes short: drop as readily as you add.",
+			Schema: obj(map[string]any{
+				"ids":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Ids of the notes to drop"},
+				"reason": map[string]any{"type": "string", "description": "Why, e.g. the command changed; the old repo is gone"},
+			}, "ids", "reason")})
+		list = append(list, Tool{Name: "recall", Description: "Read your notes, with their ids, on a topic from the index in your notes (they are not in the prompt; topic core = the notes with no topic), or search all your notes by keywords, ignoring accents (and, when the office has Cognee, by meaning across the notes of every agent of the project). With no arguments, lists your topics.",
 			Schema: obj(map[string]any{
 				"topic": map[string]any{"type": "string", "description": "Topic name from the index, e.g. payments"},
 				"query": map[string]any{"type": "string", "description": "Keywords to search the notes by (optional)"},
 			}), ReadOnly: true})
+		list = append(list, Tool{Name: "use_skill", Description: "Read the instructions of a project skill (one of Your skills, or any the project has) when the task in front of you clearly needs it. Not for questions, small edits or work you already know how to do.",
+			Schema: obj(map[string]any{
+				"name": map[string]any{"type": "string", "description": "Skill name, e.g. launch-checklist"},
+				"task": map[string]any{"type": "string", "description": "What you need it for, in a few words"},
+			}, "name"), ReadOnly: true})
+		if t.skills != nil {
+			list = append(list, Tool{Name: "find_skills", Description: "Search the office's skill library (beyond the skills this project has) when a task needs a procedure none of the project's skills covers. A match the project lacks can be added with my_skills: the person approves installing it.",
+				Schema: obj(map[string]any{
+					"query": map[string]any{"type": "string", "description": "Words of what you need, e.g. seo launch; empty lists them all"},
+				}), ReadOnly: true})
+		}
+		list = append(list, Tool{Name: "my_skills", Description: "Keep Your skills useful: add a skill you needed and will need again in this project (one only in the office library becomes a card the person approves to install it), or remove one you never use or that no longer fits. The list is capped: when full, remove the least useful first.",
+			Schema: obj(map[string]any{
+				"action": map[string]any{"type": "string", "enum": []string{"add", "remove"}},
+				"name":   map[string]any{"type": "string", "description": "Skill name"},
+				"why":    map[string]any{"type": "string", "description": "add: when it helps, one line, e.g. before a website goes live"},
+			}, "action", "name")})
 		str := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
-		list = append(list, Tool{Name: "propose_automation", Description: "Propose an automation (the person approves it). Prefer action=script (NO AI tokens); chat only when every run needs AI; workflow runs a project workflow. A script feeds the project's Burn: each output line '@@quest <title> :: <detail>' becomes a Burn quest (open ones with the same title are skipped). chat/workflow with goal runs until a check passes. With automation_id it edits that one.",
+		list = append(list, Tool{Name: "propose_automation", Description: "Propose an automation (the person approves it). Prefer action=script (NO AI tokens); chat only when every run needs AI; workflow runs a project workflow. A script feeds the project's Burn: each output line '@@quest <title> :: <detail>' becomes a Burn quest (open ones with the same title are skipped). chat/workflow with goal runs until a check passes. A frequent schedule takes only_if (it runs only when its data or the work board has work: no tokens otherwise) and limits. With the self.manage capability, a chat/workflow schedule at most every 30 minutes with limits.daily_cost_usd up to 5 is done at once, no approval. With automation_id it edits that one.",
 			Schema: obj(map[string]any{
 				"automation_id": str("Edit this automation (empty = create a new one)"),
+				"enabled":       map[string]any{"type": "boolean", "description": "Turn it on (true) or off (false); empty = a new one on, an edited one as it is"},
 				"name":          str("Short name"),
 				"source":        map[string]any{"type": "string", "enum": []string{"schedule", "webhook"}},
 				"every_minutes": map[string]any{"type": "integer"},
@@ -241,18 +318,29 @@ func (t *Toolbox) Tools() []Tool {
 				}),
 				"ends_at": str("schedule: time to stop on its own (RFC3339, e.g. 2026-10-12T00:00:00+07:00); empty = runs until turned off"),
 				"tags":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "chat: tags put on each run's chat (max 10; empty = keep the current tags)"},
-				"reason":  str("Why this automation is needed"),
+				"only_if": obj(map[string]any{
+					"collection": str("Data table (collection key) of the project to look at"),
+					"where": map[string]any{"type": "array", "description": "Run when a record matches all of these; \"$today\"/\"$now\" stand for the tick's date/time, e.g. [{\"field\":\"status\",\"op\":\"in\",\"value\":[\"cho-kiem-tra\"]}] or [{\"field\":\"due\",\"op\":\"lt\",\"value\":\"$today\"}]",
+						"items": obj(map[string]any{"field": str("Field"), "op": str("eq ne lt lte gt gte contains in"), "value": map[string]any{"description": "Value (a list for in)"}}, "field", "op", "value")},
+					"changed": map[string]any{"type": "boolean", "description": "Also run when a record changed since its last run"},
+					"board":   str("Also (or only, with no collection) the project's work board, the Burn's: open = work no one is doing (Burn off with pieces left, or a piece waiting for review); changed = a piece added, started or finished since its last run; any = either"),
+				}),
+				"limits": obj(map[string]any{
+					"daily_cost_usd": map[string]any{"type": "number", "description": "Cost cap a day; it turns off when reached"},
+					"max_minutes":    map[string]any{"type": "integer", "description": "How long one run may take"},
+				}),
+				"reason": str("Why this automation is needed"),
 			}, "name", "source", "action", "reason")})
 	}
 	if t.config != nil && t.actions != nil {
 		kind := map[string]any{"type": "string", "description": "Setting type, see describe"}
 		list = append(list,
-			Tool{Name: "describe", Description: "The setting types that can be changed (automation, agent, workflow, monitor, process, policy, project, usage_settings, provider); with resource, lists its editable fields.",
+			Tool{Name: "describe", Description: "The setting types that can be changed (automation, agent, workflow, monitor, process, policy, project, usage_settings, provider) and the read-only agent_library a new agent starts from; with resource, lists its editable fields.",
 				Schema: obj(map[string]any{"resource": kind}), ReadOnly: true},
 			Tool{Name: "list", Description: "The settings of one type in the project (id, name, status).", Schema: obj(map[string]any{"resource": kind}, "resource"), ReadOnly: true},
 			Tool{Name: "get", Description: "One setting in full (secrets masked). policy, project and usage_settings need no id.",
 				Schema: obj(map[string]any{"resource": kind, "id": map[string]any{"type": "string"}}, "resource"), ReadOnly: true},
-			Tool{Name: "propose_change", Description: "PROPOSE changing a setting; office applies it once the person approves the card. patch holds only the fields to change (see describe/get); never include API keys: the person pastes them on the card.",
+			Tool{Name: "propose_change", Description: "PROPOSE changing a setting; office applies it once the person approves the card. patch holds only the fields to change (see describe/get); never include API keys: the person pastes them on the card. With the self.manage capability, a workflow (made, changed or deleted), a deleted chat/workflow schedule, or a new agent of this project (no full_access, no extra_dirs, at most 15 agents), is done at once.",
 				Schema: obj(map[string]any{
 					"resource": kind,
 					"op":       map[string]any{"type": "string", "enum": []string{"create", "update", "delete"}},
@@ -262,6 +350,8 @@ func (t *Toolbox) Tools() []Tool {
 				}, "resource", "op", "reason")},
 		)
 	}
+	list = append(list, staffLoadTool()) // ADR-197
+	list = append(list, nextRunTool())   // ADR-202
 	list = append(list, Tool{Name: "search_history", Description: "Search chat history (web, Discord, Telegram, automations) by keyword, ignoring accents. When the person refers to earlier work, search first, don't guess; read a result in full with read_link.",
 		Schema: obj(map[string]any{
 			"query":   map[string]any{"type": "string", "description": "Keywords, a few words are enough"},
@@ -298,9 +388,27 @@ func (t *Toolbox) Tools() []Tool {
 			Tool{Name: "burn_quest", Description: "Put a piece of work (a quest) on the project's work board (the Burn's), when the person asks to note work for later or hand it to the board. It waits there for the person to give it to an agent; a running Burn takes it next. One self-contained task per quest; several steps: several quests, in order.", Schema: obj(map[string]any{
 				"title":  map[string]any{"type": "string", "description": "Short title (an open quest with the same title is not added twice)"},
 				"detail": map[string]any{"type": "string", "description": "The brief, clear enough to do without asking back: goal, where (file:line), constraints, how to verify"},
+				"owner":  map[string]any{"type": "string", "description": "Who follows it up (reads its result, accepts or rewrites it): an agent of the board's project, key or name; empty = you, or the project's default agent"},
 			}, "title", "detail")},
-			Tool{Name: "burn_quests", Description: "List the quests on the project's work board: each one's status and, once finished, its summary.", Schema: obj(map[string]any{}), ReadOnly: true},
+			Tool{Name: "burn_assign", Description: "Hand quests on the work board to another agent of the project to follow up: one quest (item), or every open quest of one agent (from), when work is split between managers or handed over. The Burn still does the work.", Schema: obj(map[string]any{
+				"owner": map[string]any{"type": "string", "description": "The agent that follows them up from now on (key or name)"},
+				"item":  map[string]any{"type": "string", "description": "One quest's id (from burn_quests)"},
+				"from":  map[string]any{"type": "string", "description": "Or: every open quest this agent follows up (key or name)"},
+			}, "owner")},
+			Tool{Name: "burn_quests", Description: "The project's work board: the Burn's state, its run's work not merged yet, what it found on its own, and each quest's status and, once finished, its summary.", Schema: obj(map[string]any{"owner": map[string]any{"type": "string", "description": "Only the quests this agent follows up (key or name); empty = all"}}), ReadOnly: true},
 		)
+	}
+	if t.decide != nil {
+		list = append(list,
+			Tool{Name: "pending_requests", Description: "The project's cards waiting for a person: operations (kind action) and diffs (kind patch), with id, who proposed it and from which chat. Administrator only.",
+				Schema: obj(map[string]any{}), ReadOnly: true},
+			Tool{Name: "decide_request", Description: "Approve or reject a waiting card (see pending_requests) as administrator: an approved one is carried out at once and its agent goes on. A push to master/main is never yours to approve.",
+				Schema: obj(map[string]any{
+					"kind":    map[string]any{"type": "string", "enum": []string{"action", "patch"}},
+					"id":      map[string]any{"type": "string"},
+					"approve": map[string]any{"type": "boolean"},
+					"reason":  map[string]any{"type": "string", "description": "Why"},
+				}, "kind", "id", "approve")})
 	}
 	if t.sendFile != nil {
 		list = append(list, Tool{Name: "send_file", Description: "Send a file (a screenshot, chart, log…) into the current Discord/Telegram chat at once; images show inline. It must be inside the project's working folder (copy it there first if needed).",
@@ -312,8 +420,10 @@ func (t *Toolbox) Tools() []Tool {
 	if t.delegate != nil {
 		list = append(list, Tool{Name: "delegate", Description: "Hand part of the work to another agent: it works in the background while you answer the person; you are called again when it is done. Only when needed. @Name in a reply hands over nothing.",
 			Schema: obj(map[string]any{
-				"agent": map[string]any{"type": "string", "description": "Name of a project agent"},
-				"task":  map[string]any{"type": "string", "description": "The work to do, clear enough to do without asking back"},
+				"agent":   map[string]any{"type": "string", "description": "Name of a project agent"},
+				"task":    map[string]any{"type": "string", "description": "The work to do, clear enough to do without asking back"},
+				"effort":  effortParam,
+				"task_id": map[string]any{"type": "string", "description": "Optional: the id of the task on the project's work board this is (burn_quests): office marks it in progress with that agent, then done with its answer (or failed)"},
 			}, "agent", "task")})
 	}
 	if t.askExpert != nil {
@@ -331,7 +441,7 @@ func (t *Toolbox) Tools() []Tool {
 			"additionalProperties": map[string]any{"type": "string"}}
 		list = append(list,
 			Tool{Name: "workflow_delegate", Description: "Workflow: give a role its first piece of work; it starts when your turn ends, and you are called again once all roles just given work are done. Pass agent when the role has none assigned.",
-				Schema: obj(map[string]any{"role": str("Role key"), "agent": str("Name of the agent taking the role (empty = the agent assigned to the role)"), "brief": brief}, "role", "brief")},
+				Schema: obj(map[string]any{"role": str("Role key"), "agent": str("Name of the agent taking the role (empty = the agent assigned to the role)"), "brief": brief, "effort": effortParam}, "role", "brief")},
 			Tool{Name: "workflow_send", Description: "Workflow: send more to a role already given work (the role keeps its thread and remembers what it did). Each send is one round, and rounds are limited.",
 				Schema: obj(map[string]any{"role": str("Role key"), "message": str("What to send, e.g. another role's argument it should answer")}, "role", "message")},
 			Tool{Name: "workflow_ask", Description: "Workflow: ask a role (not propose/edit, not a sub-workflow) and WAIT for its answer this turn (up to wait_seconds), for short questions. On timeout it carries on in the background and you are called again.",
@@ -371,6 +481,14 @@ func (t *Toolbox) ToolsFor(sc Scope) []Tool {
 		return out
 	}
 	for _, x := range t.Tools() {
+		if x.Name == "schedule_next_run" { // a run of a schedule, that may propose
+			if sc.Office || !perm.AtLeast(sc.Level, perm.Propose) {
+				continue
+			}
+			if _, err := t.scheduleOf(context.Background(), sc); err != nil {
+				continue
+			}
+		}
 		if x.Name == "ask_expert" && (sc.ConversationID == "" || sc.TaskID != "" || sc.Office || t.hasExperts == nil || !t.hasExperts(context.Background(), sc.ProjectID)) {
 			continue
 		}
@@ -380,12 +498,18 @@ func (t *Toolbox) ToolsFor(sc Scope) []Tool {
 		if x.Name == "send_to_chat" && sc.ConversationID == "" {
 			continue
 		}
+		if (x.Name == "use_skill" || x.Name == "my_skills") && sc.Office {
+			continue // the assistant works across projects: no skills of its own (ADR-185)
+		}
 		if questTool(x.Name) {
-			if t.burnChat(sc) || (x.Name == "burn_quest" && !perm.AtLeast(sc.Level, perm.Propose)) {
+			if t.burnChat(sc) || (x.Name != "burn_quests" && !perm.AtLeast(sc.Level, perm.Propose)) {
 				continue // a Burn records its own work with burn_add
 			}
 		} else if strings.HasPrefix(x.Name, "burn_") && !t.burnChat(sc) {
 			continue // a Burn's conversation only
+		}
+		if (x.Name == "pending_requests" || x.Name == "decide_request") && !sc.Admin {
+			continue // an administrator's run only (ADR-188)
 		}
 		if x.Name == "send_file" && !t.botChat(sc) {
 			continue // only a bot's chat has somewhere to post it
@@ -410,8 +534,13 @@ func (t *Toolbox) ToolsFor(sc Scope) []Tool {
 		}
 		if sc.Office {
 			x = withProject(x)
+		} else if sc.Admin {
+			x = withLinked(x) // ADR-191
 		}
 		out = append(out, x)
+	}
+	if sc.Admin && !sc.Office && t.transfer != nil && !sc.AnswerOnly && sc.ConversationID != "" {
+		out = append(out, t.createProjectTool())
 	}
 	if !sc.Office {
 		for _, p := range t.providers {
@@ -433,7 +562,7 @@ func (t *Toolbox) ToolsFor(sc Scope) []Tool {
 }
 
 // ownTools are the assistant's own, not a project's: they take no project.
-var ownTools = []string{"remember", "recall", "read_link"}
+var ownTools = []string{"remember", "forget", "recall", "read_link"}
 
 // withProject gives a project tool of the office assistant a "project"
 // argument (ADR-046): any project of the office, not only linked ones.
@@ -477,6 +606,12 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 	if p := t.provider(sc, name); p != nil && !sc.Office {
 		return p.Call(ctx, sc, name, raw)
 	}
+	if name == "propose_create_project" && !sc.Office {
+		if !sc.Admin || t.transfer == nil || sc.AnswerOnly {
+			return "Chỉ agent chạy như administrator mới tạo project", true
+		}
+		return t.createProject(ctx, sc, raw)
+	}
 	projectID := sc.ProjectID
 	var in struct {
 		Expert   string          `json:"expert"`
@@ -514,15 +649,22 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 		Command  string          `json:"command"`
 		Agent    string          `json:"agent"`
 		Task     string          `json:"task"`
+		Effort   string          `json:"effort"`
+		TaskID   string          `json:"task_id"` // delegate: the work board's task (ADR-210)
 		URL      string          `json:"url"`
 		Resource string          `json:"resource"`
 		Op       string          `json:"op"`
 		ID       string          `json:"id"`
 		Patch    json.RawMessage `json:"patch"`
 		Note     string          `json:"note"`
+		Replaces []string        `json:"replaces"`
+		IDs      []string        `json:"ids"`
 		Topic    string          `json:"topic"`
 		Chat     string          `json:"chat"`
 		Text     string          `json:"text"`
+		Why      string          `json:"why"`
+		Owner    string          `json:"owner"`
+		From     string          `json:"from"`
 	}
 	if len(raw) > 0 && string(raw) != "null" {
 		if err := json.Unmarshal(raw, &in); err != nil {
@@ -544,6 +686,12 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 				projectID, sc.ProjectID, sc.Dir = p.ID, p.ID, ""
 			}
 		}
+	} else if sc.Admin && in.Project != "" && in.Project != projectID && slices.Contains(linkedTools, name) { // ADR-191: a linked project's settings
+		p, err := t.linkedProject(ctx, sc, in.Project)
+		if err != nil {
+			return err.Error(), true
+		}
+		projectID, sc.ProjectID, sc.Dir = p.ID, p.ID, ""
 	} else if in.Project != "" && in.Project != projectID && name != "send_to_chat" && name != "search_history" { // these two: a linked project
 		return "Bạn chỉ làm việc trong project của mình", true
 	}
@@ -605,7 +753,13 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 			}
 			var a storage.Action
 			a, err = t.actions.Propose(ctx, sc, "config_change", "", in.Reason, storage.ActionArgs{Change: &storage.ConfigChange{Resource: in.Resource, Op: in.Op, ID: in.ID, Patch: in.Patch}})
-			if err == nil {
+			switch {
+			case err != nil:
+			case a.Status == "done": // within its own rights (self.manage) or as administrator
+				out = "Done: " + a.Target + ". " + a.Detail
+			case a.Status == "failed":
+				return "Không đổi được " + a.Target + ": " + a.Detail, true
+			default:
 				out = "Created approval card: " + a.Target + ". Office changes it only once the person approves the card; tell them briefly what you proposed."
 			}
 		}
@@ -613,20 +767,44 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 		out, err = t.readLink(ctx, sc, in.URL)
 	case "search_history":
 		out, err = t.searchHistory(ctx, sc, in.Query, in.Days, in.Author, in.Project)
-	case "burn_quest", "burn_quests":
+	case "schedule_next_run":
+		if sc.Office || !perm.AtLeast(sc.Level, perm.Propose) {
+			return "Bạn không có quyền đổi lịch chạy (gói hiện tại: " + perm.Label(sc.Level) + ")", true
+		}
+		out, err = t.scheduleNextRun(ctx, sc, raw, time.Now())
+	case "staff_load":
+		var d struct{ Days int }
+		_ = json.Unmarshal(raw, &d)
+		out, err = t.staffLoad(ctx, sc, d.Days)
+	case "burn_quest", "burn_quests", "burn_assign":
 		if t.burn == nil {
 			return "Burn chưa bật trên office này", true
 		}
-		if name == "burn_quest" && !perm.AtLeast(sc.Level, perm.Propose) {
+		if name != "burn_quests" && !perm.AtLeast(sc.Level, perm.Propose) {
 			return "Bạn không có quyền giao việc cho Burn (gói hiện tại: " + perm.Label(sc.Level) + ")", true
 		}
 		sc.ProjectID = projectID
-		out, err = t.burn(ctx, sc, name, BurnInput{Title: in.Title, Detail: in.Detail})
+		out, err = t.burn(ctx, sc, name, BurnInput{Title: in.Title, Detail: in.Detail, Item: in.Item, Owner: in.Owner, From: in.From})
 	case "burn_add", "burn_pick", "burn_skip", "burn_done", "burn_fail", "burn_list", "burn_scan_done":
 		if t.burn == nil || !t.burnChat(sc) {
 			return "Các công cụ burn_* chỉ dùng trong hội thoại Burn", true
 		}
 		out, err = t.burn(ctx, sc, name, BurnInput{Title: in.Title, Kind: in.Kind, Detail: in.Detail, Item: in.Item, Summary: in.Summary, Reason: in.Reason, What: in.What, Scanned: in.Scanned, Map: in.CodeMap, Priority: in.Priority, Lessons: in.Lessons, Coverage: in.Coverage})
+	case "pending_requests":
+		if !sc.Admin {
+			return "Chỉ administrator xem được các thẻ chờ duyệt", true
+		}
+		out, err = t.pendingRequests(ctx, sc)
+	case "decide_request":
+		if t.decide == nil || !sc.Admin {
+			return "Chỉ administrator duyệt được thẻ", true
+		}
+		var d struct {
+			Kind, ID string
+			Approve  bool
+		}
+		_ = json.Unmarshal(raw, &d)
+		out, err = t.decide(ctx, sc, d.Kind, d.ID, d.Approve)
 	case "send_file":
 		if t.sendFile == nil || !t.botChat(sc) {
 			return "send_file chỉ dùng trong cuộc chat của bot Discord/Telegram", true
@@ -653,7 +831,7 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 		if t.delegate == nil {
 			return "Không có công cụ giao việc ở đây", true
 		}
-		out, err = t.delegate(ctx, sc, in.Agent, in.Task)
+		out, err = t.delegate(WithBoardTask(ctx, in.TaskID), sc, in.Agent, in.Task, in.Effort)
 	case "propose_automation":
 		if t.actions == nil || !perm.AtLeast(sc.Level, perm.Propose) {
 			return "Bạn không có quyền đề xuất tự động hóa (gói hiện tại: " + perm.Label(sc.Level) + ")", true
@@ -667,7 +845,14 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 			kind, target = "update_automation", id.AutomationID
 		}
 		var a storage.Action
-		if a, err = t.actions.Propose(ctx, sc, kind, target, in.Reason, storage.ActionArgs{Automation: raw}); err == nil {
+		a, err = t.actions.Propose(ctx, sc, kind, target, in.Reason, storage.ActionArgs{Automation: raw})
+		switch {
+		case err != nil:
+		case a.Status == "done": // within its own rights (self.manage) or as administrator
+			out = fmt.Sprintf("Done: %s %q. %s", map[bool]string{true: "updated", false: "created"}[kind == "update_automation"], a.Target, a.Detail)
+		case a.Status == "failed":
+			return fmt.Sprintf("Không lưu được tự động hóa %q: %s", a.Target, a.Detail), true
+		default:
 			out = fmt.Sprintf("Created proposal %q (id %s), waiting for the person's approval. Nothing runs yet; summarize the script/schedule for the person and remind them to approve it.", a.Target, a.ID)
 		}
 	case "send_to_chat":
@@ -695,7 +880,7 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 		}
 		var a storage.Action
 		topic, summary := memory.Clean(in.Topic, in.Summary)
-		if a, err = t.actions.Propose(ctx, sc, "remember", in.Note, in.Reason, storage.ActionArgs{Topic: topic, Summary: summary}); err == nil {
+		if a, err = t.actions.Propose(ctx, sc, "remember", in.Note, in.Reason, storage.ActionArgs{Topic: topic, Summary: summary, Replaces: in.Replaces}); err == nil {
 			if a.Status == "done" {
 				out = "Written to memory notes: " + a.Target
 			} else {
@@ -705,21 +890,45 @@ func (t *Toolbox) Call(ctx context.Context, sc Scope, name string, raw json.RawM
 				out += " (topic " + topic + ")"
 			}
 		}
+	case "forget":
+		if t.actions == nil {
+			return "Không bỏ ghi nhớ được ở đây", true
+		}
+		var a storage.Action
+		if a, err = t.actions.Propose(ctx, sc, "forget", "", in.Reason, storage.ActionArgs{Replaces: in.IDs}); err == nil {
+			if a.Status == "done" {
+				out = "Dropped from your notes: " + a.Target
+			} else {
+				out = "Proposed dropping the notes (id " + a.ID + "), waiting for the person's approval."
+			}
+		}
 	case "recall":
 		var id string
 		if id, err = t.agentID(ctx, projectID, sc.Agent); err == nil {
 			out, err = memory.Recall(ctx, t.store, projectID, id, in.Topic, in.Query)
 		}
+		if err == nil && t.related != nil && strings.TrimSpace(in.Query) != "" {
+			out += t.recallRelated(ctx, projectID, in.Query, out)
+		}
+	case "use_skill", "my_skills":
+		out, err = t.skillCall(ctx, sc, projectID, name, in.Action, in.Name, in.Why, in.Task)
+	case "find_skills":
+		if t.skills == nil {
+			return "Không có thư viện skill ở đây", true
+		}
+		out, err = t.skills.Find(ctx, projectID, in.Query)
 	case "propose_action":
 		if t.actions == nil || !perm.AtLeast(sc.Level, perm.Propose) {
 			return "Bạn không có quyền đề xuất thao tác (gói hiện tại: " + perm.Label(sc.Level) + ")", true
 		}
 		var a storage.Action
 		if a, err = t.actions.Propose(ctx, sc, in.Action, in.Target, in.Reason, storage.ActionArgs{Message: in.Message, Files: in.Files, Branch: in.Branch}); err == nil {
-			switch a.Status {
-			case "done":
+			switch {
+			case a.Args.AfterDiff && a.Status == "pending": // ADR-189
+				out = fmt.Sprintf("Commit %q (%d files, id %s) waits for this turn's changes: once your turn ends and its diff is merged into the project, it runs on its own if your permissions allow, else it waits for the person's approval after the diff. Do not propose it again; report the commit as pending, not done.", a.Target, len(a.Args.Files), a.ID)
+			case a.Status == "done":
 				out = fmt.Sprintf("Did %q for %s on your own, as your permissions allow: %s. Use process_logs/container_logs to see the result.", actions.Kinds[a.Kind], a.Target, a.Detail)
-			case "failed":
+			case a.Status == "failed":
 				out = fmt.Sprintf("Did %q for %s on your own, but it failed: %s", actions.Kinds[a.Kind], a.Target, a.Detail)
 			default:
 				out = fmt.Sprintf("Created proposal %q for %s (id %s), waiting for the person's approval. Nothing has been done yet; tell the person it needs their approval.", actions.Kinds[a.Kind], a.Target, a.ID)
@@ -1006,6 +1215,73 @@ func (t *Toolbox) searchHistory(ctx context.Context, sc Scope, query string, day
 }
 
 // agentID is the id of the project's agent called name (whose notes recall reads).
+// skillCall runs use_skill and my_skills for the agent called agent (ADR-185).
+func (t *Toolbox) skillCall(ctx context.Context, sc Scope, projectID, name, action, skill, why, task string) (string, error) {
+	p, err := t.store.Repos().Get(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	id, err := t.agentID(ctx, projectID, sc.Agent)
+	if err != nil {
+		return "", err
+	}
+	home, _ := os.UserHomeDir()
+	switch {
+	case name == "use_skill":
+		return agentskills.Use(ctx, t.store, home, p.Path, id, skill, task)
+	case action == "add":
+		err := agentskills.Add(ctx, t.store, home, p.Path, id, skill, why, "agent")
+		if errors.Is(err, automation.ErrUnknownSkill) && t.skills != nil && t.actions != nil && t.skills.Has(skill) {
+			return t.proposeSkill(ctx, sc, p.Path, id, skill, why)
+		}
+		if err != nil {
+			return "", err
+		}
+		return "Added " + skill + " to your skills.", nil
+	case action == "remove":
+		if err := agentskills.Remove(ctx, t.store, id, skill); errors.Is(err, storage.ErrNotFound) {
+			return skill + " is not on your skills.", nil
+		} else if err != nil {
+			return "", err
+		}
+		return "Removed " + skill + " from your skills.", nil
+	}
+	return "", errors.New("action phải là add hoặc remove")
+}
+
+// proposeSkill asks the person to install a library skill the project lacks
+// and add it to the agent's skills (ADR-187). A full list refuses first:
+// the agent drops one before asking for another.
+func (t *Toolbox) proposeSkill(ctx context.Context, sc Scope, projectPath, agentID, skill, why string) (string, error) {
+	list, err := t.store.AgentSkills().List(ctx, agentID)
+	if err != nil {
+		return "", err
+	}
+	if len(list) >= agentskills.Limit {
+		return "", agentskills.ErrFull
+	}
+	a, err := t.actions.Propose(ctx, sc, "install_skill", skill, why, storage.ActionArgs{Summary: why})
+	if err != nil {
+		return "", err
+	}
+	if a.Status == "done" {
+		return "Installed " + skill + " in the project and added it to your skills.", nil
+	}
+	return fmt.Sprintf("%s is only in the office library: created proposal %s to install it in the project and add it to your skills, waiting for the person's approval. Tell the person; carry on without it meanwhile.", skill, a.ID), nil
+}
+
+// recallRelated is what recall adds by meaning: a short wait, and nothing
+// when Cognee is down (the keyword answer stands on its own).
+func (t *Toolbox) recallRelated(ctx context.Context, projectID, query, shown string) string {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	lines, err := t.related(ctx, projectID, query, shown, 8)
+	if err != nil || len(lines) == 0 {
+		return ""
+	}
+	return "\nRelated by meaning (notes of all agents of this project):\n- " + strings.Join(lines, "\n- ") + "\n"
+}
+
 func (t *Toolbox) agentID(ctx context.Context, projectID, name string) (string, error) {
 	agents, err := t.store.Agents().List(ctx, projectID)
 	if err != nil {
@@ -1020,7 +1296,9 @@ func (t *Toolbox) agentID(ctx context.Context, projectID, name string) (string, 
 }
 
 // questTool: the Burn tools of any chat (giving the Burn work, reading it back).
-func questTool(name string) bool { return name == "burn_quest" || name == "burn_quests" }
+func questTool(name string) bool {
+	return name == "burn_quest" || name == "burn_quests" || name == "burn_assign"
+}
 
 // burnChat: the run is a Burn's conversation or one of its pieces' work
 // chats, where the burn_* tools work.
@@ -1030,4 +1308,34 @@ func (t *Toolbox) burnChat(sc Scope) bool {
 	}
 	c, err := t.store.Chat().GetConversation(context.Background(), sc.ConversationID)
 	return err == nil && (c.Purpose == "burn" || c.Purpose == "burn_work")
+}
+
+// pendingRequests: the cards waiting for a person in the project (every
+// project for the office assistant), for an administrator to decide (ADR-188).
+func (t *Toolbox) pendingRequests(ctx context.Context, sc Scope) (string, error) {
+	var b strings.Builder
+	acts, err := t.store.Actions().Pending(ctx, 200)
+	if err != nil {
+		return "", err
+	}
+	for _, a := range acts {
+		if sc.Office || a.ProjectID == sc.ProjectID {
+			fmt.Fprintf(&b, "- action %s: %s %s (by %s, chat %s)\n", a.ID, a.Kind, a.Target, a.ProposedBy, a.ConversationID)
+		}
+	}
+	patches, err := t.store.Chat().PendingPatches(ctx, 200)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range patches {
+		c, err := t.store.Chat().GetConversation(ctx, p.ConversationID)
+		if err != nil || (!sc.Office && c.ProjectID != sc.ProjectID) {
+			continue
+		}
+		fmt.Fprintf(&b, "- patch %s: %s (chat %s)\n", p.ID, strings.Join(p.Files, ", "), p.ConversationID)
+	}
+	if b.Len() == 0 {
+		return "Không có thẻ nào chờ duyệt", nil
+	}
+	return b.String(), nil
 }

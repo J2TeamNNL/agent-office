@@ -15,10 +15,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/tung1998/agent-office/internal/actions"
 	"github.com/tung1998/agent-office/internal/audit"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/usage"
+	"github.com/tung1998/agent-office/templates/packs"
 )
 
 // The config registry (ADR-045): every setting an agent (or the office
@@ -88,6 +91,38 @@ func cfgKinds() []cfgKind {
 			create: &cfgRoute{"POST", func(s *server) http.HandlerFunc { return s.createAgent }, byProject},
 			update: &cfgRoute{"PATCH", func(s *server) http.HandlerFunc { return s.updateAgent }, byID},
 			del:    &cfgRoute{"DELETE", func(s *server) http.HandlerFunc { return s.deleteAgent }, byID}},
+		// read only: the office's agent library, where a new agent starts from
+		{name: "agent_library", title: "Thư viện agent", office: true, input: struct{}{},
+			get: func(_ *server, _ context.Context, id, _ string) (any, string, error) {
+				a, err := team.LibraryAgentByID(id)
+				return a, "", err
+			},
+			list: func(_ *server, _ context.Context, _ string) ([]map[string]any, error) {
+				list, err := team.Library()
+				out := []map[string]any{}
+				for _, a := range list {
+					out = append(out, map[string]any{"id": a.ID, "name": a.Name, "category": a.Category, "description": a.Description})
+				}
+				return out, err
+			}},
+		// read only: office's library of project packs (ADR-199), for propose_create_project pack=<ref>
+		{name: "project_pack", title: "Mẫu project (thư viện)", office: true, input: struct{}{},
+			get: func(s *server, ctx context.Context, id, _ string) (any, string, error) {
+				_, e, err := packs.Find(id)
+				if err != nil {
+					return e, "", err
+				}
+				raw, err := packs.Read(e.Ref) // the whole pack: what a project made from it should have (ADR-206)
+				return map[string]any{"pack": e, "content": json.RawMessage(raw)}, "", err
+			},
+			list: func(s *server, ctx context.Context, _ string) ([]map[string]any, error) {
+				list, err := s.packList(ctx)
+				out := []map[string]any{}
+				for _, p := range list {
+					out = append(out, map[string]any{"id": p.Ref, "title": p.Title, "description": p.Description, "root": p.Root})
+				}
+				return out, err
+			}},
 		{name: "collection", title: "Bảng dữ liệu (collection)", input: collectionInput{}, merge: true,
 			get: func(s *server, ctx context.Context, id, _ string) (any, string, error) {
 				c, err := s.cfg.Store.Collections().ByID(ctx, id)
@@ -152,6 +187,7 @@ func cfgKinds() []cfgKind {
 			create: &cfgRoute{"POST", func(s *server) http.HandlerFunc { return s.createWorkflow }, byProject},
 			update: &cfgRoute{"PATCH", func(s *server) http.HandlerFunc { return s.updateWorkflow }, byID},
 			del:    &cfgRoute{"DELETE", func(s *server) http.HandlerFunc { return s.deleteWorkflow }, byID}},
+		burnConfigKind(), // ADR-196
 		{name: "policy", title: "Quyền & lệnh của project", input: perm.Policy{}, merge: true,
 			get: func(s *server, ctx context.Context, _, projectID string) (any, string, error) {
 				return perm.LoadPolicy(ctx, s.cfg.Store, projectID), projectID, nil
@@ -193,7 +229,7 @@ func cfgKinds() []cfgKind {
 
 func (s *server) cfgKind(name string) (cfgKind, error) {
 	for _, k := range cfgKinds() {
-		if k.name == name && (k.name != "process" || s.cfg.Ops != nil) && (k.name != "monitor" || s.cfg.Monitors != nil) && (k.name != "workflow" || s.cfg.Workflows != nil) {
+		if k.name == name && (k.name != "process" || s.cfg.Ops != nil) && (k.name != "monitor" || s.cfg.Monitors != nil) && (k.name != "workflow" || s.cfg.Workflows != nil) && (k.name != "burn" || s.cfg.Burn != nil) {
 			return k, nil
 		}
 	}
@@ -406,6 +442,9 @@ func (s *server) DescribeConfig(kind string) (string, error) {
 			ops = append(ops, op)
 		}
 	}
+	if k.name == "agent_library" {
+		return "Thư viện agent của office (chỉ đọc): list agent_library để tìm, get agent_library <id> để đọc đủ hướng dẫn, quyền, skill. " + fromLibrary, nil
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (%s)\nThao tác: %s\nTrường sửa được:\n", k.title, k.name, strings.Join(ops, ", "))
 	t := reflect.TypeOf(k.input)
@@ -418,11 +457,17 @@ func (s *server) DescribeConfig(kind string) (string, error) {
 		fmt.Fprintf(&b, "- %s: %s\n", name, typeName(f.Type))
 	}
 	b.WriteString("Đổi bằng propose_change (resource, op, id, patch): patch là object JSON chỉ gồm các trường cần đổi; get để xem giá trị hiện tại.")
+	if k.name == "agent" {
+		b.WriteString(" " + fromLibrary)
+	}
 	if k.name == "provider" {
 		b.WriteString(" API key không đưa qua patch: người dùng tự dán trên thẻ duyệt.")
 	}
 	return b.String(), nil
 }
+
+// fromLibrary is how a new agent is made: from the library, tailored.
+const fromLibrary = "Thêm agent mới: tìm trong agent_library trước; có mẫu hợp thì get nó, rồi propose_change agent create từ mẫu đó (instructions, role, model_tier, permissions, skills) sửa theo project hiện tại (AGENTS.md, skill, lệnh, quy ước của repo) và nói rõ là dựa trên mẫu nào. Chỉ viết từ đầu khi thư viện không có mẫu hợp."
 
 // ListConfig lists the settings of a kind in a project.
 func (s *server) ListConfig(ctx context.Context, projectID, kind string) (string, error) {
@@ -526,6 +571,12 @@ func typeName(t reflect.Type) string {
 func (s *server) approver(ctx context.Context, by string) (storage.User, error) {
 	if u, err := s.cfg.Store.Users().GetByEmail(ctx, by); err == nil {
 		return u, nil
+	}
+	if email := actions.PrincipalOf(ctx); email != "" { // an administrator's run, for the admin it acts for (ADR-188)
+		if u, err := s.cfg.Store.Users().GetByEmail(ctx, email); err == nil && u.Role == storage.RoleAdmin && !u.Disabled {
+			return u, nil
+		}
+		return storage.User{}, errors.New("người agent đại diện (người bật quyền administrator, hoặc người của lượt chat) không phải admin đang hoạt động")
 	}
 	if via, _, _ := strings.Cut(by, ":"); via == "discord" || via == "telegram" || via == "bot" {
 		users, err := s.cfg.Store.Users().List(ctx)

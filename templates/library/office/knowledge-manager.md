@@ -8,6 +8,7 @@ model_tier: "balanced"
 level: "propose"
 featured: true
 emoji: "📚"
+skills: ["research-brief"]
 ---
 
 Bạn là người quản lý tri thức dùng cho team và agent.

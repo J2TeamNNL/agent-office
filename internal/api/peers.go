@@ -12,11 +12,14 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tung1998/agent-office/internal/actor"
 	"github.com/tung1998/agent-office/internal/assistant"
+	"github.com/tung1998/agent-office/internal/officetools"
 	"github.com/tung1998/agent-office/internal/peer"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/transfer"
@@ -49,6 +52,9 @@ func (s *server) peerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/peer/projects", s.peerCall(s.peerSetProjects))
 	mux.HandleFunc("GET /api/peer/chats/{id}", s.peerCall(s.peerReadChat))
 	mux.HandleFunc("GET /api/peer/projects/{id}/pack", s.peerCall(s.peerPack))
+	mux.HandleFunc("GET /api/peer/projects/{id}/chats", s.peerCall(s.peerChats))
+	mux.HandleFunc("GET /api/peer/projects/{id}/tools", s.peerCall(s.peerTools))
+	mux.HandleFunc("POST /api/peer/projects/{id}/tools/{name}", s.peerCall(s.peerTool))
 	mux.HandleFunc("POST /api/peer/search", s.peerCall(s.peerSearch))
 	mux.HandleFunc("POST /api/peer/consult", s.peerCall(s.peerConsult))
 	mux.HandleFunc("POST /api/peer/consult/answer", s.peerCall(s.peerConsultAnswer))
@@ -444,7 +450,7 @@ func (s *server) peerProjects(w http.ResponseWriter, r *http.Request, p peer.Pee
 }
 
 // peerPack: the other office takes a pack (.zip) of a project shared with
-// it (ADR-170): config and notes as chosen, chats only those between the two.
+// it (ADR-170): config and notes as chosen, chats only those it may read.
 func (s *server) peerPack(w http.ResponseWriter, r *http.Request, p peer.Peer) {
 	id := r.PathValue("id")
 	if !slices.Contains(p.Shared, id) {
@@ -485,6 +491,95 @@ func (s *server) peerSetProjects(w http.ResponseWriter, r *http.Request, p peer.
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// peerChats: the other office lists the chats of a project shared with it
+// that it may read (ADR-211), the latest first.
+func (s *server) peerChats(w http.ResponseWriter, r *http.Request, p peer.Peer) {
+	id := r.PathValue("id")
+	if s.cfg.Chat == nil || !p.Opens(id, assistant.ID(r.Context(), s.cfg.Store)) {
+		writeError(w, http.StatusForbidden, "project này không mở cho office của bạn")
+		return
+	}
+	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	if days <= 0 {
+		days = 7
+	}
+	since := time.Now().UTC().AddDate(0, 0, -min(days, 365))
+	list, err := s.cfg.Store.Chat().ListConversations(r.Context(), id, 200)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
+	out := []peer.ChatInfo{}
+	for _, c := range list {
+		if len(out) == 50 {
+			break
+		}
+		if c.UpdatedAt.After(since) && s.cfg.Chat.PeerChat(r.Context(), c, p) {
+			out = append(out, peer.ChatInfo{Chat: c.ID, Project: c.ProjectID, Title: c.Title, Agent: c.AgentName, UpdatedAt: c.UpdatedAt})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"chats": out})
+}
+
+// peerScope: the scope the other office's tool calls run in on a project
+// shared with it (ADR-212); false when it is not shared.
+func (s *server) peerScope(r *http.Request, p peer.Peer) (officetools.Scope, bool) {
+	id := r.PathValue("id")
+	if s.cfg.Office == nil || !p.Opens(id, assistant.ID(r.Context(), s.cfg.Store)) {
+		return officetools.Scope{}, false
+	}
+	admin := ""
+	if p.Admin && s.isAdminActor(r.Context(), p.As) {
+		admin = p.As
+	}
+	return officetools.PeerScope(id, p.Name, admin), true
+}
+
+// peerTools: the office tools the other office may call on a project.
+func (s *server) peerTools(w http.ResponseWriter, r *http.Request, p peer.Peer) {
+	sc, ok := s.peerScope(r, p)
+	if !ok {
+		writeError(w, http.StatusForbidden, "project này không mở cho office của bạn")
+		return
+	}
+	out := []peer.RemoteTool{}
+	for _, x := range s.cfg.Office.PeerTools(sc) {
+		out = append(out, peer.RemoteTool{Name: x.Name, Description: x.Description, Schema: x.Schema, ReadOnly: x.ReadOnly})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tools": out, "admin": sc.Admin})
+}
+
+// peerTool: the other office calls one of those tools.
+func (s *server) peerTool(w http.ResponseWriter, r *http.Request, p peer.Peer) {
+	sc, ok := s.peerScope(r, p)
+	if !ok {
+		writeError(w, http.StatusForbidden, "project này không mở cho office của bạn")
+		return
+	}
+	name := r.PathValue("name")
+	if !slices.ContainsFunc(s.cfg.Office.PeerTools(sc), func(x officetools.Tool) bool { return x.Name == name }) {
+		writeError(w, http.StatusForbidden, "tool "+name+" không mở cho office của bạn (xem tools)")
+		return
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256<<10))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if slices.Contains(officetools.PeerAgentTools, name) { // an agent's notes: the agent the call names
+		var in struct {
+			Agent string `json:"agent"`
+		}
+		if json.Unmarshal(raw, &in) != nil || strings.TrimSpace(in.Agent) == "" {
+			writeError(w, http.StatusBadRequest, "thiếu agent")
+			return
+		}
+		sc.Agent = strings.TrimSpace(in.Agent)
+	}
+	text, isErr := s.cfg.Office.Call(actor.With(r.Context(), p.As), sc, name, raw)
+	writeJSON(w, http.StatusOK, peer.ToolResult{Text: text, Error: isErr})
+}
+
 // peerReadChat: the other office reads a chat between the two (read_link).
 func (s *server) peerReadChat(w http.ResponseWriter, r *http.Request, p peer.Peer) {
 	if s.cfg.Chat == nil || s.cfg.Office == nil {
@@ -508,7 +603,7 @@ func (s *server) peerReadChat(w http.ResponseWriter, r *http.Request, p peer.Pee
 }
 
 // peerSearch: the other office searches a project shared with it, only in
-// the chats between the two (search_history).
+// the chats it may read (search_history).
 func (s *server) peerSearch(w http.ResponseWriter, r *http.Request, p peer.Peer) {
 	var q peer.Search
 	if err := json.NewDecoder(r.Body).Decode(&q); err != nil || strings.TrimSpace(q.Query) == "" {
@@ -544,4 +639,14 @@ func (s *server) peerSearch(w http.ResponseWriter, r *http.Request, p peer.Peer)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"hits": hits})
+}
+
+// isAdminActor: who (human:<email>) is still an admin of this office (ADR-074).
+func (s *server) isAdminActor(ctx context.Context, who string) bool {
+	email, ok := strings.CutPrefix(who, "human:")
+	if !ok {
+		return false
+	}
+	u, err := s.cfg.Store.Users().GetByEmail(ctx, email)
+	return err == nil && u.Role == storage.RoleAdmin && !u.Disabled
 }

@@ -75,11 +75,13 @@ export function agentLevel(p: Permissions): PermLevel {
 
 // single capabilities; a package is a preset of them (same list as internal/perm)
 export type PermGroup = 'code' | 'commands' | 'git' | 'ops'
-export interface PermCap { id: string, group: PermGroup, readonly label: string, readonly description: string, min: PermLevel, icon: string }
+export interface PermCap { id: string, group: PermGroup, readonly label: string, readonly description: string, min: PermLevel, icon: string, optIn?: boolean }
 export const permCaps: PermCap[] = [
   { id: 'propose', group: 'code', get label() { return useLang().t('perm.cap.propose.label') }, get description() { return useLang().t('perm.cap.propose.description') }, min: 'propose', icon: 'i-lucide-message-square-diff' },
   { id: 'code.apply', group: 'code', get label() { return useLang().t('perm.cap.codeApply.label') }, get description() { return useLang().t('perm.cap.codeApply.description') }, min: 'edit', icon: 'i-lucide-pencil' },
   { id: 'tools.mcp', group: 'commands', get label() { return useLang().t('perm.cap.toolsMcp.label') }, get description() { return useLang().t('perm.cap.toolsMcp.description') }, min: 'read', icon: 'i-lucide-plug-zap' },
+  { id: 'tools.web', group: 'commands', get label() { return useLang().t('perm.cap.toolsWeb.label') }, get description() { return useLang().t('perm.cap.toolsWeb.description') }, min: 'read', icon: 'i-lucide-globe', optIn: true },
+  { id: 'self.manage', group: 'commands', get label() { return useLang().t('perm.cap.selfManage.label') }, get description() { return useLang().t('perm.cap.selfManage.description') }, min: 'propose', icon: 'i-lucide-calendar-cog', optIn: true },
   { id: 'tools.mcp.write', group: 'commands', get label() { return useLang().t('perm.cap.toolsMcpWrite.label') }, get description() { return useLang().t('perm.cap.toolsMcpWrite.description') }, min: 'operate', icon: 'i-lucide-plug' },
   { id: 'chat.send', group: 'commands', get label() { return useLang().t('perm.cap.chatSend.label') }, get description() { return useLang().t('perm.cap.chatSend.description') }, min: 'operate', icon: 'i-lucide-send' },
   { id: 'chat.cross', group: 'commands', get label() { return useLang().t('perm.cap.chatCross.label') }, get description() { return useLang().t('perm.cap.chatCross.description') }, min: 'operate', icon: 'i-lucide-waypoints' },
@@ -95,7 +97,7 @@ export const permGroups: { id: PermGroup, readonly label: string, icon: string }
   { id: 'git', get label() { return useLang().t('perm.group.git') }, icon: 'i-lucide-git-fork' },
   { id: 'ops', get label() { return useLang().t('perm.group.ops') }, icon: 'i-lucide-server-cog' }
 ]
-export const presetCaps = (l: PermLevel) => permCaps.filter(c => permRank(c.min) <= permRank(l)).map(c => c.id)
+export const presetCaps = (l: PermLevel) => permCaps.filter(c => !c.optIn && permRank(c.min) <= permRank(l)).map(c => c.id)
 export const agentCaps = (p: Permissions) => p.caps ?? presetCaps(agentLevel(p))
 
 export interface CommandPack { id: string, label: string, icon?: string, commands: string[], custom?: boolean }
@@ -162,7 +164,7 @@ export interface Pack {
 export type LibraryCategory = 'code' | 'design' | 'plan' | 'customer' | 'content'
 export interface LibraryEntry {
   id: string // "<set>/<key>"
-  set: 'office' | 'agency'
+  set: 'office' | 'agency' | 'ecc' | 'aitmpl'
   key: string
   name: string
   role: string
@@ -174,6 +176,7 @@ export interface LibraryEntry {
   featured?: boolean
   source?: string
   words: number
+  skills?: string[] // the library skills it keeps at hand once added (ADR-185)
 }
 export interface LibraryAgent extends LibraryEntry {
   instructions: string

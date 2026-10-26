@@ -68,7 +68,7 @@ func (e *Engine) callWorkflow(ctx context.Context, conv storage.Conversation, ag
 	turn.setJobID(job.ID)
 	// the run's chat: the same agent and rights as here, never listed
 	own := storage.Conversation{ProjectID: conv.ProjectID, AgentID: agent.ID, AgentName: agent.Name, CreatedBy: actor.From(ctx), Purpose: RunPurpose,
-		Title: truncate(run.def.Name+": "+oneLine(firstNonEmpty(run.rec.Input, run.def.Name)), 80), Mode: conv.Mode, EditMode: conv.EditMode, Effort: conv.Effort}
+		Title: truncate(run.def.Name+": "+oneLine(firstNonEmpty(run.rec.Input, run.def.Name)), 80), Mode: conv.Mode, EditMode: conv.EditMode}
 	if own, err = e.store.Chat().CreateConversation(ctx, own); err != nil {
 		e.endJob(job.ID, "", err, nil)
 		return fail(err)
@@ -210,7 +210,7 @@ func (e *Engine) StartWorkflow(ctx context.Context, sc officetools.Scope, key, i
 	if _, err := e.Queue(actor.With(ctx, t.actor), conv.ID, workflow.Call(def.Key, input), "", nil, storage.QueuedOptions{}); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Workflow #%s (%s) starts in this chat when your turn ends; its result comes back here. End your turn now with one short line saying you started it; do not do its work yourself.", def.Key, def.Name), nil
+	return fmt.Sprintf("Workflow #%s (%s) starts in this chat when your turn ends; its result comes back here. End your turn now and do not do its work yourself. The chat already shows the \"#%s …\" message that starts it: do not announce it again; write only what else the person needs to know, or nothing.", def.Key, def.Name, def.Key), nil
 }
 
 // startable: the keys of the project's workflows a chat may run.

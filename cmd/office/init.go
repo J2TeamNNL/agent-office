@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/tung1998/agent-office/internal/repos"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/team"
+	"github.com/tung1998/agent-office/internal/transfer"
+	"github.com/tung1998/agent-office/templates/packs"
 )
 
 func initCmd() *cobra.Command {
@@ -23,6 +26,8 @@ func initCmd() *cobra.Command {
 		local  bool
 		agents []string
 		yes    bool
+		from   string
+		tmpl   string
 	)
 	cmd := &cobra.Command{
 		Use:   "init [đường-dẫn]",
@@ -34,7 +39,11 @@ Hai chế độ cài đặt:
   mặc định  dữ liệu ở ~/.agent-office (hoặc .office của project gần nhất), quản lý nhiều project ở bất kỳ đâu`,
 		Example: `  office init                       # thư mục hiện tại, agent Trợ lý
   office init --local
-  office init ~/code/shop --agent office/team-lead --agent office/frontend-dev`,
+  office init ~/code/shop --agent office/team-lead --agent office/frontend-dev
+  office init ~/code/acme                   # thư mục có ` + transfer.RepoPackFile + `: nhập gói (agent, quy trình, lịch, ghi nhớ)
+  office init ~/code/acme --from ~/packs/company.pack.json
+  office init ~/code/acme --template @agentoffice/startup        # công ty mới từ thư viện mẫu (ADR-199)
+  office init ~/code/shop --template @agentoffice/startup/san-pham`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -42,9 +51,25 @@ Hai chế độ cài đặt:
 			if len(args) == 1 {
 				path = args[0]
 			}
+			if tmpl != "" {
+				if err := writeTemplate(ctx, tmpl, path); err != nil {
+					return err
+				}
+			}
 			info, err := repos.Detect(path)
 			if err != nil {
 				return fmt.Errorf("không đọc được thư mục %s: %w", path, err)
+			}
+			// read first: a bad pack leaves nothing behind (ADR-190)
+			packFile, pack := filepath.Join(info.Path, transfer.RepoPackFile), (*transfer.Pack)(nil)
+			if from != "" {
+				p, err := transfer.ReadPackFile(from)
+				if err != nil {
+					return err
+				}
+				packFile, pack = from, &p
+			} else if pack, err = transfer.RepoPack(info.Path); err != nil {
+				return err
 			}
 			for _, id := range agents { // checked first: a wrong id leaves nothing behind
 				if _, err := team.LibraryAgentByID(id); err != nil {
@@ -72,7 +97,8 @@ Hai chế độ cài đặt:
 			}
 
 			repo, err := a.store.Repos().GetByPath(ctx, info.Path)
-			if errors.Is(err, storage.ErrNotFound) {
+			created := errors.Is(err, storage.ErrNotFound)
+			if created {
 				repo, err = a.store.Repos().Create(ctx, storage.Repo{Name: info.Name, Path: info.Path, GitRemote: info.GitRemote, Description: info.Description})
 				if err != nil {
 					return err
@@ -87,6 +113,25 @@ Hai chế độ cài đặt:
 			current, err := a.store.Agents().List(ctx, repo.ID)
 			if err != nil {
 				return err
+			}
+			switch {
+			case pack != nil && len(current) > 0 && from != "":
+				return fmt.Errorf("project %s đã có agent: gói chỉ nhập vào project mới", repo.Name)
+			case pack != nil && len(current) > 0:
+				fmt.Fprintf(os.Stderr, "• Project đã có agent, bỏ qua %s\n", transfer.RepoPackFile)
+			case pack != nil:
+				res, err := newTransfers(a).ImportPack(ctx, *pack, repo, pack.Include)
+				if err != nil {
+					if created { // nothing half made stays behind
+						_ = a.store.Repos().Delete(ctx, repo.ID)
+					}
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "✓ Đã nhập gói %s (%s)\n", packFile, strings.Join(pack.Include, ", "))
+				printChanges(os.Stderr, res.Changes)
+				if current, err = a.store.Agents().List(ctx, repo.ID); err != nil {
+					return err
+				}
 			}
 			ids := agents
 			if len(ids) == 0 && len(current) == 0 {
@@ -127,6 +172,8 @@ Hai chế độ cài đặt:
 	cmd.Flags().BoolVar(&local, "local", false, "lưu dữ liệu trong <project>/.office (chỉ quản lý project này)")
 	cmd.Flags().StringArrayVar(&agents, "agent", nil, "thêm agent từ thư viện theo id, vd office/devops (lặp lại được)")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "tự đồng ý các bước (không hỏi)")
+	cmd.Flags().StringVar(&tmpl, "template", "", "mẫu trong thư viện của office (@agentoffice/<bộ>[/<mẫu>], xem office packs): ghi vào thư mục (tạo thư mục và git repo nếu chưa có) rồi nhập gói của nó (ADR-199)")
+	cmd.Flags().StringVar(&from, "from", "", "nhập gói project (.zip hoặc JSON) vào project mới; mặc định "+transfer.RepoPackFile+" trong thư mục nếu có")
 	return cmd
 }
 
@@ -270,5 +317,34 @@ func firstNonNil(errs ...error) error {
 			return e
 		}
 	}
+	return nil
+}
+
+// writeTemplate puts library pack ref into path (ADR-199): a folder that is
+// not there yet becomes a new git repo with the pack committed; an existing
+// one gets the files, left for the person to commit.
+func writeTemplate(ctx context.Context, ref, path string) error {
+	fresh := false
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			return err
+		}
+		fresh = true
+	}
+	if _, err := os.Stat(filepath.Join(path, ".git")); errors.Is(err, os.ErrNotExist) {
+		if out, err := exec.CommandContext(ctx, "git", "-C", path, "init", "-q", "-b", "main").CombinedOutput(); err != nil {
+			return fmt.Errorf("git init: %s", strings.TrimSpace(string(out)))
+		}
+		fresh = true
+	}
+	files, err := packs.Write(ctx, ref, path, fresh)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ Đã ghi mẫu %s (%d file) vào %s", ref, len(files), path)
+	if !fresh {
+		fmt.Print(": chưa commit, xem rồi commit vào repo của bạn")
+	}
+	fmt.Println()
 	return nil
 }

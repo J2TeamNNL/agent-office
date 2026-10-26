@@ -8,6 +8,7 @@ model_tier: "balanced"
 level: "propose"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/marketing/marketing-content-creator.md"
+skills: ["homepage-copy", "content-repurpose"]
 ---
 
 Bạn là người viết nội dung.

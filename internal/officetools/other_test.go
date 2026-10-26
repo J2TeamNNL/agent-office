@@ -64,3 +64,42 @@ func TestOtherOldOffice(t *testing.T) {
 		t.Fatal("an unlinked project's chat by id")
 	}
 }
+
+// A chat another office handed work to answers back there (a result that
+// came later) with no project of that office shared or linked: only that
+// chat, and not on a report back alone.
+func TestOtherAnswersHandOff(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, _ := sqlite.Open(filepath.Join(dir, "o.db"))
+	defer st.Close()
+	st.Migrate(ctx)
+	box, _ := secrets.Load(filepath.Join(dir, "k"))
+	key, _ := box.Seal("ofp_x")
+	st.Settings().Set(ctx, "peers", []peer.Peer{{ID: "peer_b", Name: "office-b", URL: "https://b.example", OutKeyEnc: key}})
+	p, _ := st.Repos().Create(ctx, storage.Repo{Name: "mine"})
+	conv, _ := st.Chat().CreateConversation(ctx, storage.Conversation{ProjectID: p.ID})
+	box2 := New(st, nil, nil)
+	box2.SetPeers(peer.New(st, box))
+	sc := Scope{ProjectID: p.ID, ConversationID: conv.ID, Level: perm.Operate}
+
+	st.Chat().AddMessage(ctx, storage.Message{ConversationID: conv.ID, Role: "user", Content: "↩ Báo lại",
+		Context: `{"relayed_from":"cnv_report","relayed_from_peer":"peer_b","relayed_from_project_id":"rep_there","relay_report":true}`})
+	if box2.HasOther(ctx, sc, "send") {
+		t.Fatal("a report back alone opened send")
+	}
+	st.Chat().AddMessage(ctx, storage.Message{ConversationID: conv.ID, Role: "user", Content: "làm trang shop",
+		Context: `{"relayed_from":"cnv_there","relayed_from_peer":"peer_b","relayed_from_project_id":"rep_there"}`})
+	if !box2.HasOther(ctx, sc, "send") || !box2.HasOther(ctx, sc, "read_chat") {
+		t.Fatal("the chat that got work has no send back")
+	}
+	_, project, id, _, verify, err := box2.otherChat(ctx, sc, nil, "", "", "https://b.example/projects/rep_there?tab=chat&c=cnv_there")
+	if err != nil || project != "rep_there" || id != "cnv_there" || verify {
+		t.Fatalf("answer back: %q %q %v %v", project, id, verify, err)
+	}
+	for _, chat := range []string{"cnv_report", "cnv_other"} {
+		if _, _, _, _, _, err := box2.otherChat(ctx, sc, nil, "office-b", "", chat); err == nil {
+			t.Fatalf("%s reached with no project", chat)
+		}
+	}
+}

@@ -50,9 +50,13 @@ type Gateway struct {
 	Env []string
 	// StdioIdle stops a stdio server nobody called for this long (0: 10 minutes).
 	StdioIdle time.Duration
+	// MaxResult: a tool result's text longer than this reaches a run cut
+	// (0: DefaultMaxResult, <0: never, ADR-183).
+	MaxResult int
 
 	logins logins
 	pool   pool
+	cuts   cuts
 	logged atomic.Int64 // calls logged, to prune the log now and then
 }
 
@@ -243,6 +247,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
+	size := callSize{in: int64(len(body))}
 	logged := func(status int, errMsg string) {
 		if !isCall {
 			return
@@ -254,10 +259,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				errMsg = "HTTP " + strconv.Itoa(status)
 			}
 		}
-		g.logCall(r.Context(), m, c, callTool, st, errMsg, time.Since(start).Milliseconds(), "")
+		g.logCall(r.Context(), m, c, callTool, st, errMsg, time.Since(start).Milliseconds(), "", size)
 	}
 	if m.Kind == "stdio" {
-		logged(g.serveStdio(w, r, m, body))
+		logged(g.serveStdio(w, r, m, body, c, &size))
 		return
 	}
 	headers, err := OpenMap(g.Box, m.HeadersEnc)
@@ -317,14 +322,20 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "MCP "+name+" từ chối token đã lưu trong office (HTTP "+strconv.Itoa(resp.StatusCode)+"): sửa trên dashboard", http.StatusBadGateway)
 		return
 	}
-	logged(resp.StatusCode, "")
 	for _, h := range passResponse {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt == "text/event-stream" {
+	mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if isCall && resp.StatusCode == http.StatusOK && (mt == "application/json" || mt == "text/event-stream") {
+		size.out, size.cut = g.writeCut(w, resp.Body, mt == "text/event-stream", c, name, callTool)
+		logged(resp.StatusCode, "")
+		return
+	}
+	logged(resp.StatusCode, "")
+	if mt == "text/event-stream" {
 		stream(w, resp.Body)
 		return
 	}

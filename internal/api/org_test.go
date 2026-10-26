@@ -2,6 +2,10 @@ package api_test
 
 import (
 	"context"
+	"fmt"
+	"github.com/tung1998/agent-office/internal/collections"
+	"github.com/tung1998/agent-office/internal/perm"
+	"github.com/tung1998/agent-office/internal/storage"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -291,6 +295,90 @@ func TestNewProjectAPI(t *testing.T) {
 	}
 	if resp, _ := do(t, admin, "POST", e.srv.URL+"/api/projects/new", map[string]any{"idea": "x", "name": "shop", "parent": filepath.Join(parent, "missing")}, nil); resp.StatusCode != 400 {
 		t.Fatalf("missing parent = %d", resp.StatusCode)
+	}
+}
+
+// ADR-199: a new company from the template shipped with office: the repo
+// holds the template, committed; its pack made the project (the CEO alone,
+// ADR-204); the goal given is its first goal.
+func TestNewCompanyAPI(t *testing.T) {
+	e := setup(t)
+	admin := e.client(t)
+	login(t, e, admin, "admin@x.io", "admin-password")
+	parent := t.TempDir()
+	if resp, _ := do(t, admin, "POST", e.srv.URL+"/api/projects/new", map[string]any{"template": "nope", "name": "acme", "parent": parent}, nil); resp.StatusCode != 400 {
+		t.Fatalf("unknown template = %d", resp.StatusCode)
+	}
+	resp, body := do(t, admin, "POST", e.srv.URL+"/api/projects/new", map[string]any{"template": "company", "name": "Acme", "dir": "acme", "parent": parent,
+		"goal": "Doanh thu 1.000 USD/tháng trong 90 ngày"}, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("new company = %d %v", resp.StatusCode, body)
+	}
+	ctx := context.Background()
+	pid := body["project"].(map[string]any)["id"].(string)
+	if _, err := os.Stat(filepath.Join(parent, "acme", ".claude", "skills", "van-hanh", "SKILL.md")); err != nil {
+		t.Fatal("the template is not in the repo")
+	}
+	agents, _ := e.st.Agents().List(ctx, pid)
+	r, _ := e.st.Repos().Get(ctx, pid)
+	if def, ok := storage.DefaultAgent(r, agents); !ok || def.Key != "ceo" || len(agents) != 1 { // ADR-204: it makes the rest
+		t.Fatalf("agents = %d, default %+v", len(agents), def)
+	}
+	goals, n, err := collections.New(e.st).Query(ctx, pid, "goals", collections.Query{})
+	if err != nil || n != 1 || goals[0].Data["request"] != "Doanh thu 1.000 USD/tháng trong 90 ngày" { // ADR-213: the words as given
+		t.Fatalf("goals = %d %+v %v", n, goals, err)
+	}
+	// ADR-209: one message is all it needs: its CEO runs as administrator in
+	// the creating admin's name, and got the goal in a chat at Vận hành
+	ceoA := agents[0]
+	if !ceoA.Permissions.FullAccess || ceoA.Permissions.FullAccessBy != "admin@x.io" {
+		t.Fatalf("ceo permissions = %+v", ceoA.Permissions)
+	}
+	convs, _ := e.st.Chat().ListConversations(ctx, pid, 10)
+	var sent bool
+	for _, c := range convs {
+		msgs, _ := e.st.Chat().ListMessages(ctx, c.ID)
+		sent = sent || c.Mode == perm.Operate && len(msgs) > 0 && msgs[0].Content == "#nhan-viec Doanh thu 1.000 USD/tháng trong 90 ngày" // ADR-213: through its workflow
+	}
+	if !sent {
+		t.Fatalf("the goal never reached the CEO: %+v", convs)
+	}
+	// a unit pack of the library, by name
+	resp, body = do(t, admin, "POST", e.srv.URL+"/api/projects/new", map[string]any{"template": "@agentoffice/startup/cskh", "name": "CSKH", "dir": "cskh", "parent": parent}, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("new unit = %d %v", resp.StatusCode, body)
+	}
+	agents, _ = e.st.Agents().List(ctx, body["project"].(map[string]any)["id"].(string))
+	if len(agents) != 3 {
+		t.Fatalf("unit agents = %d", len(agents))
+	}
+	_, body = do(t, admin, "GET", e.srv.URL+"/api/project-packs", nil, nil)
+	if list, _ := body["packs"].([]any); len(list) < 7 {
+		t.Fatalf("library = %v", body)
+	}
+	// ADR-210: the overview's activity of every project
+	_, body = do(t, admin, "GET", e.srv.URL+"/api/activity", nil, nil)
+	if list, _ := body["projects"].([]any); len(list) < 2 {
+		t.Fatalf("activity = %v", body)
+	}
+	// ADR-206: the project knows its template, and comes back to it
+	ceo, _ := e.st.Agents().Get(ctx, r.DefaultAgentID)
+	if ceo.Key != "ceo" {
+		agentsHQ, _ := e.st.Agents().List(ctx, pid)
+		ceo = agentsHQ[0]
+	}
+	ceo.Instructions = "cũ"
+	e.st.Agents().Update(ctx, ceo)
+	sync := e.srv.URL + "/api/projects/" + pid + "/pack-sync"
+	_, body = do(t, admin, "GET", sync, nil, nil)
+	if body["ref"] != "@agentoffice/startup" || !strings.Contains(fmt.Sprint(body["changes"]), "update") {
+		t.Fatalf("preview = %v", body)
+	}
+	if resp, body = do(t, admin, "POST", sync, map[string]any{"mode": "apply"}, nil); resp.StatusCode != 200 {
+		t.Fatalf("apply = %d %v", resp.StatusCode, body)
+	}
+	if a, _ := e.st.Agents().Get(ctx, ceo.ID); a.Instructions == "cũ" {
+		t.Fatal("the CEO did not come back to the template")
 	}
 }
 

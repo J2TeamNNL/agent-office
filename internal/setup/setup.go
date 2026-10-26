@@ -45,7 +45,9 @@ type AgentPick struct {
 	// Commands narrow the project's command catalog for this agent; ones
 	// outside it are reported in Warnings (Resolve ignores them at run time).
 	Commands *[]string `json:"commands,omitempty"`
-	Reason   string    `json:"reason"`
+	// Skills are the picked skills this agent keeps at hand (ADR-185).
+	Skills []string `json:"skills,omitempty"`
+	Reason string   `json:"reason"`
 }
 
 // Proposal is the model's recommendation.
@@ -172,10 +174,33 @@ func (a *Assistant) Propose(ctx context.Context, projectID, projectName, project
 		*l.picks, w = cleanPicks(l.kind, *l.picks, l.tools)
 		warnings = append(warnings, w...)
 	}
+	cleanAgentSkills(res.Proposal.Agents, res.Proposal.Skills)
 	res.Proposal.QuickChecks, w = cleanQuickChecks(prop.QuickChecks)
 	warnings = append(warnings, w...)
 	res.Plan, res.Problems, res.Warnings = plan, orEmpty(problems), orEmpty(warnings)
 	return res, nil
+}
+
+// maxAgentSkills caps the skills the setup gives one agent.
+const maxAgentSkills = 4
+
+// cleanAgentSkills keeps of each agent's skills those picked for the
+// project (deduped, at most maxAgentSkills).
+func cleanAgentSkills(agents []AgentPick, skills []Pick) {
+	picked := map[string]bool{}
+	for _, p := range skills {
+		picked[p.Name] = true
+	}
+	for i := range agents {
+		var keep []string
+		for _, name := range agents[i].Skills {
+			name = strings.TrimSpace(name)
+			if picked[name] && !slices.Contains(keep, name) && len(keep) < maxAgentSkills {
+				keep = append(keep, name)
+			}
+		}
+		agents[i].Skills = keep
+	}
 }
 
 // Build turns picks into the agents they add next to existing ones, and

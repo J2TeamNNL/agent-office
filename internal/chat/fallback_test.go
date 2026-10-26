@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 // fakeClaude writes a claude CLI that logs each call to log; ok answers
@@ -20,12 +21,12 @@ func fakeClaude(t *testing.T, name string, ok bool) (bin, log string) {
 	if ok {
 		out = `echo '{"type":"result","subtype":"success","is_error":false,"result":"từ ` + name + `","usage":{"input_tokens":3,"output_tokens":2}}'`
 	}
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 case "$*" in auth*) echo '{"loggedIn":true}'; exit 0;; esac
 cat >/dev/null
 echo x >> `+log+`
 `+out+`
-`), 0o755)
+`))
 	return bin, log
 }
 

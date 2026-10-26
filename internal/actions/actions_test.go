@@ -132,6 +132,38 @@ func TestGitActions(t *testing.T) {
 	if a, err := svc.Propose(ctx, wt, "git_branch", "", "nhánh", storage.ActionArgs{Branch: "feat/y"}); err != nil || a.Status != "done" {
 		t.Fatalf("git after the merge = %v %+v", err, a)
 	}
+
+	// ADR-189: a commit asked with the edits waits for their diff, then runs
+	// on the agent's permission; only the diff's files, never another chat's
+	wt.RunRef = "g6"
+	p2, _ := st.Chat().AddPatch(ctx, storage.Patch{ConversationID: conv.ID, Diff: "x", Files: []string{"d.txt"}, Status: "pending", Origin: "worktree"})
+	os.WriteFile(filepath.Join(root, "other.txt"), []byte("another chat\n"), 0o644)
+	a, err = svc.Propose(ctx, wt, "git_commit", "", "lưu", storage.ActionArgs{Message: "feat: d"})
+	if err != nil || a.Status != "pending" || !a.Args.AfterDiff || strings.Join(a.Args.Files, ",") != "d.txt" {
+		t.Fatalf("commit before the merge = %v %+v", err, a)
+	}
+	if q, err := svc.RunDeferred(ctx, wt, a.ID, true); err != nil || q.Status != "queued" {
+		t.Fatalf("behind a waiting diff = %v %+v", err, q)
+	}
+	q, _ := st.Actions().Get(ctx, a.ID) // back to waiting, to run it after the merge below
+	q.Status = "pending"
+	st.Actions().Update(ctx, q)
+	os.WriteFile(filepath.Join(root, "d.txt"), []byte("d\n"), 0o644) // the diff merged
+	st.Chat().DecidePatch(ctx, p2.ID, "applied", "", "human:a", time.Now())
+	if done, err := svc.RunDeferred(ctx, wt, a.ID, false); err != nil || done.Status != "done" {
+		t.Fatalf("after the merge = %v %+v", err, done)
+	}
+	out, _ = exec.Command("git", "-C", root, "log", "--oneline", "-1", "--name-only").Output()
+	if !strings.Contains(string(out), "feat: d") || !strings.Contains(string(out), "d.txt") || strings.Contains(string(out), "other.txt") {
+		t.Fatalf("deferred commit content: %s", out)
+	}
+	// a read-only run: it waits for a person after the diff
+	wt.RunRef, wt.Level, wt.Access = "g7", perm.Propose, at(perm.Propose)
+	st.Chat().AddPatch(ctx, storage.Patch{ConversationID: conv.ID, Diff: "x", Files: []string{"e.txt"}, Status: "pending", Origin: "worktree"})
+	a, _ = svc.Propose(ctx, wt, "git_commit", "", "lưu", storage.ActionArgs{Message: "feat: e"})
+	if left, _ := svc.RunDeferred(ctx, wt, a.ID, false); left.Status != "pending" {
+		t.Fatalf("propose level = %+v", left)
+	}
 }
 
 // at is the preset access of a package.
@@ -192,8 +224,9 @@ func TestRunCommand(t *testing.T) {
 	}
 }
 
-// TestRunCommandRisky: a risky pattern saved to an agent's commands before
-// putPolicy rejected them (or by any other path) must still never auto-run.
+// TestRunCommandRisky: a command that deletes or publishes follows the
+// permissions like any other: in the agent's commands it runs on its own,
+// out of them it waits for a person.
 func TestRunCommandRisky(t *testing.T) {
 	ctx := context.Background()
 	st, _ := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
@@ -202,22 +235,19 @@ func TestRunCommandRisky(t *testing.T) {
 	proj, _ := st.Repos().Create(ctx, storage.Repo{Name: "r", Path: t.TempDir()})
 	svc := New(st, nil)
 	acc := perm.Access{Level: perm.Operate, Caps: []string{perm.CapPropose, perm.CapCommands},
-		Commands: []string{"git push *", "go version *", "git -C *", "git --no-pager *", "git -c *"}}
+		Commands: []string{"rm *", "go version *"}}
 	sc := Scope{ProjectID: proj.ID, RunRef: "r1", Agent: "a", Level: perm.Operate, Access: acc}
 
-	if a, err := svc.Propose(ctx, sc, "run_command", "git push origin main --force", "x"); err != nil || a.Status != "pending" {
-		t.Fatalf("a risky pattern must wait for a person, even with CapCommands: %v %+v", err, a)
-	}
-	// git's global options before the subcommand don't hide a push or reset
-	for i, line := range []string{"git -C . push origin main", "git --no-pager push", "git -c x=y reset --hard"} {
-		sc.RunRef = fmt.Sprintf("g%d", i)
-		if a, err := svc.Propose(ctx, sc, "run_command", line, "x"); err != nil || a.Status != "pending" {
-			t.Fatalf("%q must wait for a person: %v %+v", line, err, a)
-		}
+	if a, err := svc.Propose(ctx, sc, "run_command", "rm -f nothing-here", "x"); err != nil || !strings.HasPrefix(a.DecidedBy, "auto:") {
+		t.Fatalf("an allowed risky command runs on its own: %v %+v", err, a)
 	}
 	sc.RunRef = "r2"
+	if a, err := svc.Propose(ctx, sc, "run_command", "git push origin main", "x"); err != nil || a.Status != "pending" {
+		t.Fatalf("a command out of the agent's list waits for a person: %v %+v", err, a)
+	}
+	sc.RunRef = "r3"
 	if a, err := svc.Propose(ctx, sc, "run_command", "go version", "x"); err != nil || a.Status != "done" {
-		t.Fatalf("a non-risky allowed command still runs on its own: %v %+v", err, a)
+		t.Fatalf("an allowed command runs on its own: %v %+v", err, a)
 	}
 }
 
@@ -226,8 +256,7 @@ type fakeSender struct{}
 func (fakeSender) Relay(ctx context.Context, a storage.Action) (string, string, error) {
 	return "", a.TargetID, nil
 }
-func (fakeSender) Relayed(ctx context.Context, conversationID string) bool    { return false }
-func (fakeSender) RelayLimit(ctx context.Context, conversationID string) bool { return false }
+func (fakeSender) Relayed(ctx context.Context, conversationID string) bool { return false }
 
 // TestCheckSendCrossProject: checkSend must reject a target chat that belongs
 // to a different project than the one the run is in, even when the target is
@@ -469,5 +498,111 @@ func TestCheckSendPeerProject(t *testing.T) {
 	cross := storage.Action{Kind: "send_message", ProjectID: p1.ID, Args: storage.ActionArgs{Project: "rep_shop", Peer: "peer_b"}}
 	if svc.autoAllowed(ctx, cross, perm.Access{Caps: []string{perm.CapChatSend}}) || !svc.autoAllowed(ctx, cross, perm.Access{Caps: []string{perm.CapChatCross}}) {
 		t.Fatal("another office's project runs on its own only with chat.cross")
+	}
+}
+
+// ADR-188: an administrator's run carries out what it proposes, but a push
+// to master/main and a workflow's gate still wait for a person.
+func TestAdminAllowed(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git missing")
+	}
+	ctx := context.Background()
+	st, _ := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
+	defer st.Close()
+	st.Migrate(ctx)
+	root := t.TempDir()
+	gitRun := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatal(string(out))
+		}
+	}
+	gitRun("init", "-q", "-b", "main")
+	gitRun("config", "user.email", "t@x.io")
+	gitRun("config", "user.name", "T")
+	os.WriteFile(filepath.Join(root, "a.txt"), []byte("1\n"), 0o644)
+	gitRun("add", ".")
+	gitRun("commit", "-qm", "init")
+	proj, _ := st.Repos().Create(ctx, storage.Repo{Name: "g", Path: root})
+	svc := New(st, nil)
+
+	for kind, want := range map[string]bool{"config_change": true, "create_automation": true, "data_delete": true, "mcp_call": true, "install_skill": true, "workflow_gate": false} {
+		if got := svc.adminAllowed(ctx, storage.Action{Kind: kind, ProjectID: proj.ID}); got != want {
+			t.Errorf("%s: %v, want %v", kind, got, want)
+		}
+	}
+	push := storage.Action{Kind: "git_push", ProjectID: proj.ID}
+	if svc.adminAllowed(ctx, push) {
+		t.Fatal("a push from main ran without a person")
+	}
+	gitRun("checkout", "-q", "-b", "feat/x")
+	if !svc.adminAllowed(ctx, push) {
+		t.Fatal("a push of a feature branch waited")
+	}
+	gitRun("config", "branch.feat/x.remote", "origin")
+	gitRun("config", "branch.feat/x.merge", "refs/heads/master")
+	gitRun("remote", "add", "origin", t.TempDir())
+	gitRun("update-ref", "refs/remotes/origin/master", "HEAD")
+	if svc.adminAllowed(ctx, push) {
+		t.Fatal("a branch tracking master pushed without a person")
+	}
+	// a git_push proposed by an admin's run on main still waits
+	gitRun("checkout", "-q", "main")
+	a, err := svc.Propose(ctx, Scope{ProjectID: proj.ID, RunRef: "r", Agent: "a", Level: perm.Operate, Access: perm.Admin(perm.Access{}), Admin: true}, "git_push", "", "push", storage.ActionArgs{})
+	if err != nil || a.Status != "pending" {
+		t.Fatalf("push from main: %v %+v", err, a)
+	}
+}
+
+// ADR-196: a Burn run's branch merges on its own for an agent that may
+// commit; any other branch waits for a person.
+func TestMergeBurnBranchOnItsOwn(t *testing.T) {
+	svc := &Service{}
+	acc := perm.Access{Caps: []string{perm.CapCommit}}
+	burnRun := storage.Action{Kind: "git_merge", Args: storage.ActionArgs{Branch: "burn/2026-10-25-0800"}}
+	feature := storage.Action{Kind: "git_merge", Args: storage.ActionArgs{Branch: "feat/x"}}
+	if !svc.autoAllowed(context.Background(), burnRun, acc) {
+		t.Fatal("a reviewed Burn run did not merge on its own")
+	}
+	if svc.autoAllowed(context.Background(), feature, acc) || svc.autoAllowed(context.Background(), burnRun, perm.Access{}) {
+		t.Fatal("merged without a person")
+	}
+}
+
+// ADR-200: an edited automation is turned on or off by enabled (a past
+// automatic turn-off cleared); without it, it stays as it is; a new one with
+// enabled false comes in off.
+func TestAutomationEnabled(t *testing.T) {
+	ctx := context.Background()
+	st, _ := sqlite.Open(filepath.Join(t.TempDir(), "o.db"))
+	defer st.Close()
+	st.Migrate(ctx)
+	proj, _ := st.Repos().Create(ctx, storage.Repo{Name: "p", Path: t.TempDir()})
+	a, _ := st.Automations().Create(ctx, storage.Automation{ProjectID: proj.ID, Name: "Điều phối", Source: "schedule", Action: "chat", Prompt: "x",
+		Config: storage.AutomationConfig{EveryMinutes: 60}, DisabledCode: "failures", Failures: 3})
+	svc := New(st, nil)
+	save := func(kind, spec string) {
+		t.Helper()
+		if err := svc.saveAutomation(ctx, storage.Action{Kind: kind, ProjectID: proj.ID, Args: storage.ActionArgs{Automation: []byte(spec)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := `{"automation_id":"` + a.ID + `","name":"Điều phối","source":"schedule","every_minutes":60,"action":"chat","prompt":"y"%s}`
+	save("update_automation", fmt.Sprintf(spec, ""))
+	if got, _ := st.Automations().Get(ctx, a.ID); got.Enabled || got.Prompt != "y" {
+		t.Fatalf("an edit without enabled turned it on: %+v", got)
+	}
+	save("update_automation", fmt.Sprintf(spec, `,"enabled":true`))
+	if got, _ := st.Automations().Get(ctx, a.ID); !got.Enabled || got.DisabledCode != "" || got.Failures != 0 {
+		t.Fatalf("not turned on: %+v", got)
+	}
+	save("create_automation", `{"name":"Mới","source":"schedule","every_minutes":60,"action":"chat","prompt":"z","enabled":false}`)
+	list, _ := st.Automations().List(ctx, proj.ID)
+	for _, x := range list {
+		if x.Name == "Mới" && x.Enabled {
+			t.Fatal("a new one with enabled false came in on")
+		}
 	}
 }

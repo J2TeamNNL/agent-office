@@ -9,6 +9,7 @@ dashboard/node_modules/
 
 # local build
 bin/
+/office
 
 # Claude Code agent worktrees
 .claude/worktrees/

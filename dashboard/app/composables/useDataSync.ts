@@ -15,6 +15,7 @@ export function requestURL(input: RequestInfo | URL): string {
 // tablesFor: the tables an API path shows ('*' = refresh on anything).
 const routes: [RegExp, string[]][] = [
   [/\/memories/, ['agent_memories']],
+  [/\/agents\/[^/]+\/skills/, ['agent_skills']],
   [/\/support\//, ['support_sources', 'support_tickets', 'support_events', 'records', 'automations']],
   [/\/collections/, ['collections', 'records']],
   [/\/burn\/review-profiles/, ['burn_review_profiles']],

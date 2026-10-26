@@ -60,17 +60,3 @@ func TestProcessMonitor(t *testing.T) {
 		t.Fatalf("monitor of a deleted process: %v", err)
 	}
 }
-
-// A container monitor needs two failures in a row before it is down.
-func TestContainerFlapGuard(t *testing.T) {
-	s, st, p, _ := setup(t)
-	s.ops = nil // no compose: every check fails
-	ctx := context.Background()
-	m, _ := st.Monitors().Create(ctx, storage.Monitor{ProjectID: p.ID, Name: "db", Type: "container", Target: "db", IntervalS: 30, Enabled: true})
-	if m, _ = s.CheckNow(ctx, m.ID); m.Status == "down" || m.Fails != 1 {
-		t.Fatalf("one failure must not flip: %+v", m)
-	}
-	if m, _ = s.CheckNow(ctx, m.ID); m.Status != "down" {
-		t.Fatalf("two failures: %+v", m)
-	}
-}

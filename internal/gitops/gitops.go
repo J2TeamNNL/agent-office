@@ -212,6 +212,42 @@ func CreateBranch(ctx context.Context, root, name string) error {
 	return err
 }
 
+// Merge merges local branch name into the current one with a merge commit
+// (ADR-196): a Burn's run branch reviewed, so the next run starts from it.
+// Staged changes refuse it, a conflict is aborted (nothing left half
+// merged); unstaged changes stay as they are unless git would lose them.
+// It returns the merge commit and how many commits it brought.
+func Merge(ctx context.Context, root, name string) (hash string, commits int, err error) {
+	if err := checkBranch(ctx, root, name); err != nil {
+		return "", 0, err
+	}
+	if _, err := git(ctx, root, "rev-parse", "--verify", "--quiet", "refs/heads/"+name); err != nil {
+		return "", 0, fmt.Errorf("không có nhánh %s", name)
+	}
+	cur := CurrentBranch(ctx, root)
+	if cur == "" || cur == name {
+		return "", 0, errors.New("phải đứng trên một nhánh khác nhánh cần gộp")
+	}
+	defer commitLock(root)()
+	if _, err := git(ctx, root, "diff", "--cached", "--quiet"); err != nil {
+		return "", 0, errors.New("project có thay đổi đã stage: commit hoặc bỏ stage trước khi gộp")
+	}
+	out, err := git(ctx, root, "rev-list", "--count", "HEAD..refs/heads/"+name)
+	if err != nil {
+		return "", 0, err
+	}
+	fmt.Sscan(strings.TrimSpace(out), &commits)
+	if commits == 0 {
+		return "", 0, fmt.Errorf("nhánh %s không có gì mới so với %s", name, cur)
+	}
+	if _, err := git(ctx, root, "merge", "--no-ff", "--no-edit", "-m", "Merge "+name, "refs/heads/"+name); err != nil {
+		git(ctx, root, "merge", "--abort")
+		return "", 0, fmt.Errorf("gộp %s không được (đã hủy, project giữ nguyên): %w", name, err)
+	}
+	hash, err = git(ctx, root, "rev-parse", "--short", "HEAD")
+	return strings.TrimSpace(hash), commits, err
+}
+
 // Branch is a local branch.
 type Branch struct {
 	Name     string `json:"name"`

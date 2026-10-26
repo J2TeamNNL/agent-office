@@ -380,7 +380,11 @@ async function restore(e: Entry) {
       </fieldset>
 
       <!-- long-term notes (ADR-068) -->
-      <AgentMemory v-else-if="tab === 'memory'" :project-id="projectId" :agent-id="agentId" />
+      <div v-else-if="tab === 'memory'" class="space-y-3">
+        <AgentMemory :project-id="projectId" :agent-id="agentId" />
+        <!-- skills at hand (ADR-185) -->
+        <AgentSkills :project-id="projectId" :agent-id="agentId" />
+      </div>
 
       <!-- activity -->
       <UCard v-else-if="tab === 'activity'" :ui="{ body: 'p-0 sm:p-0' }">

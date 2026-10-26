@@ -21,8 +21,10 @@ import (
 	"github.com/tung1998/agent-office/internal/api"
 	"github.com/tung1998/agent-office/internal/assistant"
 	"github.com/tung1998/agent-office/internal/auth"
+	"github.com/tung1998/agent-office/internal/burn"
 	"github.com/tung1998/agent-office/internal/chat"
 	"github.com/tung1998/agent-office/internal/clitools"
+	"github.com/tung1998/agent-office/internal/collections"
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/mcpgateway"
 	"github.com/tung1998/agent-office/internal/mcpserver"
@@ -118,12 +120,14 @@ func setupWithStore(t *testing.T, proxies []netip.Prefix, wrap func(storage.Stor
 	office.SetPeers(peers)
 	transfers := transfer.New(st, provs, org, wfs.Lib)
 	transfers.SetCloneRoot(t.TempDir())
+	transfers.SetCollections(collections.New(st))
+	transfers.SetBurnCheck(burn.CheckSetup)
 	acts.SetProjects(transfers)
 	office.SetProjects(transfers, t.TempDir())
 	h := api.New(api.Config{Peers: peers, Store: st, Auth: svc, AllowedOrigins: []string{"http://localhost:3000"}, TrustedProxies: proxies,
 		Providers: provs, Team: org, Setup: officesetup.New(st, provs, org), Transfer: transfers, Workflows: wfs, Usage: u, CLITools: cliManager(), Chat: chatEng,
 		Trigger: trigger.New(st, idleExec{}), Actions: acts, Office: office, MCP: mcp, Memory: mem, Events: bus, Automation: testAutomation(t, st),
-		Monitors: monitor.New(st, nil, chatEng), Ops: ops.NewManager(st, t.TempDir(), []string{}),
+		Monitors: monitor.New(st, nil, chatEng), Ops: ops.NewManager(st, t.TempDir(), []string{}), Burn: burn.New(st, chatEng, nil),
 		Gateway: &mcpgateway.Gateway{Store: st, Box: box, Auth: mcp.Authorized, Identify: testIdentify(mcp)}})
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)

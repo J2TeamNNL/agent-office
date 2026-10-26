@@ -17,7 +17,7 @@ interface Item {
   id: string, title: string, kind: '' | 'unfinished' | 'upgrade' | 'bug' | 'idea' | 'quest', detail: string, status: string, priority: number,
   branch: string, worktree: string, summary: string, subagents: number, cost_usd: number, updated_at: string,
   reviewed: ReviewStage[], review_note: string, review_conversations: Partial<Record<ReviewStage, string>>,
-  work_conversation_id: string, run_branch: string
+  work_conversation_id: string, run_branch: string, owner?: string
 }
 // what its workers look for (ADR-128): a template, or the person's own prompt
 const templates = ['general', 'ux', 'ideas', 'security', 'performance', 'test', 'docs', 'builder', 'custom'] as const
@@ -190,7 +190,8 @@ const runItems = computed(() => [
 ])
 const shown = computed(() => run.value === 'all'
   ? items.value
-  : items.value.filter(i => run.value === '__none' ? !i.run_branch && i.kind !== 'quest' : i.run_branch === run.value || !finished.includes(i.status)))
+  // a task an agent did outside any run (handed, ADR-210) shows in every run
+  : items.value.filter(i => run.value === '__none' ? !i.run_branch && i.kind !== 'quest' : i.run_branch === run.value || !finished.includes(i.status) || (i.kind === 'quest' && !i.run_branch)))
 
 // a quest: work the person gives, done as given (not a scan)
 const questOpen = ref(false)
@@ -216,7 +217,7 @@ const expanded = ref(new Set<string>())
 function expand(key: string) { expanded.value = new Set([...expanded.value, key]) }
 const columns = computed(() => [
   { key: 'found', label: t('burn.col.found'), statuses: ['found'] },
-  { key: 'doing', label: t('burn.col.doing'), statuses: ['doing', 'review', 'queued'] },
+  { key: 'doing', label: t('burn.col.doing'), statuses: ['doing', 'review', 'queued', 'handed'] }, // handed: an agent has it (delegate, ADR-210)
   { key: 'paused', label: t('burn.col.paused'), statuses: ['paused'] },
   { key: 'done', label: t('burn.col.done'), statuses: ['done'] },
   { key: 'other', label: t('burn.col.other'), statuses: ['failed', 'skipped'] }
@@ -259,6 +260,53 @@ const builderDone = computed(() => builderFeatures.value.filter(f => f.passes).l
 <template>
   <div class="space-y-4">
     <UAlert v-if="loadError" color="error" variant="subtle" icon="i-lucide-triangle-alert" :title="t('common.loadError')" :actions="[{ label: t('common.refresh'), onClick: () => refresh() }]" />
+    <!-- the work board first (ADR-210): the project's tasks; Burn below is how a run of them gets done on its own -->
+    <div class="flex flex-wrap items-center gap-2">
+      <USelect v-model="run" :items="runItems" size="sm" class="w-56 max-w-full" />
+      <UButton size="sm" color="neutral" variant="outline" icon="i-lucide-plus" :label="t('burn.quest.add')" class="ms-auto" @click="questOpen = true" />
+    </div>
+    <!-- side by side on every screen: scrolled across below xl -->
+    <div class="flex snap-x snap-mandatory items-start gap-3 overflow-x-auto pb-2 xl:grid xl:grid-cols-5 xl:overflow-visible xl:pb-0">
+      <div v-for="col in columns" :key="col.key" class="w-[80%] min-w-0 shrink-0 snap-start space-y-2 rounded-xl border border-(--ui-border) p-2 sm:w-[45%] xl:w-auto">
+        <p class="flex items-center gap-2 px-1 text-xs font-medium text-(--ui-text-muted)">
+          {{ col.label }}<UBadge :label="String(col.all.length)" color="neutral" variant="subtle" size="sm" />
+          <span v-if="col.key === 'found' && coverage.total" class="ms-auto tabular-nums text-(--ui-text-dimmed)" :title="t('burn.col.coverage', { n: coverage.done, max: coverage.total })">{{ coverage.done }}/{{ coverage.total }}</span>
+        </p>
+        <LoadingRows v-if="loading" :n="2" :icon="false" />
+        <p v-else-if="!col.items.length" class="px-1 py-2 text-xs text-(--ui-text-dimmed)">—</p>
+        <div v-for="it in col.items" :key="it.id" class="space-y-1.5 rounded-lg bg-(--ui-bg-elevated)/60 p-2.5 text-sm">
+          <div class="flex items-start gap-2">
+            <UIcon v-if="it.status === 'doing'" name="i-lucide-loader-circle" class="mt-0.5 size-4 shrink-0 animate-spin text-(--ui-warning)" />
+            <UIcon v-else-if="it.status === 'handed'" name="i-lucide-user-round-cog" class="mt-0.5 size-4 shrink-0 text-(--ui-warning)" :title="t('burn.handed')" />
+            <UIcon v-else-if="it.status === 'review'" name="i-lucide-scan-eye" class="mt-0.5 size-4 shrink-0 text-(--ui-info)" :title="t('burn.review.waiting')" />
+            <span class="min-w-0 flex-1 font-medium">{{ it.title }}</span>
+            <UBadge v-if="it.kind" :label="t(`burn.kind.${it.kind}`)" :color="kindColor(it.kind)" variant="subtle" size="sm" />
+            <UBadge v-else :label="t('burn.kind.hunting')" color="neutral" variant="subtle" size="sm" />
+          </div>
+          <p v-if="it.summary" class="line-clamp-4 whitespace-pre-line text-xs text-(--ui-text-muted)">{{ it.summary }}</p>
+          <p v-else-if="it.detail" class="line-clamp-3 text-xs text-(--ui-text-muted)">{{ it.detail }}</p>
+          <p v-if="it.review_note" class="flex gap-1 text-xs text-(--ui-text-muted)" :title="it.review_note">
+            <UIcon name="i-lucide-scan-eye" class="mt-0.5 size-3.5 shrink-0" /><span class="line-clamp-2">{{ it.review_note }}</span>
+          </p>
+          <div class="flex flex-wrap items-center gap-x-2 text-xs text-(--ui-text-dimmed)">
+            <span v-if="it.owner" class="inline-flex items-center gap-0.5" :title="t('burn.owner')"><UIcon name="i-lucide-user-round" class="size-3" />{{ it.owner }}</span>
+            <span v-if="it.cost_usd">${{ it.cost_usd.toFixed(2) }}</span>
+            <span v-if="it.subagents">{{ t('burn.subagents', { n: it.subagents }) }}</span>
+            <span v-if="it.status === 'review'" class="text-(--ui-info)">{{ t('burn.review.waiting') }}</span>
+            <span v-else-if="it.reviewed?.length">{{ t('burn.review.passed', { stages: it.reviewed.map(v => t(`burn.review.${v}`)).join(', ') }) }}</span>
+            <span>{{ when(it.updated_at) }}</span>
+          </div>
+          <div class="flex flex-wrap gap-1">
+            <UButton v-if="hasReviews(it)" size="xs" color="neutral" variant="ghost" icon="i-lucide-scan-eye" :label="t('burn.review.view')" @click="openReviews(it)" />
+            <UButton v-if="['found', 'skipped', 'failed'].includes(it.status)" size="xs" color="neutral" variant="outline" icon="i-lucide-arrow-up-to-line" :label="t('burn.first')" :loading="itemActing[it.id] === 'first'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'first'" @click="itemAction(it, 'first')" />
+            <UButton v-if="['found', 'queued', 'paused', 'review'].includes(it.status)" size="xs" color="neutral" variant="ghost" :label="t('burn.skip')" :loading="itemActing[it.id] === 'skip'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'skip'" @click="itemAction(it, 'skip')" />
+            <UButton v-if="it.worktree && ['done', 'failed', 'skipped'].includes(it.status)" size="xs" color="neutral" variant="ghost" icon="i-lucide-trash-2" :label="t('burn.dropWorktree')" :loading="itemActing[it.id] === 'drop-worktree'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'drop-worktree'" @click="itemAction(it, 'drop-worktree')" />
+          </div>
+        </div>
+        <UButton v-if="col.all.length > col.items.length" size="xs" color="neutral" variant="ghost" block :label="t('burn.showMore', { n: col.all.length - col.items.length })" @click="expand(col.key)" />
+      </div>
+    </div>
+
     <UCard :ui="{ body: 'space-y-3 sm:p-4' }">
       <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
         <span class="flex size-9 shrink-0 items-center justify-center rounded-lg" :class="running ? 'bg-(--ui-warning)/15 text-(--ui-warning)' : 'bg-(--ui-bg-elevated) text-(--ui-text-muted)'">
@@ -330,51 +378,6 @@ const builderDone = computed(() => builderFeatures.value.filter(f => f.passes).l
         </li>
       </ul>
     </UCard>
-
-    <!-- the pieces of work, by where they are -->
-    <div class="flex flex-wrap items-center gap-2">
-      <USelect v-model="run" :items="runItems" size="sm" class="w-56 max-w-full" />
-      <UButton size="sm" color="neutral" variant="outline" icon="i-lucide-plus" :label="t('burn.quest.add')" class="ms-auto" @click="questOpen = true" />
-    </div>
-    <!-- side by side on every screen: scrolled across below xl -->
-    <div class="flex snap-x snap-mandatory items-start gap-3 overflow-x-auto pb-2 xl:grid xl:grid-cols-5 xl:overflow-visible xl:pb-0">
-      <div v-for="col in columns" :key="col.key" class="w-[80%] min-w-0 shrink-0 snap-start space-y-2 rounded-xl border border-(--ui-border) p-2 sm:w-[45%] xl:w-auto">
-        <p class="flex items-center gap-2 px-1 text-xs font-medium text-(--ui-text-muted)">
-          {{ col.label }}<UBadge :label="String(col.all.length)" color="neutral" variant="subtle" size="sm" />
-          <span v-if="col.key === 'found' && coverage.total" class="ms-auto tabular-nums text-(--ui-text-dimmed)" :title="t('burn.col.coverage', { n: coverage.done, max: coverage.total })">{{ coverage.done }}/{{ coverage.total }}</span>
-        </p>
-        <LoadingRows v-if="loading" :n="2" :icon="false" />
-        <p v-else-if="!col.items.length" class="px-1 py-2 text-xs text-(--ui-text-dimmed)">—</p>
-        <div v-for="it in col.items" :key="it.id" class="space-y-1.5 rounded-lg bg-(--ui-bg-elevated)/60 p-2.5 text-sm">
-          <div class="flex items-start gap-2">
-            <UIcon v-if="it.status === 'doing'" name="i-lucide-loader-circle" class="mt-0.5 size-4 shrink-0 animate-spin text-(--ui-warning)" />
-            <UIcon v-else-if="it.status === 'review'" name="i-lucide-scan-eye" class="mt-0.5 size-4 shrink-0 text-(--ui-info)" :title="t('burn.review.waiting')" />
-            <span class="min-w-0 flex-1 font-medium">{{ it.title }}</span>
-            <UBadge v-if="it.kind" :label="t(`burn.kind.${it.kind}`)" :color="kindColor(it.kind)" variant="subtle" size="sm" />
-            <UBadge v-else :label="t('burn.kind.hunting')" color="neutral" variant="subtle" size="sm" />
-          </div>
-          <p v-if="it.summary" class="line-clamp-4 whitespace-pre-line text-xs text-(--ui-text-muted)">{{ it.summary }}</p>
-          <p v-else-if="it.detail" class="line-clamp-3 text-xs text-(--ui-text-muted)">{{ it.detail }}</p>
-          <p v-if="it.review_note" class="flex gap-1 text-xs text-(--ui-text-muted)" :title="it.review_note">
-            <UIcon name="i-lucide-scan-eye" class="mt-0.5 size-3.5 shrink-0" /><span class="line-clamp-2">{{ it.review_note }}</span>
-          </p>
-          <div class="flex flex-wrap items-center gap-x-2 text-xs text-(--ui-text-dimmed)">
-            <span v-if="it.cost_usd">${{ it.cost_usd.toFixed(2) }}</span>
-            <span v-if="it.subagents">{{ t('burn.subagents', { n: it.subagents }) }}</span>
-            <span v-if="it.status === 'review'" class="text-(--ui-info)">{{ t('burn.review.waiting') }}</span>
-            <span v-else-if="it.reviewed?.length">{{ t('burn.review.passed', { stages: it.reviewed.map(v => t(`burn.review.${v}`)).join(', ') }) }}</span>
-            <span>{{ when(it.updated_at) }}</span>
-          </div>
-          <div class="flex flex-wrap gap-1">
-            <UButton v-if="hasReviews(it)" size="xs" color="neutral" variant="ghost" icon="i-lucide-scan-eye" :label="t('burn.review.view')" @click="openReviews(it)" />
-            <UButton v-if="['found', 'skipped', 'failed'].includes(it.status)" size="xs" color="neutral" variant="outline" icon="i-lucide-arrow-up-to-line" :label="t('burn.first')" :loading="itemActing[it.id] === 'first'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'first'" @click="itemAction(it, 'first')" />
-            <UButton v-if="['found', 'queued', 'paused', 'review'].includes(it.status)" size="xs" color="neutral" variant="ghost" :label="t('burn.skip')" :loading="itemActing[it.id] === 'skip'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'skip'" @click="itemAction(it, 'skip')" />
-            <UButton v-if="it.worktree && ['done', 'failed', 'skipped'].includes(it.status)" size="xs" color="neutral" variant="ghost" icon="i-lucide-trash-2" :label="t('burn.dropWorktree')" :loading="itemActing[it.id] === 'drop-worktree'" :disabled="!!itemActing[it.id] && itemActing[it.id] !== 'drop-worktree'" @click="itemAction(it, 'drop-worktree')" />
-          </div>
-        </div>
-        <UButton v-if="col.all.length > col.items.length" size="xs" color="neutral" variant="ghost" block :label="t('burn.showMore', { n: col.all.length - col.items.length })" @click="expand(col.key)" />
-      </div>
-    </div>
 
     <!-- settings: one place, in blocks; the plan first (turning it on asks nothing) -->
     <USlideover v-model:open="settingsOpen" :title="t('burn.settingsTitle')" :ui="{ content: 'sm:max-w-xl' }">

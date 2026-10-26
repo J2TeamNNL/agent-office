@@ -202,7 +202,9 @@ func (geminiRunner) run(ctx context.Context, req RunRequest, emit func(Event)) (
 		env = append(env, "GEMINI_CLI_HOME="+home, geminiTokenEnv+"="+req.Office.Token)
 	}
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, bin, args...)
+	runCtx, quiet, stop := watchSilence(ctx)
+	defer stop()
+	cmd := exec.CommandContext(runCtx, bin, args...)
 	ownGroup(cmd)
 	cmd.Dir = req.WorkDir
 	cmd.Env = env
@@ -226,7 +228,7 @@ func (geminiRunner) run(ctx context.Context, req RunRequest, emit func(Event)) (
 	res.Usage.Model = req.Model
 	var answer strings.Builder
 	var failure string
-	sc := bufio.NewScanner(out)
+	sc := bufio.NewScanner(quiet.out(out))
 	sc.Buffer(make([]byte, 1<<20), 16<<20)
 	for sc.Scan() {
 		var ev struct {
@@ -286,6 +288,9 @@ func (geminiRunner) run(ctx context.Context, req RunRequest, emit func(Event)) (
 	werr := cmd.Wait()
 	res.Usage.DurationMS = time.Since(start).Milliseconds()
 	res.Text = strings.TrimSpace(answer.String())
+	if err := quiet.err("Gemini CLI"); err != nil {
+		return res, err
+	}
 	if scanErr != nil {
 		return res, scanErr
 	}

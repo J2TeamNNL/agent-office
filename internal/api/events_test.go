@@ -5,12 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/storage"
 )
 
@@ -149,10 +149,10 @@ func TestEventsFollowTurn(t *testing.T) {
 	login(t, e, admin, "admin@x.io", "admin-password")
 	bin := filepath.Join(t.TempDir(), "claude")
 	result := `{"type":"result","subtype":"success","is_error":false,"result":"xong","session_id":"s1","total_cost_usd":0.01,"usage":{"input_tokens":3,"output_tokens":4}}`
-	os.WriteFile(bin, []byte("#!/bin/sh\ncat >/dev/null\nsleep 1\ncat <<'JSON'\n"+
+	fakebin.Write(bin, []byte("#!/bin/sh\ncat >/dev/null\nsleep 1\ncat <<'JSON'\n"+
 		`{"type":"system","subtype":"init","session_id":"s1"}`+"\n"+
 		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"xong"}}}`+"\n"+
-		result+"\nJSON\n"), 0o755)
+		result+"\nJSON\n"))
 	do(t, admin, "POST", e.srv.URL+"/api/providers", map[string]any{"name": "CC", "kind": "claude_cli", "base_url": bin}, nil)
 	_, body := do(t, admin, "POST", e.srv.URL+"/api/projects", map[string]any{"path": t.TempDir()}, nil)
 	pid := body["project"].(map[string]any)["id"].(string)

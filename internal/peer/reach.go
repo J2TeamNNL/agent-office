@@ -2,6 +2,7 @@ package peer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -86,6 +87,31 @@ func PriorSend(ctx context.Context, st storage.Store, conversationID, peerID, ch
 		}
 	}
 	return storage.Action{}, false
+}
+
+// PriorReceive is the chat in the office peerID that handed work to
+// conversationID (a message it relayed here, not a report back) and that
+// chat's project there: answers to it may go on there; chat "" = any.
+func PriorReceive(ctx context.Context, st storage.Store, conversationID, peerID, chat string) (from, project string, ok bool) {
+	if conversationID == "" || peerID == "" {
+		return "", "", false
+	}
+	msgs, _ := st.Chat().ListMessages(ctx, conversationID)
+	for _, m := range msgs {
+		var info struct {
+			Chat    string `json:"relayed_from"`
+			Project string `json:"relayed_from_project_id"`
+			Peer    string `json:"relayed_from_peer"`
+			Report  bool   `json:"relay_report"`
+		}
+		if m.Role != "user" || json.Unmarshal([]byte(m.Context), &info) != nil {
+			continue
+		}
+		if info.Peer == peerID && info.Chat != "" && !info.Report && (chat == "" || info.Chat == chat) {
+			return info.Chat, info.Project, true
+		}
+	}
+	return "", "", false
 }
 
 // ParseChatLink reads a dashboard link of one of offices: the office, its

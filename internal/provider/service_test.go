@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
@@ -132,7 +133,7 @@ func TestGeminiCLIProvider(t *testing.T) {
 	t.Setenv("GEMINI_CLI_HOME", home)
 	t.Setenv("GEMINI_API_KEY", "")
 	bin := filepath.Join(t.TempDir(), "gemini")
-	os.WriteFile(bin, []byte("#!/bin/sh\necho '0.63.0'\n"), 0o755)
+	fakebin.Write(bin, []byte("#!/bin/sh\necho '0.63.0'\n"))
 	svc.SetBinResolver(func(name string) string {
 		if name == "gemini" {
 			return bin
@@ -160,13 +161,13 @@ func TestAntigravityCLIProvider(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "agy")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 case "$1" in
   --version) echo "1.3.1";;
   models) if [ -f "`+dir+`/in" ]; then echo "Fetching available models..."; echo "gemini-3.8-flash-high"; echo "gemini-3.5-pro (default)"
           else echo "Error: Please sign in to view available models. Launch the CLI without arguments to sign in."; exit 1; fi;;
 esac
-`), 0o755)
+`))
 	svc.SetBinResolver(func(name string) string {
 		if name == "agy" {
 			return bin

@@ -10,6 +10,7 @@ import (
 
 	"github.com/tung1998/agent-office/internal/actor"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/usage"
@@ -20,7 +21,7 @@ import (
 func TestRestartGoesOn(t *testing.T) {
 	tmp := t.TempDir()
 	bin, argsLog := filepath.Join(tmp, "claude"), filepath.Join(tmp, "args")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 echo "$*" >> `+argsLog+`
 cat >/dev/null
 echo '{"type":"system","subtype":"init","session_id":"sess-1"}'
@@ -28,7 +29,7 @@ case "$*" in
 *"--resume sess-1"*) echo '{"type":"result","subtype":"success","is_error":false,"result":"xong phần còn lại","session_id":"sess-1","usage":{"input_tokens":1,"output_tokens":1}}' ;;
 *) sleep 30 ;;
 esac
-`), 0o755)
+`))
 	f := setup(t, func(provs *provider.Service) storage.Provider {
 		p, err := provs.Create(context.Background(), provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 		if err != nil {

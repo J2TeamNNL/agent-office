@@ -138,9 +138,16 @@ func (r *Runner) Tick(ctx context.Context, now time.Time) {
 			continue
 		}
 		_ = r.store.Automations().SetNextRun(ctx, a.ID, &next)
+		woken := a.Config.WakeAt != nil && !now.Before(*a.Config.WakeAt) // a run asked for this one (ADR-202)
+		if woken {
+			_ = r.store.Automations().SetWake(ctx, a.ID, nil)
+		}
 		if n, _ := r.store.Jobs().Active(ctx, "automation", a.ID); n >= a.Parallel() {
 			r.recordSkippedBusy(ctx, a) // leave a trace: this tick was dropped, not silently lost
 			continue                    // as many runs as it may have are still going: none more, none stopped (ADR-082)
+		}
+		if !woken && !HasWork(ctx, r.store, a, now) {
+			continue // nothing in its data to act on: no run, no tokens (ADR-194)
 		}
 		_, _, _ = r.enqueueAt(ctx, now, a, "schedule", "", "", "", false)
 	}

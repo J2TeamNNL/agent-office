@@ -1,13 +1,12 @@
 package api_test
 
 import (
-	"strings"
 	"testing"
 )
 
-// putPolicy must refuse a custom pack command that covers a risky command
-// (delete, push, run-another-command), the same class AllowAlways blocks.
-func TestPutPolicyRejectsRiskyCommands(t *testing.T) {
+// putPolicy saves a custom pack command that deletes or publishes: commands
+// follow the permissions the person sets, risky or not.
+func TestPutPolicyRiskyCommands(t *testing.T) {
 	e := setup(t)
 	admin := e.client(t)
 	login(t, e, admin, "admin@x.io", "admin-password")
@@ -17,15 +16,12 @@ func TestPutPolicyRejectsRiskyCommands(t *testing.T) {
 	for _, pattern := range []string{"git push *", "rm *", "sudo *"} {
 		policy := map[string]any{"packs": []map[string]any{{"label": "Custom", "commands": []string{pattern}}}}
 		resp, b := do(t, admin, "PUT", e.srv.URL+"/api/projects/"+pid+"/policy", policy, nil)
-		if resp.StatusCode != 400 {
-			t.Fatalf("pattern %q must be rejected: %d %v", pattern, resp.StatusCode, b)
-		}
-		if msg, _ := b["error"].(string); !strings.Contains(msg, pattern) {
-			t.Fatalf("error must name the rejected pattern %q: %v", pattern, b)
+		if resp.StatusCode != 200 {
+			t.Fatalf("pattern %q must save: %d %v", pattern, resp.StatusCode, b)
 		}
 	}
 
-	// a non-risky pattern still saves fine
+	// a plain pattern saves too
 	policy := map[string]any{"packs": []map[string]any{{"label": "Custom", "commands": []string{"go test *"}}}}
 	resp, b := do(t, admin, "PUT", e.srv.URL+"/api/projects/"+pid+"/policy", policy, nil)
 	if resp.StatusCode != 200 {

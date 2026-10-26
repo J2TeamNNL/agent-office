@@ -163,11 +163,16 @@ watch([() => current.value?.id, () => current.value?.agent_id, agents, () => mes
 const picked = computed(() => agents.value.find(a => a.id === pick.value))
 // the levels the picked agent's model takes: none, no picker (Antigravity names it in the model)
 const { data: provData } = useLiveFetch<{ providers: Provider[] }>('/api/providers', { lazy: true })
-const pickedEfforts = computed(() => {
+const pickedProvider = computed(() => {
   const ps = provData.value?.providers
-  const p = ps?.find(x => x.id === picked.value?.provider_id) ?? ps?.find(x => x.is_default)
+  return ps?.find(x => x.id === picked.value?.provider_id) ?? ps?.find(x => x.is_default)
+})
+const pickedEfforts = computed(() => {
+  const p = pickedProvider.value
   return effortsFor(p?.kind, picked.value?.llm_model || (picked.value && p?.tier_models[picked.value.model_tier]) || '')
 })
+// its connection failing (signed out, its CLI stuck): said before sending, not after a turn that never ends
+const pickedBroken = computed(() => pickedProvider.value?.enabled && pickedProvider.value.status === 'error' ? pickedProvider.value : null)
 const pickedLevel = computed(() => picked.value ? agentLevel(picked.value.permissions) : 'read')
 const prompt = ref<{ busy: boolean, focus?: () => void } | null>(null)
 
@@ -1138,10 +1143,15 @@ onBeforeUnmount(() => {
               @click="openSkillDraft(d)"
             />
             <ActionCard
-              v-for="a in m.actions ?? []" :key="a.id" :action="a" :project-id="projectId" :stale="staleCards[a.id]"
+              v-for="a in (m.actions ?? []).filter(x => !x.after_diff)" :key="a.id" :action="a" :project-id="projectId" :stale="staleCards[a.id]"
               @updated="(na: ProposedAction) => m.actions = (m.actions ?? []).map(x => x.id === na.id ? { ...na, seq: x.seq } : x)"
             />
             <PatchCard v-for="p in m.patches" :key="p.id" :patch="p" :stale="staleCards[p.id]" @updated="(np: Patch) => onPatchUpdated(m, np)" />
+            <!-- a commit asked with the edits comes after their diff (ADR-189) -->
+            <ActionCard
+              v-for="a in (m.actions ?? []).filter(x => x.after_diff)" :key="a.id" :action="a" :project-id="projectId" :stale="staleCards[a.id]"
+              @updated="(na: ProposedAction) => m.actions = (m.actions ?? []).map(x => x.id === na.id ? { ...na, seq: x.seq } : x)"
+            />
           </div>
         </template>
         <WorkflowRunCard v-for="r in runsAt.after" :key="r.id" :run="r" @updated="onRunUpdated" />
@@ -1207,6 +1217,10 @@ onBeforeUnmount(() => {
           : '@max-sm/chat:hidden')]"
         @submit.prevent="send"
       >
+        <NuxtLink v-if="pickedBroken" to="/providers" class="mb-1.5 flex items-center gap-1.5 px-1 text-xs text-(--ui-error) hover:underline" :title="pickedBroken.status_detail">
+          <UIcon name="i-lucide-plug-zap" class="size-3.5 shrink-0" />
+          <span class="truncate">{{ t('chat.providerBroken', { name: pickedBroken.name, detail: pickedBroken.status_detail }) }}</span>
+        </NuxtLink>
         <PromptInput
           ref="prompt" v-model="draft" v-model:attachments="draftFiles" :project-id="projectId"
           :placeholder="picked ? t('chat.placeholderWithAgent', { agent: picked.name }) : t('chat.placeholderNoAgent')"

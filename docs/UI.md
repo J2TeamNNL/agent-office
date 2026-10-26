@@ -12,7 +12,7 @@ Dự án thật (`dashboard/app/pages/`) là projects-based, không phải sơ �
 | `/projects` | Danh sách project | Project đang quản lý (ADR-017: có thư mục, clone git, hoặc không thư mục — toàn máy) | Thêm project (chọn gói khởi tạo — ADR-099) |
 | `/projects/:id?tab=…` | Project | Thanh tiêu đề gọn (menu `⋯` sửa tên/mô tả, thiết lập AI), 1 dòng thông tin (đường dẫn · git · mô tả rút gọn). Tab: **Chat**, **Tự động hoá** (lịch/webhook/bot), **Vận hành** (Tiến trình · Container, mỗi dòng có giám sát riêng — ADR-162), **Agent** (danh sách agent, agent mặc định, tạm dừng, lịch sử, xuất, áp gói — ADR-099), **Quy trình** (cài từ thư viện, gán vai, bật/tắt, sửa — ADR-098; mục Lần chạy — ADR-101), **Quyền** (lệnh, file cấm sửa, project liên kết — ADR-155); chỉ admin thấy thêm: **Files**, **Skill**, **MCP**, **Burn**, **Nhật ký sửa**; và **Thông tin** (budget, git, mô tả, **Tính năng**: gói Lập trình và tính năng con — ADR-161). Tính năng tắt thì ẩn tab/mục của nó (Vận hành khi tắt `ops`, GitBar khi tắt `git`) | tuỳ tab |
 | `/projects/:id/setup` | Thiết lập AI | Quét project, đọc agent có sẵn, đề xuất gói khởi tạo + tinh chỉnh agent (ADR-018) | Tạo / Chỉnh / Hủy |
-| `/projects/:id/agents/:agentId` | Agent | Số liệu (lượt chạy, chi phí, tỉ lệ lỗi theo ngày/model), việc + chat gần đây, lịch sử sửa cấu hình (khôi phục được) | Sửa cấu hình, từng thẻ tự lưu |
+| `/projects/:id/agents/:agentId` | Agent | Số liệu (lượt chạy, chi phí, tỉ lệ lỗi theo ngày/model), việc + chat gần đây, lịch sử sửa cấu hình (khôi phục được); tab Trí nhớ có sổ ghi nhớ và **Skill hay dùng** (nguồn, số lần dùng, lần gần nhất; admin thêm/bỏ, tối đa 12, ADR-185) | Sửa cấu hình, từng thẻ tự lưu |
 | `/projects/:id/automations/new`, `/automations/:aid`, `/automations/:aid/edit` | Tự động hoá | Tạo/sửa 1 automation (lịch, webhook, điều kiện, script hoặc chat); xem 1 cái: trạng thái, bật/tắt, Việc đã chạy | Chạy thử, sửa, xoá, copy URL webhook |
 | `/projects/:id/bots/new`, `/bots/:bid`, `/bots/:bid/edit` | Bot (Discord/Telegram) | Kết nối bot (ADR-049), trạng thái, thiết lập chung của các lệnh và kiểu trả lời (ADR-097), danh sách lệnh (mỗi lệnh là 1 automation riêng; Nâng cao → thiết lập riêng), Việc đã chạy | Kết nối/ngắt, thêm/sửa lệnh |
 | `/projects/:id/skills/edit?name=&scope=` | Soạn skill | Soạn skill của project hoặc riêng máy (`?scope=user`) bằng chat có theo dõi (ADR-062) | Lưu |
@@ -20,7 +20,7 @@ Dự án thật (`dashboard/app/pages/`) là projects-based, không phải sơ �
 | `/workflows` (admin) | Thư viện quy trình | Quy trình dùng chung (có sẵn, đã sửa, tự tạo), lỗi nếu file sai (ADR-098) | Tạo / Sửa / Khôi phục / Xoá |
 | `/projects/:id/workflows/runs/:runId` | Lần chạy quy trình | Chat đã gọi, đầu vào, đầu ra, vai/cổng/chi phí, nội dung (chat riêng của lần chạy, chỉ xem) — ADR-101 | Dừng, duyệt cổng |
 | `/projects/:id/burn/reviews` | Hồ sơ review của Burn (admin) | Danh sách hồ sơ; mỗi hồ sơ: tên, từng bước (vấn đề, cách làm, kết quả) bật/tắt kèm agent và quy trình review riêng — ADR-113 | Tạo, lưu, xóa |
-| `/workflows/edit?key=`, `/projects/:id/workflows/edit?w=` | Soạn quy trình | Canvas kéo thả (bước, agent, quy trình con; form điền phần thiếu, Đầu vào/Đầu ra — ADR-108), văn bản, và chat (`purpose=workflow`, nút ở góc mở khung bên phải như chat hỗ trợ, không chặn thao tác trên canvas; tab văn bản trên desktop thì chat mở sẵn, chia đôi màn hình); ba cách cùng sửa một file | Lưu |
+| `/workflows/edit?key=`, `/projects/:id/workflows/edit?w=` | Soạn quy trình | Canvas kéo thả (bước, agent, quy trình con; form điền phần thiếu, Đầu vào/Đầu ra — ADR-108; bước agent có ô Skill — ADR-186), văn bản, và chat (`purpose=workflow`, nút ở góc mở khung bên phải như chat hỗ trợ, không chặn thao tác trên canvas; tab văn bản trên desktop thì chat mở sẵn, chia đôi màn hình); ba cách cùng sửa một file | Lưu |
 | `/jobs` | Job | Mọi lượt chạy (chat, Việc, automation) của mọi project: trạng thái, lọc theo project, lỗi 24h, chi phí 24h | |
 | `/agents` | Thư viện agent | Duyệt mẫu agent (lọc mảng, tìm, xem hướng dẫn; ✕ hoặc bấm lại thẻ để đóng); admin chọn project rồi **Thêm vào project** (mở tab Agent với form điền sẵn) | Thêm vào project |
 | `/providers` | Kết nối AI | Danh sách kết nối (Anthropic, OpenAI, API tương thích, CLI…), gửi thử, thống kê theo kết nối | Thêm / Sửa / Xoá / Đặt mặc định |
@@ -78,6 +78,9 @@ Base `/api`. Auth bằng cookie phiên `office_session` sau khi đăng nhập t�
 | GET | `/api/org-models/:id/export` | đăng nhập | JSON Template |
 | POST | `/api/org-models/:id/agents` | admin | Thêm agent |
 | PATCH/DELETE | `/api/agents/:id` | admin | Sửa/xóa agent; lỗi cấu trúc trả `problems[]` |
+| POST | `/api/projects/:id/agents` | admin | Tạo agent; `skills[]` (mẫu thư viện): cài skill project chưa có từ thư viện office rồi gắn cho agent (ADR-186) |
+| GET/POST | `/api/projects/:id/agents/:aid/skills` | đăng nhập/admin | Skill hay dùng của agent `{items, limit}` / thêm `{name, why}`; 400 khi đầy hoặc project không có skill (ADR-185) |
+| DELETE | `/api/projects/:id/agents/:aid/skills/:name` | admin | Bỏ skill khỏi danh sách của agent |
 | GET/POST | `/api/projects` | đăng nhập/admin | `{path?, name?, template_id?}`; bỏ trống path = helper toàn máy (bắt buộc name) |
 | GET/PATCH/DELETE | `/api/projects/:id` | đăng nhập/admin | Xóa chỉ bỏ quản lý, không đụng file |
 | POST | `/api/projects/:id/model` | admin | `{template_id, replace}` |
@@ -98,6 +101,7 @@ Base `/api`. Auth bằng cookie phiên `office_session` sau khi đăng nhập t�
 | POST | `/api/patches/:id/approve` \| `/reject` | admin | Áp diff bằng git apply / từ chối |
 | GET | `/api/cli-tools[/:id]` | admin | Claude Code / Codex: đã cài, version, đăng nhập, cách cài |
 | POST | `/api/cli-tools/:id/install` | admin | `{method}`: native \| brew \| npm |
+| POST | `/api/cli-tools/:id/update` | admin | Cập nhật lên bản mới nhất theo cách đã cài (`update_command` trong trạng thái) |
 | POST | `/api/cli-tools/:id/login` | admin | Bắt đầu đăng nhập |
 | GET | `/api/cli-jobs/:id` | admin | Output, link, mã thiết bị, trạng thái |
 | POST | `/api/cli-jobs/:id/input` \| `/cancel` | admin | Gửi mã / hủy |

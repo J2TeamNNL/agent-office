@@ -1,12 +1,12 @@
 <script setup lang="ts">
-// Installs and signs in a local AI CLI (Claude Code, Codex, Gemini CLI, Antigravity CLI) through the office
+// Installs, updates and signs in a local AI CLI (Claude Code, Codex, Gemini CLI, Antigravity CLI) through the office
 // server, which runs on the same machine. Emits `ready` once usable. Once
 // signed in it shows the account with Sign in again / Sign out: a session the
 // server revoked can still read signed in to the CLI.
 interface Method { id: string, label: string, command: string, requires: string, available: boolean, recommended: boolean }
 interface JobView {
   id: string
-  action: 'install' | 'login'
+  action: 'install' | 'update' | 'login'
   command: string
   state: 'running' | 'succeeded' | 'failed' | 'cancelled'
   output: string
@@ -21,6 +21,7 @@ interface ToolStatus {
   docs_url: string
   login_command: string
   logout_command: string
+  update_command?: string
   installed: boolean
   version?: string
   auth: { logged_in: boolean, account?: string, detail?: string }
@@ -79,6 +80,12 @@ function follow(j: JobView) {
       if (job.value.state === 'succeeded' && job.value.action === 'install') {
         toast.add({ id: `cli-${j.id}`, title: t('cli.installed', { name: status.value?.name ?? '' }), color: 'success' })
       }
+      if (job.value.action === 'update') {
+        const name = status.value?.name ?? ''
+        toast.add(job.value.state === 'succeeded'
+          ? { id: `cli-${j.id}`, title: t('cli.updated', { name }), description: status.value?.version, color: 'success' }
+          : { id: `cli-${j.id}`, title: t('cli.updateFailed', { name }), description: job.value.error || job.value.output.slice(-300), color: 'error' })
+      }
       if (job.value.action === 'login' && status.value?.auth.logged_in) {
         toast.add({ id: `cli-${j.id}`, title: t('cli.loggedIn', { name: status.value?.name ?? '' }), description: status.value.auth.account, color: 'success' })
       }
@@ -87,7 +94,7 @@ function follow(j: JobView) {
   tick()
 }
 
-async function start(action: 'install' | 'login') {
+async function start(action: 'install' | 'update' | 'login') {
   try {
     const body = action === 'install' ? { method: method.value } : {}
     follow(await $fetch<JobView>(`/api/cli-tools/${props.tool}/${action}`, { method: 'POST', body, query: query.value }))
@@ -163,6 +170,10 @@ onBeforeUnmount(() => clearTimeout(timer))
     <span class="min-w-0 flex-1 basis-40 truncate">
       {{ t('cli.loggedIn', { name: status.name }) }}<span v-if="status.auth.account" class="text-(--ui-text-muted)"> · {{ status.auth.account }}</span>
     </span>
+    <UButton
+      v-if="status.update_command" size="xs" color="neutral" variant="ghost" icon="i-lucide-circle-arrow-up"
+      :label="t('cli.update')" :title="`${status.version ?? ''} · ${status.update_command}`" @click="start('update')"
+    />
     <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-refresh-cw" :label="t('cli.relogin')" @click="relogin" />
     <UButton size="xs" color="neutral" variant="ghost" icon="i-lucide-log-out" :label="t('cli.logout')" @click="confirmLogout" />
   </div>
@@ -223,7 +234,7 @@ onBeforeUnmount(() => clearTimeout(timer))
       <div class="flex items-center gap-2">
         <template v-if="running">
           <UIcon name="i-lucide-loader-circle" class="size-4 animate-spin text-(--ui-text-muted)" />
-          <span class="text-xs text-(--ui-text-muted)">{{ job.action === 'install' ? t('cli.installing') : t('cli.waitingLogin') }}</span>
+          <span class="text-xs text-(--ui-text-muted)">{{ job.action === 'install' ? t('cli.installing') : job.action === 'update' ? t('cli.updating') : t('cli.waitingLogin') }}</span>
           <UButton :label="t('cli.cancel')" size="xs" color="neutral" variant="ghost" class="ms-auto" @click="cancel" />
         </template>
         <span v-else class="text-xs text-(--ui-error)">{{ t('cli.failed', { detail: job.error ? `: ${job.error}` : '' }) }}</span>

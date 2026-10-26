@@ -25,8 +25,11 @@ import (
 const (
 	keepLines   = 3000
 	maxLogBytes = 5 << 20
-	stopGrace   = 8 * time.Second
 )
+
+// stopGrace is how long Stop waits after SIGTERM before SIGKILL (a var so the
+// test does not wait it out).
+var stopGrace = 8 * time.Second
 
 var (
 	ErrRunning  = errors.New("tiến trình đang chạy")

@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 func write(t *testing.T, p, s string) {
@@ -206,11 +208,11 @@ func TestSeedBuiltinSkillsDoesNotOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 5 {
-		t.Fatalf("seeded %d skills, want 5", n)
+	if n != 10 {
+		t.Fatalf("seeded %d skills, want 10", n)
 	}
 	items, err := l.List("skill")
-	if err != nil || len(items) != 5 {
+	if err != nil || len(items) != 10 {
 		t.Fatalf("library skills: %d, %v", len(items), err)
 	}
 	custom := filepath.Join(dir, "skills", "research-brief", "SKILL.md")
@@ -457,7 +459,7 @@ func fakeClaude(t *testing.T, logPath string, failAddOnce bool) string {
 		script += "if [ \"$1\" = mcp ] && [ \"$2\" = add-json ] && [ ! -f " + marker + " ]; then touch " + marker + "; exit 1; fi\n"
 	}
 	script += "exit 0\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+	if err := fakebin.Write(bin, []byte(script)); err != nil {
 		t.Fatal(err)
 	}
 	return bin

@@ -176,7 +176,7 @@ func (s *server) listWorkflows(w http.ResponseWriter, r *http.Request) {
 }
 
 type workflowInput struct {
-	Key      string            `json:"key"`    // create: the library workflow to copy ("" = Source)
+	Key      string            `json:"key"`    // create: the library workflow to copy, when there is no Source
 	Source   *string           `json:"source"` // the whole file
 	Bindings map[string]string `json:"bindings"`
 	Enabled  *bool             `json:"enabled"`
@@ -220,11 +220,11 @@ func (s *server) createWorkflow(w http.ResponseWriter, r *http.Request) {
 		x   storage.Workflow
 		err error
 	)
-	switch {
-	case in.Key != "":
-		x, err = s.cfg.Workflows.InstallEnabled(r.Context(), pid, in.Key, in.Bindings, enabled)
+	switch { // a source is the whole file: it wins over a key (its own key is inside)
 	case in.Source != nil:
 		x, err = s.cfg.Workflows.CreateEnabled(r.Context(), pid, *in.Source, in.Bindings, enabled)
+	case in.Key != "":
+		x, err = s.cfg.Workflows.InstallEnabled(r.Context(), pid, in.Key, in.Bindings, enabled)
 	default:
 		writeError(w, http.StatusBadRequest, "cần key (quy trình trong thư viện) hoặc source")
 		return

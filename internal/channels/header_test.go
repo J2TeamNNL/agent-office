@@ -15,6 +15,7 @@ import (
 	"github.com/tung1998/agent-office/internal/attach"
 	"github.com/tung1998/agent-office/internal/channels"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
@@ -376,11 +377,11 @@ func TestFilesToTheAgent(t *testing.T) {
 	provs.SetUsage(u)
 	org := team.NewService(st, nil)
 	bin := filepath.Join(tmp, "claude")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat >/dev/null
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"đã xem ảnh","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
 	org.AddFromLibrary(ctx, project.ID, team.StarterAgent)
@@ -611,7 +612,7 @@ func (d *alwaysDecider) DecideAlways(ctx context.Context, id, by string) (string
 }
 
 // A command that may be allowed for good has a "♾️ Luôn cho phép" button;
-// a risky one has none, and its command is refused.
+// a wrapper (sudo, bash…) has none, and its command is refused.
 func TestAlwaysButton(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
@@ -638,7 +639,7 @@ func TestAlwaysButton(t *testing.T) {
 	}
 	conv, _ := engine.StartConversationPurpose(ctx, project.ID, "", "channel")
 	sw, _ := st.Actions().Create(ctx, storage.Action{ProjectID: project.ID, ConversationID: conv.ID, Kind: "run_command", Target: "git switch main", Status: "pending"})
-	rm, _ := st.Actions().Create(ctx, storage.Action{ProjectID: project.ID, ConversationID: conv.ID, Kind: "run_command", Target: "rm -rf dist", Status: "pending"})
+	rm, _ := st.Actions().Create(ctx, storage.Action{ProjectID: project.ID, ConversationID: conv.ID, Kind: "run_command", Target: "sudo rm -rf dist", Status: "pending"})
 	payload, _ := json.Marshal(trigger.ChannelPayload{ChannelID: ch.ID, ChatID: "42", ConversationID: conv.ID})
 	m.Reply(ctx, storage.Job{ID: "job_1", Payload: string(payload)}, "Xong", nil, true)
 	var rows [][]channels.Button
@@ -1016,11 +1017,11 @@ func TestAdminAndUsers(t *testing.T) {
 	u := usage.New(st, time.UTC)
 	org := team.NewService(st, nil)
 	bin := filepath.Join(tmp, "claude")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat >/dev/null
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: t.TempDir()})
 	org.AddFromLibrary(ctx, project.ID, team.StarterAgent)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/tung1998/agent-office/internal/channels"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/provider"
 	"github.com/tung1998/agent-office/internal/secrets"
@@ -125,14 +126,14 @@ func TestManagerRules(t *testing.T) {
 	bin := filepath.Join(tmp, "claude")
 	// the filter call gets "YES/NO" questions; an answer otherwise
 	argsLog := filepath.Join(tmp, "args.log")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 in=$(cat)
 printf '%s\nSTDIN:%s\n===\n' "$*" "$in" >> `+argsLog+`
 out="đơn 123 đang giao"
 case "$in" in *"YES or NO"*) out=NO; case "$in" in *"đơn hàng"*"đơn 123"*) out=YES;; esac;; esac
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"'"$out"'","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 	dir := t.TempDir()
 	project, _ := st.Repos().Create(ctx, storage.Repo{Name: "shop", Path: dir})

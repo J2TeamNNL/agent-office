@@ -3,7 +3,18 @@
 # (no sudo), then builds bin/office and the dashboard.
 #   scripts/install.sh          check, install, build
 #   scripts/install.sh --run    … then start the office
+#   scripts/install.sh --with-cognee   … and run Cognee in Docker (ADR-195):
+#                               recall finds the agents' notes by meaning
 set -euo pipefail
+
+RUN=0 COGNEE=0
+for a in "$@"; do
+  case "$a" in
+    --run) RUN=1 ;;
+    --with-cognee) COGNEE=1 ;;
+    *) printf 'unknown option: %s\n' "$a" >&2; exit 2 ;;
+  esac
+done
 
 cd "$(dirname "$0")/.."
 PREFIX="${AGENT_OFFICE_TOOLS:-$HOME/.local}"
@@ -109,7 +120,20 @@ if [ ${#ADDED_PATHS[@]} -gt 0 ]; then
   done
 fi
 
+# --- Cognee (optional) ------------------------------------------------------
+# Without an LLM key Cognee loads a local model that needs about 2 GB of RAM:
+# Docker (its VM on macOS) wants 8 GB or more.
+if [ "$COGNEE" = 1 ]; then
+  have docker && docker info >/dev/null 2>&1 || die "--with-cognee needs Docker running (Docker Desktop, colima, or docker on Linux)"
+  mem_gb=$(( $(docker info --format '{{.MemTotal}}') / 1024 / 1024 / 1024 ))
+  if [ "$mem_gb" -lt 8 ]; then
+    say "Docker has ${mem_gb} GB of RAM: Cognee may run out of memory (colima: colima start --memory 10)"
+  fi
+  say "Starting Cognee in Docker (first run downloads the image and models, a few minutes)"
+  ./bin/office cognee up
+fi
+
 say "Done. Start the office: ./bin/office run  →  http://localhost:2704 (admin / admin)"
-if [ "${1:-}" = "--run" ]; then
+if [ "$RUN" = 1 ]; then
   exec ./bin/office run
 fi

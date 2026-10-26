@@ -1,14 +1,22 @@
 package api
 
 import (
+	"cmp"
+	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"os"
+	"slices"
 	"strings"
 
+	"github.com/tung1998/agent-office/internal/agentskills"
+	"github.com/tung1998/agent-office/internal/automation"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/scan"
 	"github.com/tung1998/agent-office/internal/setup"
 	"github.com/tung1998/agent-office/internal/storage"
+	"github.com/tung1998/agent-office/internal/team"
 	"github.com/tung1998/agent-office/internal/usage"
 )
 
@@ -143,6 +151,7 @@ func (s *server) setupApply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ready := append(s.setupExtras(r, x, in), s.readiness(r.Context(), x.ID)...)
+	s.setupAgentSkills(r.Context(), x, in.Agents)
 	ids := make([]string, 0, len(in.Agents))
 	for _, a := range in.Agents {
 		ids = append(ids, a.ID)
@@ -151,4 +160,37 @@ func (s *server) setupApply(w http.ResponseWriter, r *http.Request) {
 		"skills": in.Skills, "mcp": in.MCP})
 	d, _ := s.repoDTO(r, x, true)
 	writeJSON(w, http.StatusOK, map[string]any{"project": d, "ready": ready})
+}
+
+// setupAgentSkills gives the agents just added the skills the setup picked
+// for each (ADR-185); a skill the project does not have is left out.
+func (s *server) setupAgentSkills(ctx context.Context, x storage.Repo, picks []setup.AgentPick) {
+	agents, err := s.cfg.Store.Agents().List(ctx, x.ID)
+	if err != nil {
+		return
+	}
+	home, _ := os.UserHomeDir()
+	for _, p := range picks {
+		lib, err := team.LibraryAgentByID(strings.TrimSpace(p.ID))
+		if err != nil {
+			continue
+		}
+		key := cmp.Or(strings.TrimSpace(p.Key), lib.Key)
+		// the setup's picks, then the library agent's own when the project has them
+		names := append(slices.Clone(p.Skills), lib.Skills...)
+		for _, a := range agents {
+			if a.Key != key {
+				continue
+			}
+			for _, name := range cleanList(names) {
+				source := "setup"
+				if !slices.Contains(p.Skills, name) {
+					source = "library"
+				}
+				if err := agentskills.Add(ctx, s.cfg.Store, home, x.Path, a.ID, name, "", source); err != nil && !errors.Is(err, automation.ErrUnknownSkill) {
+					slog.Warn("setup: agent skill", "agent", a.Key, "skill", name, "err", err)
+				}
+			}
+		}
+	}
 }

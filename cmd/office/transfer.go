@@ -13,6 +13,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/tung1998/agent-office/internal/burn"
+	"github.com/tung1998/agent-office/internal/collections"
 	"github.com/tung1998/agent-office/internal/transfer"
 )
 
@@ -98,7 +100,7 @@ func importCmd() *cobra.Command {
 				return err
 			}
 			return withApp(cmd.Context(), func(a *app) error {
-				svc := transfer.New(a.store, a.providers, a.team, a.workflows.Lib)
+				svc := newTransfers(a)
 				plan, err := svc.Import(cmd.Context(), b, true)
 				if err != nil {
 					return err
@@ -131,9 +133,18 @@ func importCmd() *cobra.Command {
 	return cmd
 }
 
+// newTransfers exports and imports with every part a pack carries.
+func newTransfers(a *app) *transfer.Service {
+	t := transfer.New(a.store, a.providers, a.team, a.workflows.Lib)
+	t.SetCollections(collections.New(a.store))
+	t.SetBurnCheck(burn.CheckSetup)
+	return t
+}
+
 func printChanges(w io.Writer, changes []transfer.Change) {
 	label := map[string]string{"create": "+ tạo", "update": "~ cập nhật", "unchanged": "  giữ nguyên", "skip": "! bỏ qua"}
-	kind := map[string]string{"provider": "kết nối", "template": "mẫu", "project": "project"}
+	kind := map[string]string{"provider": "kết nối", "template": "mẫu", "project": "project", "automation": "tự động hóa",
+		"collection": "bảng dữ liệu", "policy": "quyền", "features": "tính năng", "chat": "chat", "memory": "ghi nhớ", "burn": "Burn"}
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 	for _, c := range changes {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", label[c.Op], kind[c.Kind], c.Name, c.Detail)

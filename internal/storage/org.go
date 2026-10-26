@@ -297,6 +297,27 @@ type AgentRepo interface {
 	SetEnabled(ctx context.Context, id string, enabled bool) error
 }
 
+// AgentSkill is a skill an agent keeps at hand (ADR-185): its name and why are
+// in the agent's prompt, its instructions read with use_skill when needed.
+type AgentSkill struct {
+	AgentID, Name string
+	Why           string
+	Source        string // person | agent | setup | library (came with a library agent) | call (the person called it with /name)
+	Uses          int
+	LastUsedAt    time.Time // zero: never used
+	CreatedAt     time.Time
+}
+
+// AgentSkillRepo stores the skills each agent keeps, oldest first.
+type AgentSkillRepo interface {
+	List(ctx context.Context, agentID string) ([]AgentSkill, error)
+	// Add puts a skill on the list, or updates its why (Source and uses stay).
+	Add(ctx context.Context, s AgentSkill) error
+	Remove(ctx context.Context, agentID, name string) error
+	// Used counts one use of a skill on the list (none: nothing happens).
+	Used(ctx context.Context, agentID, name string) (bool, error)
+}
+
 // Revision is a snapshot of a project's agents taken before a change.
 type Revision struct {
 	ID         string
@@ -839,6 +860,9 @@ type ActionArgs struct {
 	// remember: the topic the note goes under and its index line ("" = core, ADR-134)
 	Topic   string `json:"topic,omitempty"`
 	Summary string `json:"summary,omitempty"`
+	// remember: the agent's notes the new one takes the place of; forget:
+	// the notes to drop (ADR-215)
+	Replaces []string `json:"replaces,omitempty"`
 	// send_message to a linked project: its id; with no target chat, a new
 	// chat is opened there
 	Project string `json:"project,omitempty"`
@@ -849,6 +873,10 @@ type ActionArgs struct {
 	NewProject *NewProject `json:"new_project,omitempty"`
 	// data_delete: the record of a collection to delete (ADR-172)
 	Record *RecordRef `json:"record,omitempty"`
+	// AfterDiff: a commit proposed in a turn whose worktree changes are not
+	// in the project yet; it comes after the turn's diff and runs once that
+	// is merged (ADR-189)
+	AfterDiff bool `json:"after_diff,omitempty"`
 }
 
 // RecordRef names a record of a project's collection.
@@ -868,6 +896,9 @@ type NewProject struct {
 	Dir         string   `json:"dir,omitempty"`
 	Pack        string   `json:"pack,omitempty"`
 	Include     []string `json:"include,omitempty"`
+	// Parent: the project an administrator made it from (ADR-191): the two
+	// link to each other and its agent learns who it reports to.
+	Parent string `json:"parent,omitempty"`
 }
 
 // MCPCallArgs is a tool call waiting for a person.

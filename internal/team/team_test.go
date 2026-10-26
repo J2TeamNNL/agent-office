@@ -3,12 +3,14 @@ package team_test
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"slices"
 	"testing"
 
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/storage/sqlite"
 	"github.com/tung1998/agent-office/internal/team"
+	librarytemplates "github.com/tung1998/agent-office/templates/library"
 )
 
 type installs struct{ keys []string }
@@ -250,4 +252,24 @@ func library(t *testing.T, ids ...string) team.Snapshot {
 		snap.Agents = append(snap.Agents, a.Spec())
 	}
 	return snap
+}
+
+// ADR-185: the skills a library agent comes with are shipped library skills.
+func TestLibrarySkillsExist(t *testing.T) {
+	list, err := team.Library()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range list {
+		for _, name := range e.Skills {
+			n++
+			if _, err := fs.Stat(librarytemplates.FS, "skills/"+name+"/SKILL.md"); err != nil {
+				t.Errorf("%s: skill %q is not in templates/library/skills", e.ID, name)
+			}
+		}
+	}
+	if n == 0 {
+		t.Fatal("no library agent comes with skills")
+	}
 }

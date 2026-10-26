@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -30,10 +31,26 @@ import (
 // Compactor rewrites notes shorter (a fast model): the new notes, one each.
 type Compactor func(ctx context.Context, projectID, agentID string, items []storage.Memory) ([]string, error)
 
+// Reviewer reads a turn an agent just answered beside its notes (with
+// their ids) and says what to keep up to date: notes to add, rewrite or drop.
+type Reviewer func(ctx context.Context, projectID, agentID string, notes []storage.Memory, asked, answer string) ([]Op, error)
+
+// Op is one change to an agent's notes: add (Text, Topic, Summary), edit
+// (ID, Text) or drop (ID).
+type Op struct {
+	Op      string
+	ID      string
+	Text    string
+	Topic   string
+	Summary string
+}
+
 // Service adds, compacts and restores notes.
 type Service struct {
 	store   storage.Store
 	compact Compactor
+	review  Reviewer
+	busy    sync.Map // projectID/agentID: a review under way
 	// Limit: characters of core notes before they are compacted (and the
 	// most of them a conversation is given).
 	Limit int
@@ -56,6 +73,9 @@ const (
 func New(store storage.Store, c Compactor) *Service {
 	return &Service{store: store, compact: c, Limit: CoreLimit, TopicLimit: TopicLimit}
 }
+
+// SetReviewer keeps the notes up to date after each turn (ADR-215).
+func (s *Service) SetReviewer(r Reviewer) { s.review = r }
 
 var ErrEmpty = errors.New("ghi nhớ trống")
 
@@ -86,6 +106,134 @@ func (s *Service) Keep(ctx context.Context, m storage.Memory) (storage.Memory, e
 		_ = s.CompactTopic(ctx, m.ProjectID, m.AgentID, m.Topic, "tự rút gọn khi sổ quá dài")
 	}
 	return m, nil
+}
+
+// Revise changes an agent's notes in one go: drops the ones in drop and
+// rewrites the ones in edit (only the agent's own), then keeps add; what the
+// notes were is kept as a revision, so it can be put back (ADR-215).
+func (s *Service) Revise(ctx context.Context, projectID, agentID string, add []storage.Memory, edit map[string]string, drop []string, reason string) (dropped int, err error) {
+	touched := map[string]bool{}
+	err = s.store.InTx(ctx, func(tx storage.Store) error {
+		list, err := tx.Memories().List(ctx, projectID, agentID)
+		if err != nil {
+			return err
+		}
+		own := map[string]storage.Memory{}
+		for _, m := range list {
+			own[m.ID] = m
+		}
+		if _, err := tx.Memories().SaveRevision(ctx, storage.MemoryRevision{ProjectID: projectID, AgentID: agentID, Items: list, Reason: reason}); err != nil {
+			return err
+		}
+		for _, id := range drop {
+			if _, ok := own[id]; !ok {
+				continue
+			}
+			if err := tx.Memories().Delete(ctx, id); err != nil {
+				return err
+			}
+			delete(own, id)
+			dropped++
+		}
+		for id, text := range edit {
+			m, ok := own[id]
+			if text = clip(text); !ok || text == "" {
+				continue
+			}
+			m.Text = text
+			if err := tx.Memories().Update(ctx, m); err != nil {
+				return err
+			}
+			touched[m.Topic] = true
+		}
+		for _, m := range add {
+			if m.Text = clip(m.Text); m.Text == "" {
+				continue
+			}
+			m.ProjectID, m.AgentID = projectID, agentID
+			m.Topic, m.Summary = Clean(m.Topic, m.Summary)
+			if _, err := tx.Memories().Create(ctx, m); err != nil {
+				return err
+			}
+			touched[m.Topic] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for topic := range touched {
+		limit := s.Limit
+		if topic != "" {
+			limit = s.TopicLimit
+		}
+		if s.size(ctx, projectID, agentID, topic) > limit && s.compact != nil {
+			_ = s.CompactTopic(ctx, projectID, agentID, topic, "tự rút gọn khi sổ quá dài")
+		}
+	}
+	return dropped, nil
+}
+
+// clip trims a note and cuts it to MaxNote.
+func clip(text string) string {
+	text = strings.TrimSpace(text)
+	if utf8.RuneCountInString(text) > MaxNote {
+		text = string([]rune(text)[:MaxNote-1]) + "…"
+	}
+	return text
+}
+
+// Most a review after one turn adds, and rewrites or drops (ADR-215).
+const (
+	ReviewAdds    = 2
+	ReviewChanges = 10
+)
+
+// Review keeps an agent's notes up to date after a turn it answered: a fast
+// model reads the turn beside the notes and adds what was learned, rewrites
+// what turned out wrong and drops what is outdated, repeated or never of use
+// again (ADR-215). Off when the project does not keep notes on its own; one
+// review at a time per agent (a turn ending meanwhile is skipped).
+func (s *Service) Review(ctx context.Context, projectID, agentID, asked, answer string) error {
+	if s.review == nil || !s.Auto(ctx, projectID) {
+		return nil
+	}
+	key := projectID + "/" + agentID
+	if _, busy := s.busy.LoadOrStore(key, true); busy {
+		return nil
+	}
+	defer s.busy.Delete(key)
+	list, err := s.store.Memories().List(ctx, projectID, agentID)
+	if err != nil {
+		return err
+	}
+	ops, err := s.review(ctx, projectID, agentID, list, asked, answer)
+	if err != nil || len(ops) == 0 {
+		return err
+	}
+	own := map[string]bool{}
+	for _, m := range list {
+		own[m.ID] = true
+	}
+	var add []storage.Memory
+	edit, drop := map[string]string{}, []string{}
+	for _, o := range ops {
+		switch {
+		case o.Op == "add" && len(add) < ReviewAdds && strings.TrimSpace(o.Text) != "":
+			if _, dup := s.Duplicate(ctx, projectID, agentID, o.Text); !dup {
+				add = append(add, storage.Memory{Text: o.Text, Topic: o.Topic, Summary: o.Summary, Source: "review"})
+			}
+		case o.Op == "edit" && own[o.ID] && len(edit)+len(drop) < ReviewChanges:
+			edit[o.ID] = o.Text
+		case o.Op == "drop" && own[o.ID] && len(edit)+len(drop) < ReviewChanges:
+			drop = append(drop, o.ID)
+		}
+	}
+	if len(add)+len(edit)+len(drop) == 0 {
+		return nil
+	}
+	_, err = s.Revise(ctx, projectID, agentID, add, edit, drop, "dọn sau lượt chạy")
+	return err
 }
 
 // Clean makes topic a slug and summary one short line ("" for a core note).
@@ -345,6 +493,7 @@ func Recall(ctx context.Context, store storage.Store, projectID, agentID, topic,
 		return "", err
 	}
 	topic, words := Slug(topic), strings.Fields(fold(query))
+	core := topic == "core" // the notes with no topic, as the prompt has them
 	if topic == "" && len(words) == 0 {
 		lines := Index(list)
 		if len(lines) == 0 {
@@ -354,7 +503,7 @@ func Recall(ctx context.Context, store storage.Store, projectID, agentID, topic,
 	}
 	var hits []storage.Memory
 	for _, m := range list {
-		if topic != "" && m.Topic != topic {
+		if core && m.Topic != "" || !core && topic != "" && m.Topic != topic {
 			continue
 		}
 		hay := fold(m.Topic + " " + m.Summary + " " + m.Text)
@@ -374,26 +523,72 @@ func Recall(ctx context.Context, store storage.Store, projectID, agentID, topic,
 	}
 	var b strings.Builder
 	if topic != "" && len(words) == 0 {
-		fmt.Fprintf(&b, "Notes on %s:\n", topic)
+		fmt.Fprintf(&b, "Notes on %s (id first: remember with replaces, or forget, keeps them right):\n", topic)
 		for _, m := range hits {
-			fmt.Fprintf(&b, "- %s\n", m.Text)
+			fmt.Fprintf(&b, "- [%s] %s\n", m.ID, m.Text)
 		}
 		return b.String(), nil
 	}
 	fmt.Fprintf(&b, "%d notes match:\n", len(hits))
 	for _, m := range hits {
-		fmt.Fprintf(&b, "- [%s] %s\n", cmp.Or(m.Topic, "core"), m.Text)
+		fmt.Fprintf(&b, "- [%s] [%s] %s\n", m.ID, cmp.Or(m.Topic, "core"), m.Text)
 	}
 	return b.String(), nil
 }
 
 func autoKey(projectID string) string { return "memory_auto/" + projectID }
 
-// Auto: an agent's notes are kept without a person approving each.
+// Auto: an agent's notes are kept without a person approving each (on
+// unless the project turned it off); the guards below still hold.
 func (s *Service) Auto(ctx context.Context, projectID string) bool {
-	var on bool
+	on := true
 	_, _ = s.store.Settings().Get(ctx, autoKey(projectID), &on)
 	return on
+}
+
+const (
+	// MinNote: shorter than this, a note says too little to save time later.
+	MinNote = 20
+	// AutoPerTurn: notes one turn keeps on its own; more wait for a person.
+	AutoPerTurn = 2
+)
+
+// Duplicate is the agent's note that already says text (same words, or one
+// holding the other), so the same thing is not noted twice.
+func (s *Service) Duplicate(ctx context.Context, projectID, agentID, text string) (storage.Memory, bool) {
+	list, _ := s.store.Memories().List(ctx, projectID, agentID)
+	w := words(text)
+	for _, m := range list {
+		if similar(w, words(m.Text)) {
+			return m, true
+		}
+	}
+	return storage.Memory{}, false
+}
+
+func words(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, f := range strings.FieldsFunc(fold(s), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		out[f] = true
+	}
+	return out
+}
+
+// similar: the smaller set nearly inside the larger (85% of its words).
+func similar(a, b map[string]bool) bool {
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	if len(a) == 0 {
+		return false
+	}
+	n := 0
+	for w := range a {
+		if b[w] {
+			n++
+		}
+	}
+	return n*100 >= len(a)*85
 }
 
 func (s *Service) SetAuto(ctx context.Context, projectID string, on bool) error {

@@ -36,6 +36,8 @@ export default {
   'team.lib.source': 'Bản gốc',
   'team.lib.use': 'Dùng mẫu này',
   'team.lib.from': 'Theo mẫu {name}: kèm mô tả, hướng dẫn và quyền của mẫu',
+  'team.lib.skills': 'Skill đi kèm:',
+  'team.lib.skillsHelp': 'Agent giữ sẵn các skill này. Skill project chưa có sẽ được cài từ thư viện office vào thư mục skill của project.',
   'team.lib.back': 'Chọn mẫu khác',
   'team.rev.library': 'thêm từ thư viện: {arg}',
   'team.rev.setup': 'thiết lập bằng AI: {arg}',

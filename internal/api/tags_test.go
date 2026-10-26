@@ -2,9 +2,10 @@ package api_test
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/tung1998/agent-office/internal/fakebin"
 )
 
 // Tags on chats: set (cleaned, "Bug" = "bug"), offered back by the project,
@@ -14,7 +15,7 @@ func TestChatTags(t *testing.T) {
 	admin := e.client(t)
 	login(t, e, admin, "admin@x.io", "admin-password")
 	bin := filepath.Join(t.TempDir(), "claude")
-	os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755)
+	fakebin.Write(bin, []byte("#!/bin/sh\n"))
 	do(t, admin, "POST", e.srv.URL+"/api/providers", map[string]any{"name": "CC", "kind": "claude_cli", "base_url": bin}, nil)
 	_, body := do(t, admin, "POST", e.srv.URL+"/api/projects", map[string]any{"path": t.TempDir()}, nil)
 	pid := body["project"].(map[string]any)["id"].(string)

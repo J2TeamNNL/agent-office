@@ -294,3 +294,25 @@ func TestParseCall(t *testing.T) {
 		t.Error("Call")
 	}
 }
+
+// ADR-185: an agent step may carry a skill; the website workflow gives each
+// of its five agent steps one.
+func TestStepSkill(t *testing.T) {
+	def, err := Parse(BuiltinSource("website"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var skills []string
+	for _, s := range def.Steps {
+		if s.Skill != "" {
+			skills = append(skills, s.Skill)
+		}
+	}
+	if strings.Join(skills, ",") != "website-blueprint,homepage-copy,page-builder,design-polish,launch-checklist" {
+		t.Fatalf("skills = %v", skills)
+	}
+	def.Steps[0].Skill = "bad name"
+	if err := def.Validate(); err == nil || !strings.Contains(err.Error(), "tên skill") {
+		t.Fatalf("bad skill name: %v", err)
+	}
+}

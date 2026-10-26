@@ -152,3 +152,22 @@ func TestWorkflowCreateDisabled(t *testing.T) {
 		t.Fatalf("default create = %d %v", resp.StatusCode, body)
 	}
 }
+
+// A create with both a key and a source (propose_change sends the key next
+// to the file) takes the source, not the library workflow of that key.
+func TestWorkflowCreateSourceWinsOverKey(t *testing.T) {
+	e := setup(t)
+	admin := e.client(t)
+	login(t, e, admin, "admin@x.io", "admin-password")
+	_, body := do(t, admin, "POST", e.srv.URL+"/api/projects", map[string]any{"path": t.TempDir(), "name": "shop"}, nil)
+	pid := body["project"].(map[string]any)["id"].(string)
+
+	src := "---\nkey: advisor\nname: Cố vấn riêng\nroles:\n  - key: a\n---\nLàm đi.\n"
+	resp, body := do(t, admin, "POST", e.srv.URL+"/api/projects/"+pid+"/workflows", map[string]any{"key": "advisor", "source": src}, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("create = %d %v", resp.StatusCode, body)
+	}
+	if wf := body["workflow"].(map[string]any); wf["name"] != "Cố vấn riêng" {
+		t.Fatalf("library copy instead of the source: %v", wf["name"])
+	}
+}

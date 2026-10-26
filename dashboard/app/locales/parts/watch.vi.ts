@@ -237,5 +237,22 @@ export default {
   'watchW.burn.open': 'Mở trang Burn',
   'watchW.burnwork.add': 'Thêm quest cho Burn…',
   'watchW.burnwork.none': 'Burn chưa có việc nào đang mở',
-  'watchW.consoles.more': 'Còn {n} console không đủ chỗ; kéo box to ra để xem'
+  'watchW.consoles.more': 'Còn {n} console không đủ chỗ; kéo box to ra để xem',
+  'watchW.kind.tasks': 'Bảng việc',
+  'watchW.desc.tasks': 'Việc đang mở, đang làm, đã xong, thất bại của từng project (cùng các project liên kết)',
+  'watchW.kind.team': 'Agent làm việc',
+  'watchW.desc.team': 'Số lượt, lỗi, chi phí của từng agent trong khoảng thời gian',
+  'watchW.kind.changes': 'Thay đổi cài đặt',
+  'watchW.desc.changes': 'Ai đổi agent, quy trình, lịch, bảng dữ liệu, lúc nào',
+  'watchW.tasks.line': '{open} mở · {doing} đang làm · {done} xong',
+  'watchW.tasks.failed': '{n} lỗi',
+  'watchW.team.none': 'Chưa có agent nào chạy',
+  'watchW.team.errors': '{n} lỗi',
+  'watchW.changes.none': 'Chưa có thay đổi cài đặt',
+  'watchW.kind.officemap': 'Bản đồ văn phòng',
+  'watchW.desc.officemap': 'Phòng Giám đốc và các phòng ban, agent ở bàn: rảnh thì ngủ gật, làm thì gõ phím, giao việc và trao đổi có hiệu ứng',
+  'watchW.officemap.none': 'Project chưa có tiến trình bản đồ (node ban-do/server.mjs của mẫu Startup): thêm ở Vận hành',
+  'watchW.officemap.stopped': 'Tiến trình Bản đồ văn phòng đang tắt',
+  'watchW.officemap.noPort': 'Bản đồ đang khởi động',
+  'watchW.officemap.start': 'Chạy bản đồ'
 }

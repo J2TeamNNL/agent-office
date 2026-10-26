@@ -24,6 +24,9 @@ import (
 	"github.com/tung1998/agent-office/internal/repos"
 	"github.com/tung1998/agent-office/internal/storage"
 	"github.com/tung1998/agent-office/internal/team"
+	"github.com/tung1998/agent-office/internal/transfer"
+	"github.com/tung1998/agent-office/internal/workflow"
+	"github.com/tung1998/agent-office/templates/packs"
 )
 
 func (s *server) orgRoutes(mux *http.ServeMux) {
@@ -91,6 +94,9 @@ func (s *server) orgRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/revisions/{id}/restore", admin(s.restoreRevision))
 	mux.Handle("GET /api/agents/{id}", auth(s.getAgent))
 	mux.Handle("GET /api/events", auth(s.events))
+	mux.Handle("GET /api/projects/{id}/agents/{aid}/skills", auth(s.listAgentSkills))
+	mux.Handle("POST /api/projects/{id}/agents/{aid}/skills", admin(s.addAgentSkill))
+	mux.Handle("DELETE /api/projects/{id}/agents/{aid}/skills/{name}", admin(s.removeAgentSkill))
 	if s.cfg.Memory != nil {
 		mux.Handle("GET /api/projects/{id}/agents/{aid}/memories", auth(s.listMemories))
 		mux.Handle("POST /api/projects/{id}/agents/{aid}/memories", admin(s.addMemory))
@@ -112,6 +118,10 @@ func (s *server) orgRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/projects", admin(s.createRepo))
 	mux.Handle("POST /api/projects/clone", admin(s.cloneRepo))
 	mux.Handle("POST /api/projects/new", admin(s.newRepo))
+	mux.Handle("GET /api/project-packs", auth(s.projectPacks))
+	mux.Handle("GET /api/activity", auth(s.activityOverview)) // ADR-210
+	mux.Handle("GET /api/projects/{id}/pack-sync", admin(s.packSyncPreview))
+	mux.Handle("POST /api/projects/{id}/pack-sync", admin(s.packSyncApply))
 	mux.Handle("GET /api/projects/{id}", auth(s.getRepo))
 	mux.Handle("PATCH /api/projects/{id}", admin(s.updateRepo))
 	mux.Handle("DELETE /api/projects/{id}", admin(s.deleteRepo))
@@ -188,6 +198,7 @@ func (s *server) orgRoutes(mux *http.ServeMux) {
 	if s.cfg.CLITools != nil {
 		mux.Handle("GET /api/cli-tools/{id}", admin(s.cliTool))
 		mux.Handle("POST /api/cli-tools/{id}/install", admin(s.cliInstall))
+		mux.Handle("POST /api/cli-tools/{id}/update", admin(s.cliUpdate))
 		mux.Handle("POST /api/cli-tools/{id}/login", admin(s.cliLogin))
 		mux.Handle("POST /api/cli-tools/{id}/logout", admin(s.cliLogout))
 		mux.Handle("GET /api/cli-jobs/{id}", admin(s.cliJob))
@@ -622,6 +633,9 @@ func (s *server) setDefaultAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, audit.Change{Action: "project.default_agent", ResourceID: id, ProjectID: id,
 		Before: map[string]any{"default_agent_id": old.DefaultAgentID}, After: map[string]any{"default_agent_id": in.AgentID}})
+	if a, err := s.cfg.Store.Agents().Get(r.Context(), in.AgentID); err == nil && old.DefaultAgentID != in.AgentID {
+		s.briefRole(r, a, a, "you now lead this project: you are its default agent, who answers its chats and reports up")
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -652,6 +666,9 @@ type agentInput struct {
 	Avatar       *storage.Avatar     `json:"avatar"` // nil = keep
 	Sort         *int                `json:"sort"`
 	Enabled      *bool               `json:"enabled"` // nil = keep; false = paused
+	// Skills: on create, the skills it keeps at hand (a library agent's,
+	// installed into the project when missing, ADR-185)
+	Skills []string `json:"skills"`
 }
 
 // applyAgent validates in and puts it on a. FullAccess/ExtraDirs are admin
@@ -796,8 +813,9 @@ func (s *server) createAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		a.Disabled = true
 	}
+	s.createAgentSkills(r, a, in.Skills)
 	s.audit(r, audit.Change{Action: "agent.create", ResourceID: a.ID, ProjectID: a.ProjectID, After: toAgentDTO(a),
-		Detail: map[string]any{"key": a.Key}})
+		Detail: map[string]any{"key": a.Key, "skills": in.Skills}})
 	s.auditAgentFullAccess(r, storage.Agent{}, a)
 	writeJSON(w, http.StatusCreated, map[string]any{"agent": toAgentDTO(a)})
 }
@@ -843,6 +861,7 @@ func (s *server) updateAgent(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, audit.Change{Action: "agent.update", ResourceID: a.ID, ProjectID: a.ProjectID,
 		Before: toAgentDTO(old), After: toAgentDTO(a), Detail: map[string]any{"key": a.Key}})
 	s.auditAgentFullAccess(r, old, a)
+	s.briefRole(r, old, a)
 	writeJSON(w, http.StatusOK, map[string]any{"agent": toAgentDTO(a)})
 }
 
@@ -995,14 +1014,32 @@ func (s *server) registerRepo(w http.ResponseWriter, r *http.Request, info repos
 	if desc != "" {
 		info.Description = desc
 	}
+	var pack *transfer.Pack // a folder carrying its own pack becomes that project (ADR-190)
+	if s.cfg.Transfer != nil {
+		p, err := transfer.RepoPack(info.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return false
+		}
+		pack = p
+	}
 	x, err := s.cfg.Store.Repos().Create(r.Context(), storage.Repo{Name: info.Name, Path: info.Path, GitRemote: info.GitRemote, Description: info.Description})
 	if err != nil {
 		s.writeDomainError(w, r, err)
 		return false
 	}
-	if err := s.cfg.Team.AddFromLibrary(r.Context(), x.ID, team.StarterAgent); err != nil {
+	if pack != nil {
+		_, err = s.cfg.Transfer.ImportPack(r.Context(), *pack, x, pack.Include)
+	} else {
+		err = s.cfg.Team.AddFromLibrary(r.Context(), x.ID, team.StarterAgent)
+	}
+	if err != nil {
 		_ = s.cfg.Store.Repos().Delete(r.Context(), x.ID)
-		s.writeDomainError(w, r, err)
+		if pack != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+		} else {
+			s.writeDomainError(w, r, err)
+		}
 		return false
 	}
 	detail := map[string]any{"path": x.Path}
@@ -1071,17 +1108,35 @@ func (s *server) cloneRepo(w http.ResponseWriter, r *http.Request) {
 
 // newRepo creates a fresh, empty git repo on this machine from an idea and
 // adds it as a project. The idea and stack are kept only as project
-// metadata: this does not scaffold code yet.
+// metadata: this does not scaffold code yet. With template (a pack of office's
+// library, @agentoffice/…; "startup" or "company" = @agentoffice/startup) it is made from
+// that pack instead (ADR-199): the pack is written and committed, so the
+// folder's pack makes the project; for a root pack the goal given becomes the
+// first record in goals.
 func (s *server) newRepo(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Idea   string `json:"idea"`
-		Stack  string `json:"stack"`
-		Parent string `json:"parent"`
-		Dir    string `json:"dir"`
-		Name   string `json:"name"`
+		Idea     string `json:"idea"`
+		Stack    string `json:"stack"`
+		Parent   string `json:"parent"`
+		Dir      string `json:"dir"`
+		Name     string `json:"name"`
+		Template string `json:"template"` // "" | a library pack (@agentoffice/…)
+		Goal     string `json:"goal"`     // a root pack: the input goal
 	}
 	if !decode(w, r, &in) {
 		return
+	}
+	ref := strings.TrimSpace(in.Template)
+	if ref == "startup" || ref == "company" {
+		ref = packs.Scope + "/startup"
+	}
+	var tpl packs.Entry
+	if ref != "" {
+		var err error
+		if _, tpl, err = packs.Find(ref); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	parent := strings.TrimSpace(in.Parent)
 	if parent == "" {
@@ -1117,17 +1172,84 @@ func (s *server) newRepo(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, r, err)
 		return
 	}
+	if ref != "" {
+		if _, err = packs.Write(r.Context(), ref, dest, true); err != nil {
+			_ = os.RemoveAll(dest)
+			s.internal(w, r, err)
+			return
+		}
+	}
 	desc := strings.TrimSpace(in.Idea)
 	if st := strings.TrimSpace(in.Stack); st != "" {
 		desc = strings.TrimSpace(desc + "\nStack: " + st) // the builder's scan reads the description
 	}
 	info, err := repos.Detect(dest)
-	if err == nil && s.registerRepo(w, r, info, in.Name, desc, map[string]any{"stack": strings.TrimSpace(in.Stack), "created_from": "idea"}, func(x storage.Repo) { s.builderBurn(r, x) }) {
+	then, extra := func(x storage.Repo) { s.builderBurn(r, x) }, map[string]any{"stack": strings.TrimSpace(in.Stack), "created_from": "idea"}
+	if ref != "" {
+		then, extra = func(x storage.Repo) {
+			_ = s.cfg.Store.Settings().Set(r.Context(), packKey(x.ID), tpl.Ref) // what a later sync brings it up to (ADR-206)
+			s.packAdmin(r, x)                                                   // ADR-209: it runs on its own from the first message
+			if tpl.Root {
+				s.companyGoal(r, x, in.Goal)
+			}
+		}, map[string]any{"created_from": ref}
+	}
+	if err == nil && s.registerRepo(w, r, info, in.Name, desc, extra, then) {
 		return
 	}
 	_ = os.RemoveAll(dest) // not registered: the new repo does not stay behind
 	if err != nil {
 		s.internal(w, r, err)
+	}
+}
+
+// companyGoal puts the goal a new organisation was given into its goals table
+// (ADR-199), for its head to plan from; none given: the person gives it in chat.
+func (s *server) companyGoal(r *http.Request, x storage.Repo, goal string) {
+	if goal = strings.TrimSpace(goal); goal == "" {
+		return
+	}
+	title := goal
+	if rs := []rune(title); len(rs) > 120 {
+		title = string(rs[:120]) + "…"
+	}
+	// request keeps the person's words as they are: its head plans under
+	// them, never in their place (ADR-213)
+	_, _, _ = s.coll().Upsert(r.Context(), x.ID, "goals", "", map[string]any{"title": title, "detail": goal, "request": goal, "status": "dang-lam", "owner": "ceo"}, userFrom(r).Email)
+	// the goal is the one message the organisation needs (ADR-209): its head
+	// gets it now, in a chat that runs at Vận hành, as the person sending it;
+	// through its workflow for new work when the pack has one (ADR-213)
+	c, err := s.cfg.Chat.NewConversation(r.Context(), x.ID, "")
+	if err != nil {
+		return
+	}
+	_ = s.cfg.Chat.SetMode(r.Context(), c.ID, perm.Operate)
+	msg := goal
+	if wf, err := s.cfg.Store.Workflows().GetByKey(r.Context(), x.ID, "nhan-viec"); err == nil && wf.Enabled {
+		msg = workflow.Call(wf.Key, goal)
+	}
+	_, _, _ = s.cfg.Chat.Send(r.Context(), c.ID, msg, nil)
+}
+
+// packAdmin: a project an admin makes from the library runs on its own (ADR-209):
+// its agents at Vận hành run as administrator in that admin's name, as the
+// units its head opens do (ADR-207). Office checks at each run that the
+// person is still an admin (ADR-074).
+func (s *server) packAdmin(r *http.Request, x storage.Repo) {
+	by := userFrom(r).Email
+	agents, err := s.cfg.Store.Agents().List(r.Context(), x.ID)
+	if err != nil || by == "" {
+		return
+	}
+	for _, a := range agents {
+		if perm.Agent(a) != perm.Operate || a.Permissions.FullAccess {
+			continue
+		}
+		prev := a
+		a.Permissions.FullAccess, a.Permissions.FullAccessBy = true, by
+		if err := s.cfg.Store.Agents().Update(r.Context(), a); err == nil {
+			s.auditAgentFullAccess(r, prev, a)
+		}
 	}
 }
 

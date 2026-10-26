@@ -177,6 +177,9 @@ func TestDetachAdopt(t *testing.T) {
 
 // Stop ends the whole group, a child ignoring SIGTERM too.
 func TestStopEndsGroup(t *testing.T) {
+	old := stopGrace
+	stopGrace = 500 * time.Millisecond
+	t.Cleanup(func() { stopGrace = old })
 	m, st, proj := setup(t)
 	ctx := context.Background()
 	def, _ := st.Processes().Create(ctx, storage.Process{ProjectID: proj.ID, Name: "dev", Kind: "service",

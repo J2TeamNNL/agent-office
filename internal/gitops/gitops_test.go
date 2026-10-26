@@ -5,9 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
-	"unicode/utf8"
 )
 
 func TestIgnored(t *testing.T) {
@@ -171,15 +171,67 @@ func TestBranchDiffFromFork(t *testing.T) {
 	}
 }
 
-// A diff of Vietnamese text cut at its byte limit must stay valid UTF-8:
-// codex refuses a prompt with a broken character (Burn review "Góc nhìn B").
-func TestCutKeepsUTF8(t *testing.T) {
-	s := strings.Repeat("a", 9) + "đ" // "đ" is 2 bytes, at 9..10
-	got := cut(s, 10)
-	if !utf8.ValidString(got) || got != strings.Repeat("a", 9) {
-		t.Fatalf("cut = %q", got)
+// ADR-196: a reviewed run branch merges into the current one; a conflict is
+// aborted, leaving the project as it was; nothing new or staged changes refuse it.
+func TestMerge(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git missing")
 	}
-	if cut("abc", 10) != "abc" {
-		t.Fatal("short string changed")
+	root := t.TempDir()
+	run := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = root
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatal(string(out))
+		}
+	}
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "t@x.io")
+	run("config", "user.name", "T")
+	os.WriteFile(filepath.Join(root, "a.txt"), []byte("one\n"), 0o644)
+	run("add", ".")
+	run("commit", "-qm", "init")
+	run("branch", "burn/1")
+	run("switch", "-q", "burn/1")
+	os.WriteFile(filepath.Join(root, "b.txt"), []byte("b\n"), 0o644)
+	run("add", ".")
+	run("commit", "-qm", "burn: b")
+	run("switch", "-q", "main")
+	ctx := context.Background()
+	os.WriteFile(filepath.Join(root, "wip.txt"), []byte("w\n"), 0o644) // another chat's work, untracked
+	if _, _, err := Merge(ctx, root, "nope"); err == nil {
+		t.Fatal("merged a branch that does not exist")
+	}
+	hash, n, err := Merge(ctx, root, "burn/1")
+	if err != nil || hash == "" || n != 1 {
+		t.Fatalf("merge: %s %d %v", hash, n, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "b.txt")); err != nil {
+		t.Fatal("the branch's work is not on main")
+	}
+	if _, err := os.Stat(filepath.Join(root, "wip.txt")); err != nil {
+		t.Fatal("the merge lost a file it does not touch")
+	}
+	if _, _, err := Merge(ctx, root, "burn/1"); err == nil {
+		t.Fatal("merged a branch with nothing new")
+	}
+	// a conflict: aborted, main as it was
+	run("switch", "-q", "-c", "burn/2")
+	os.WriteFile(filepath.Join(root, "a.txt"), []byte("two\n"), 0o644)
+	run("commit", "-qam", "burn: a")
+	run("switch", "-q", "main")
+	os.WriteFile(filepath.Join(root, "a.txt"), []byte("three\n"), 0o644)
+	run("commit", "-qam", "main: a")
+	before, _ := git(ctx, root, "rev-parse", "HEAD")
+	if _, _, err := Merge(ctx, root, "burn/2"); err == nil {
+		t.Fatal("a conflicting merge went through")
+	}
+	after, _ := git(ctx, root, "rev-parse", "HEAD")
+	if st, _ := ReadStatus(ctx, root); before != after || slices.ContainsFunc(st.Changes, func(c Change) bool { return c.Path == "a.txt" }) {
+		t.Fatalf("a failed merge left the project changed: %+v", st)
+	}
+	run("add", "wip.txt")
+	if _, _, err := Merge(ctx, root, "burn/2"); err == nil || !strings.Contains(err.Error(), "stage") {
+		t.Fatalf("merged with staged changes: %v", err)
 	}
 }

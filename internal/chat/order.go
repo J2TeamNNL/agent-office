@@ -56,10 +56,17 @@ func (e *Engine) cardSeqs(ctx context.Context, conversationID string, acts []sto
 	}
 	byMsg := map[string][]string{}
 	for _, a := range acts {
-		byMsg[a.MessageID] = append(byMsg[a.MessageID], a.ID)
+		if !a.Args.AfterDiff {
+			byMsg[a.MessageID] = append(byMsg[a.MessageID], a.ID)
+		}
 	}
 	for _, p := range ps {
 		byMsg[p.MessageID] = append(byMsg[p.MessageID], p.ID)
+	}
+	for _, a := range acts { // a commit waiting for its answer's diff comes after it (ADR-189)
+		if a.Args.AfterDiff {
+			byMsg[a.MessageID] = append(byMsg[a.MessageID], a.ID)
+		}
 	}
 	seq := map[string]int{}
 	for _, m := range msgs {
@@ -140,12 +147,20 @@ func numberCards(msgs []MessageDTO) {
 	n := 0
 	for _, m := range msgs {
 		for i := range m.Actions {
-			n++
-			m.Actions[i].Seq = n
+			if !m.Actions[i].AfterDiff {
+				n++
+				m.Actions[i].Seq = n
+			}
 		}
 		for i := range m.Patches {
 			n++
 			m.Patches[i].Seq = n
+		}
+		for i := range m.Actions { // after the answer's diff (ADR-189)
+			if m.Actions[i].AfterDiff {
+				n++
+				m.Actions[i].Seq = n
+			}
 		}
 	}
 }

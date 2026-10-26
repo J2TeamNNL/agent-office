@@ -7,8 +7,8 @@ import (
 	"github.com/tung1998/agent-office/internal/storage"
 )
 
-// "Luôn cho phép": the card shows the pattern and its pack; a risky command
-// has none, and approving it "always" is refused (it stays pending).
+// "Luôn cho phép": the card shows the pattern and its pack; a wrapper (sudo,
+// bash…) has none, and approving it "always" is refused (it stays pending).
 func TestApproveAlwaysAPI(t *testing.T) {
 	e := setup(t)
 	admin := e.client(t)
@@ -17,7 +17,7 @@ func TestApproveAlwaysAPI(t *testing.T) {
 	_, body := do(t, admin, "POST", e.srv.URL+"/api/projects", map[string]any{"path": t.TempDir(), "name": "shop"}, nil)
 	pid := body["project"].(map[string]any)["id"].(string)
 	sw, _ := e.st.Actions().Create(ctx, storage.Action{ProjectID: pid, Kind: "run_command", Target: "git switch main", ProposedBy: "Lead", Status: "pending"})
-	rm, _ := e.st.Actions().Create(ctx, storage.Action{ProjectID: pid, Kind: "run_command", Target: "rm -rf dist", ProposedBy: "Lead", Status: "pending"})
+	rm, _ := e.st.Actions().Create(ctx, storage.Action{ProjectID: pid, Kind: "run_command", Target: "sudo rm -rf dist", ProposedBy: "Lead", Status: "pending"})
 
 	if _, b := do(t, admin, "GET", e.srv.URL+"/api/actions/"+sw.ID+"/always", nil, nil); b["pattern"] != "git switch *" || b["pack"] != "git (đã duyệt)" || b["new_pack"] != true {
 		t.Fatalf("preview = %v", b)

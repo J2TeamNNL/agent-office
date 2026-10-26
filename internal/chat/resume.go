@@ -3,6 +3,7 @@ package chat
 import (
 	"cmp"
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -124,7 +125,16 @@ func (e *Engine) goOn(conversationID string) {
 	}
 	who, lines := e.takeDecided(conversationID)
 	text := DecidedPrompt(who, lines)
-	_, _, _ = e.Send(actor.With(ctx, "human:"+who), conversationID, text, nil)
+	_, _, _ = e.Send(actor.With(ctx, decidedActor(who)), conversationID, text, nil)
+}
+
+// decidedActor: who decided as an actor. A person on the dashboard comes as
+// an email; an auto-approval (auto:…) or a bot (discord:…) is one already.
+func decidedActor(who string) string {
+	if strings.Contains(who, ":") {
+		return who
+	}
+	return "human:" + who
 }
 
 // DecidedPrompt is the message an agent goes on from once who decided its

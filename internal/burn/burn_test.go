@@ -13,6 +13,7 @@ import (
 	"github.com/tung1998/agent-office/internal/actions"
 	"github.com/tung1998/agent-office/internal/burn"
 	"github.com/tung1998/agent-office/internal/chat"
+	"github.com/tung1998/agent-office/internal/fakebin"
 	"github.com/tung1998/agent-office/internal/llm"
 	"github.com/tung1998/agent-office/internal/perm"
 	"github.com/tung1998/agent-office/internal/provider"
@@ -57,13 +58,13 @@ func setup(t *testing.T, wrap ...func(storage.Store) storage.Store) fx {
 	provs.SetUsage(u)
 	org := team.NewService(st, nil)
 	bin := filepath.Join(tmp, "claude")
-	os.WriteFile(bin, []byte(`#!/bin/sh
+	fakebin.Write(bin, []byte(`#!/bin/sh
 cat > /dev/null
 echo "do agent viết" > made-by-agent.txt
 sleep 1
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"xong lượt","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	provs.Create(ctx, provider.Input{Name: "CC", Kind: storage.ProviderClaudeCLI, BaseURL: bin})
 	dir := t.TempDir()
 	git := func(args ...string) {
@@ -155,13 +156,13 @@ func TestBurnDoesAPieceOnItsBranch(t *testing.T) {
 		t.Fatalf("branch %s: %s", it.Branch, got)
 	}
 	// the next piece starts from the run and lands on the same branch
-	os.WriteFile(f.bin, []byte(`#!/bin/sh
+	fakebin.Write(f.bin, []byte(`#!/bin/sh
 cat > /dev/null
 test -f made-by-agent.txt && echo "thứ hai" > second.txt
 sleep 1
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"xong lượt","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	f.svc.Tool(ctx, sc, "burn_add", burn.ToolInput{Title: "Việc thứ hai", Kind: "upgrade"})
 	items, _ = f.st.Burn().Items(ctx, b.ID)
 	next := items[len(items)-1]
@@ -440,7 +441,7 @@ func TestBurnFinishDoesNotOverwriteASkipRacingTheReview(t *testing.T) {
 	tmp := t.TempDir()
 	started := filepath.Join(tmp, "started") // set once finish()'s review call actually starts
 	marker := filepath.Join(tmp, "go")
-	os.WriteFile(f.bin, []byte(`#!/bin/sh
+	fakebin.Write(f.bin, []byte(`#!/bin/sh
 p=$(cat)
 case "$p" in
 *"result review"*)
@@ -451,7 +452,7 @@ case "$p" in
 esac
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"'"$r"'","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	f.svc.Start(ctx)
@@ -502,7 +503,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"'"$r"'","s
 // checks come back, and must not merge or deliver the item.
 func TestBurnWorkDoesNotOverwriteASkipRacingTheChecks(t *testing.T) {
 	f := setup(t)
-	os.WriteFile(f.bin, []byte(strings.Replace(reviewer, "sleep 1", "sleep 0.2", 1)), 0o755)
+	fakebin.Write(f.bin, []byte(strings.Replace(reviewer, "sleep 1", "sleep 0.2", 1)))
 	tmp := t.TempDir()
 	started := filepath.Join(tmp, "started") // set once checked()'s verify command actually starts
 	marker := filepath.Join(tmp, "go")
@@ -634,13 +635,13 @@ func waitWorker(t *testing.T, st storage.Store, sessionID string, seen map[strin
 func TestBurnScanRecordsThenWorkersDo(t *testing.T) {
 	f := setup(t)
 	f.svc.SetFindWork(true)
-	os.WriteFile(f.bin, []byte(`#!/bin/sh
+	fakebin.Write(f.bin, []byte(`#!/bin/sh
 cat > /dev/null
 echo "do agent viết" > made-by-agent.txt
 sleep 3
 echo '{"type":"system","subtype":"init","session_id":"s1"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"xong lượt","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
+`))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	f.svc.Start(ctx)
@@ -780,75 +781,4 @@ func TestBurnTurnsOnBySchedule(t *testing.T) {
 	if b, _ := f.st.Burn().Session(ctx, f.project.ID); b.State != "stopped" {
 		t.Fatalf("turned on again after being turned off: %s", b.State)
 	}
-}
-
-// A review the AI connection refuses (signed out: 401) is the machine's, not
-// the piece's (ADR-152): the piece stays in review, untried, the Burn says
-// so and waits ("blocked"); resumed once the connection works, it goes on.
-func TestBurnBlocksOnATechnicalErrorInsteadOfFailing(t *testing.T) {
-	f := setup(t)
-	agree := filepath.Join(t.TempDir(), "agree")
-	os.WriteFile(f.bin, []byte(`#!/bin/sh
-p=$(cat)
-case "$p" in
-*"result review"*)
-  if [ ! -f "`+agree+`" ]; then
-    echo '{"type":"system","subtype":"init","session_id":"s1"}'
-    echo '{"type":"result","subtype":"success","is_error":true,"result":"API Error: 401 Unauthorized: Encountered invalidated oauth token","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-    exit 1
-  fi
-  r="VERDICT: AGREE. Đúng phạm vi";;
-*) echo "do agent viết" > made-by-agent.txt; r="xong lượt";;
-esac
-echo '{"type":"system","subtype":"init","session_id":"s1"}'
-echo '{"type":"result","subtype":"success","is_error":false,"result":"'"$r"'","session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}'
-`), 0o755)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	f.svc.Start(ctx)
-	ends := time.Now().Add(time.Hour)
-	f.st.Burn().SaveSession(ctx, storage.BurnSession{ProjectID: f.project.ID, ModelTier: "fast", EndsAt: &ends, State: "stopped", ReviewProfileID: f.profile(t, "result")})
-	b, err := f.svc.Begin(ctx, f.project.ID, "admin@x.io")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc := actions.Scope{ProjectID: f.project.ID, ConversationID: b.ConversationID}
-	f.svc.Tool(ctx, sc, "burn_add", burn.ToolInput{Title: "Thêm file", Kind: "upgrade"})
-	items, _ := f.st.Burn().Items(ctx, b.ID)
-	f.svc.Tool(ctx, sc, "burn_pick", burn.ToolInput{Item: items[0].ID})
-	it := waitItem(t, f.st, items[0].ID, "doing")
-	f.svc.Tool(ctx, sc, "burn_done", burn.ToolInput{Item: it.ID, Summary: "đã thêm"})
-
-	var cur storage.BurnSession
-	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(30 * time.Millisecond) {
-		cur, _ = f.st.Burn().Session(ctx, f.project.ID)
-		if cur.State == "blocked" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("Burn not blocked: %s", cur.State)
-		}
-	}
-	got, _ := f.st.Burn().Item(ctx, it.ID)
-	if got.Status != "review" || got.ReviewErrAttempts != 0 {
-		t.Fatalf("piece blamed for a technical error: %+v", got)
-	}
-	msgs, _ := f.st.Chat().ListMessages(ctx, b.ConversationID)
-	said := false
-	for _, m := range msgs {
-		said = said || strings.Contains(m.Content, "lỗi kỹ thuật")
-	}
-	if !said {
-		t.Fatal("the Burn did not say it was blocked")
-	}
-
-	os.WriteFile(agree, nil, 0o644) // signed in again
-	if err := f.svc.Resume(ctx, f.project.ID); err != nil {
-		t.Fatal(err)
-	}
-	waitDelivered(t, f.st, it.ID)
-	if cur, _ = f.st.Burn().Session(ctx, f.project.ID); cur.State != "running" {
-		t.Fatalf("state after it went through: %s", cur.State)
-	}
-	f.svc.Stop(ctx, f.project.ID)
 }

@@ -111,6 +111,9 @@ type Learning struct {
 	NewMemories    int      `json:"new_memories"`
 	Topics         []string `json:"topics"`
 	RepeatedErrors []Group  `json:"repeated_errors"` // the same failure 3+ times
+	// AgentSkills are the skills each agent keeps at hand (ADR-185) and how
+	// they were used: "agent: skill (source, used N×, last date | never)".
+	AgentSkills []string `json:"agent_skills"`
 }
 
 // Item is one piece of evidence and where it happened.
@@ -140,10 +143,12 @@ func Collect(ctx context.Context, store storage.Store, p storage.Repo, days int)
 		ev.Assets = assets(p.Path)
 	}
 	ev.Assets.Description = cut(p.Description, 400)
+	var skills []string
 	if agents, err := store.Agents().List(ctx, p.ID); err == nil {
 		for _, a := range agents {
 			if !a.Disabled {
 				ev.Assets.Agents = append(ev.Assets.Agents, fmt.Sprintf("%s (%s): %d ký tự chỉ dẫn", a.Name, cut(a.Role, 60), len([]rune(a.Instructions))))
+				skills = append(skills, agentSkills(ctx, store, a)...)
 			}
 		}
 	}
@@ -162,8 +167,26 @@ func Collect(ctx context.Context, store storage.Store, p storage.Repo, days int)
 	ev.Validation = validation(f)
 	ev.Corrections = corrections(f.UserMessages)
 	ev.Burn = burn(f)
-	ev.Learning = Learning{Memories: f.Memories, NewMemories: f.NewMemories, Topics: f.MemoryTopics, RepeatedErrors: repeated(f)}
+	ev.Learning = Learning{Memories: f.Memories, NewMemories: f.NewMemories, Topics: f.MemoryTopics, RepeatedErrors: repeated(f), AgentSkills: skills}
 	return ev, nil
+}
+
+// agentSkills are an agent's skills at hand and their use, for the review
+// to see which earn their place.
+func agentSkills(ctx context.Context, store storage.Store, a storage.Agent) []string {
+	list, err := store.AgentSkills().List(ctx, a.ID)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		used := "never used, added " + s.CreatedAt.Format("2006-01-02")
+		if s.Uses > 0 {
+			used = fmt.Sprintf("used %d×, last %s", s.Uses, s.LastUsedAt.Format("2006-01-02"))
+		}
+		out = append(out, fmt.Sprintf("%s: %s (%s, %s)", a.Name, s.Name, s.Source, used))
+	}
+	return out
 }
 
 // ---- assets ----

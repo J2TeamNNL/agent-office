@@ -3,7 +3,6 @@ package chat_test
 import (
 	"context"
 	"errors"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -46,29 +45,6 @@ func TestCheckOrder(t *testing.T) {
 	}
 	if !g.engine.Waiting(ctx, g.conv.ID) {
 		t.Fatal("two proposals still wait")
-	}
-}
-
-// The agent goes on only once every proposal of the chat is decided: one
-// decided while another waits holds its word until the last is (Settled for
-// a skipped one).
-func TestDecidedWaitsForAllProposals(t *testing.T) {
-	g := newGroup(t)
-	g.sendAll(t, "chuẩn bị deploy")
-	ctx := g.context
-	other, _ := g.f.st.Actions().Create(ctx, storage.Action{ProjectID: g.f.project.ID, ConversationID: g.conv.ID, Kind: "run_command", Target: "pnpm build"})
-	g.engine.SetDecidedWait(50 * time.Millisecond)
-	g.engine.Decided(g.conv.ID, "admin@x.io", "✅ Đã duyệt Chạy lệnh: pnpm test — ok")
-	time.Sleep(300 * time.Millisecond)
-	if _, err := os.Stat(filepath.Join(g.dir, "call2.args")); err == nil {
-		t.Fatal("the agent went on while a proposal still waits")
-	}
-	other.Status = "rejected" // skipped: no word of its own
-	_ = g.f.st.Actions().Update(ctx, other)
-	g.engine.Settled(g.conv.ID)
-	g.waitAuthors(t, 2)
-	if _, in := call(t, g.dir, 2); !strings.Contains(in, "pnpm test") {
-		t.Fatalf("the held decision goes on:\n%s", in)
 	}
 }
 

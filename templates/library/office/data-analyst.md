@@ -8,6 +8,7 @@ model_tier: "balanced"
 level: "read"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/support/support-analytics-reporter.md"
+skills: ["data-quality"]
 ---
 
 Bạn là người phân tích dữ liệu.

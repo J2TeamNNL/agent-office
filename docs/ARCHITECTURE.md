@@ -1,5 +1,7 @@
 # Kiến trúc agent-office
 
+> Mục 1–5 là thiết kế M0 (Director/manager, heartbeat, debate), đã đổi theo ADR-057 (bỏ Việc) và ADR-099 (bỏ mô hình tổ chức, agent thuộc project). Bản đồ hiện tại: [MINDMAP.md](MINDMAP.md).
+
 ## 1. Thành phần
 
 ```mermaid
@@ -235,7 +237,7 @@ Cổng `/mcp/s/<tên>` (ADR-091–094) giữ secret và token OAuth của từng
   - **Ghi:** tool còn lại (kể cả tool chưa biết) chạy ngay khi người gọi có `CanWrite`. Agent có quyền `tools.mcp.write` (từ mức Vận hành), người dùng là admin.
   - **Đề xuất:** không có `CanWrite` nhưng có `CanPropose` thì lần gọi thành đề xuất `mcp_call`; người duyệt xong thì office gọi và trả kết quả.
   - Không có quyền nào thì bị từ chối. Gọi `tools/call` theo lô chỉ cho người có `CanWrite`.
-- **Fail-closed:** không xác định được người gọi (chỉ có `Auth`) thì chỉ được tool đọc. Token sai thì 401. Mỗi lần gọi đều ghi vào `mcp_calls`.
+- **Fail-closed:** không xác định được người gọi (chỉ có `Auth`) thì chỉ được tool đọc. Token sai thì 401. Mỗi lần gọi đều ghi vào `mcp_calls`, kèm số byte vào/ra/bị cắt. Kết quả text dài hơn 30KB đến tay run đã cắt (đầu + đuôi), phần giữa đọc lại bằng `mcp_result` (ADR-183).
 
 ## 9. Quan sát
 

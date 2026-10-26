@@ -107,7 +107,7 @@ async function open(e: LibraryEntry, use = false) {
       <pre class="max-h-56 overflow-y-auto whitespace-pre-wrap rounded bg-(--ui-bg-elevated) p-2 text-xs">{{ selected.instructions }}</pre>
       <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-(--ui-text-muted)">
         <span>{{ t('team.lib.words', { n: selected.words }) }}</span>
-        <span v-if="selected.set === 'agency'" class="inline-flex items-center gap-1 text-(--ui-warning)">
+        <span v-if="selected.set !== 'office'" class="inline-flex items-center gap-1 text-(--ui-warning)">
           <UIcon name="i-lucide-info" class="size-3.5" />{{ t('team.lib.agencyNote') }}
         </span>
         <ULink v-if="selected.source" :to="selected.source" target="_blank" class="inline-flex items-center gap-1">

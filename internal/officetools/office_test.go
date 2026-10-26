@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -86,7 +87,7 @@ func TestToolsReadOnly(t *testing.T) {
 	box.SetOffice(func(ctx context.Context) string { return office.ID })
 	box.SetConfig(fakeConfig{})
 	box.SetBurn(func(context.Context, Scope, string, BurnInput) (string, error) { return "", nil })
-	box.SetDelegate(func(context.Context, Scope, string, string) (string, error) { return "", nil })
+	box.SetDelegate(func(context.Context, Scope, string, string, string) (string, error) { return "", nil })
 	box.SetSendFile(func(context.Context, Scope, string, string) (string, error) { return "", nil })
 	box.SetWorkflow(fakeWorkflows{})
 
@@ -95,11 +96,11 @@ func TestToolsReadOnly(t *testing.T) {
 		"ops_overview": true, "process_logs": true, "container_logs": true, "monitor_detail": true,
 		"git_status": true, "git_diff": true, "git_log": true,
 		"describe": true, "list": true, "get": true,
-		"search_history": true, "read_link": true, "burn_list": true, "burn_quests": true, "recall": true,
+		"search_history": true, "read_link": true, "burn_list": true, "burn_quests": true, "recall": true, "use_skill": true, "staff_load": true,
 	}
-	writes := []string{"run_command", "propose_action", "propose_automation", "propose_change", "remember",
+	writes := []string{"run_command", "propose_action", "propose_automation", "propose_change", "remember", "my_skills",
 		"send_to_chat", "send_file", "delegate", "run_automation", "burn_add", "burn_pick", "burn_skip",
-		"burn_done", "burn_scan_done", "burn_fail", "burn_quest", "workflow_delegate", "workflow_send",
+		"burn_done", "burn_scan_done", "burn_fail", "burn_quest", "burn_assign", "workflow_delegate", "workflow_send",
 		"workflow_ask", "workflow_vote", "workflow_gate", "workflow_done"}
 
 	// No single scope offers every tool at once (the office assistant gets
@@ -217,8 +218,7 @@ type officeSender struct{}
 func (officeSender) Relay(context.Context, storage.Action) (string, string, error) {
 	return "", "", nil
 }
-func (officeSender) Relayed(context.Context, string) bool    { return false }
-func (officeSender) RelayLimit(context.Context, string) bool { return false }
+func (officeSender) Relayed(context.Context, string) bool { return false }
 
 type officeApplier struct{}
 
@@ -252,7 +252,7 @@ func TestOfficeReachesEveryProject(t *testing.T) {
 	}
 	for _, tl := range box.ToolsFor(sc) {
 		_, has := tl.Schema["properties"].(map[string]any)["project"]
-		if want := tl.Name != "recall" && tl.Name != "remember" && tl.Name != "read_link"; tl.Name != "projects" && tl.Name != "usage_summary" && has != want {
+		if want := !slices.Contains(ownTools, tl.Name); tl.Name != "projects" && tl.Name != "usage_summary" && has != want {
 			t.Errorf("%s: project argument = %v", tl.Name, has)
 		}
 	}

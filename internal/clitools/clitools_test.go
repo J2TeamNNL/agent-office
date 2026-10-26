@@ -329,3 +329,47 @@ func TestLogout(t *testing.T) {
 		t.Fatalf("already signed out is fine: %v", err)
 	}
 }
+
+func TestUpdateFollowsInstallMethod(t *testing.T) {
+	m, dir := testManager(t)
+	if _, err := m.Update("codex"); err != ErrNotInstalled {
+		t.Fatalf("not installed err = %v", err)
+	}
+	// codex from a Homebrew cask: bin/codex links into Caskroom
+	cask := filepath.Join(dir, "Caskroom", "codex", "1.0.0")
+	if err := os.MkdirAll(cask, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeBin(t, cask, "codex", "#!/bin/sh\necho codex-cli 1.0.0\n")
+	if err := os.Symlink(filepath.Join(cask, "codex"), filepath.Join(dir, "codex")); err != nil {
+		t.Fatal(err)
+	}
+	writeBin(t, dir, "brew", "#!/bin/sh\necho \"brew $*\"\n")
+	s, _ := m.Status(context.Background(), "codex")
+	if !strings.Contains(s.UpdateCmd, "brew upgrade --cask codex") {
+		t.Fatalf("update command = %q", s.UpdateCmd)
+	}
+	j, err := m.Update("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := waitState(t, j, "succeeded"); v.Action != "update" || !strings.Contains(v.Output, "brew upgrade --cask codex") {
+		t.Fatalf("job = %+v", v)
+	}
+
+	// Claude Code from the official installer updates itself
+	writeBin(t, dir, "claude", "#!/bin/sh\necho \"claude $*\"\n")
+	j, err = m.Update("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := waitState(t, j, "succeeded"); !strings.Contains(v.Output, "claude update") {
+		t.Fatalf("claude job = %+v", v)
+	}
+
+	// Gemini CLI has no installer of its own: a plain binary is of unknown origin
+	writeBin(t, dir, "gemini", "#!/bin/sh\necho 0.1.0\n")
+	if _, err := m.Update("gemini"); err != ErrUnknownInstall {
+		t.Fatalf("gemini err = %v", err)
+	}
+}

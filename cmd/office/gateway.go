@@ -125,3 +125,40 @@ func (a *apiGateway) Call(ctx context.Context, name string, args json.RawMessage
 	}
 	return a.gw.Invoke(ctx, a.caller, t.Server, t.Tool, args)
 }
+
+// gatewayRest is the office tool mcp_result (ADR-183): the part of a long
+// gateway result office cut, for runs whose agent gets a gateway server.
+type gatewayRest struct {
+	st storage.Store
+	gw *mcpgateway.Gateway
+}
+
+func (p gatewayRest) Tools(sc officetools.Scope) []officetools.Tool {
+	ctx := context.Background()
+	if len(p.gw.NamesFor(ctx, gatewayCaller(ctx, p.st, sc, "api"))) == 0 {
+		return nil
+	}
+	return []officetools.Tool{{Name: "mcp_result", ReadOnly: true,
+		Description: "Read the part of a long MCP tool result that office cut (the result's note gives id and offset).",
+		Schema: map[string]any{"type": "object", "required": []string{"id"}, "properties": map[string]any{
+			"id":     map[string]any{"type": "string"},
+			"offset": map[string]any{"type": "integer", "description": "Byte offset to start from"},
+			"limit":  map[string]any{"type": "integer", "description": "Bytes to read (max 30000)"},
+		}}}}
+}
+
+func (p gatewayRest) Call(_ context.Context, sc officetools.Scope, _ string, raw json.RawMessage) (string, bool) {
+	var in struct {
+		ID     string `json:"id"`
+		Offset int    `json:"offset"`
+		Limit  int    `json:"limit"`
+	}
+	if len(raw) > 0 && json.Unmarshal(raw, &in) != nil {
+		return "tham số không hợp lệ", true
+	}
+	out, err := p.gw.Rest(in.ID, sc.ConversationID, sc.JobID, in.Offset, in.Limit)
+	if err != nil {
+		return err.Error(), true
+	}
+	return out, false
+}

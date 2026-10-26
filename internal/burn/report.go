@@ -61,7 +61,7 @@ func summary(b storage.BurnSession, items []storage.BurnItem, project, why strin
 			default:
 				skipped = append(skipped, it)
 			}
-		case "doing", "paused", "review":
+		case "doing", "paused", "review", StatusHanded:
 			left = append(left, it)
 		case "queued":
 			queued++

@@ -165,7 +165,7 @@ func (t *Toolbox) savePack(ctx context.Context, data []byte) (string, error) {
 	if len(data) > transfer.MaxPack {
 		return "", errors.New("gói project quá lớn")
 	}
-	if _, err := transfer.ReadZip(data); err != nil {
+	if _, err := transfer.ReadPack(data); err != nil {
 		return "", err
 	}
 	return t.writePack(ctx, "imports", time.Now().Format("20060102-150405.000000000")+".zip", func(w io.Writer) error {

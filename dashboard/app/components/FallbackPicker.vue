@@ -14,7 +14,13 @@ const rows = computed(() => shown.value.map(split))
 const options = computed(() => props.providers
   .filter(p => p.id === props.mainId || !shown.value.includes(p.id))
   .map(p => ({ label: p.enabled ? p.name : `${p.name} (${t('org.form.fallbackOff')})`, value: p.id })))
-const add = (id: string) => { if (id) model.value = [...shown.value, id] }
+// USelect keeps the picked value even with model-value undefined; once that
+// connection leaves the options it shows its raw id, so remount it empty.
+const addKey = ref(0)
+const add = (id: string) => {
+  if (id) model.value = [...shown.value, id]
+  addKey.value++
+}
 const setModel = (i: number, m: string) => { model.value = shown.value.map((e, j) => (j === i ? join(split(e).id, m) : e)) }
 function up(i: number) {
   const l = [...shown.value]
@@ -45,7 +51,7 @@ const remove = (i: number) => { model.value = shown.value.filter((_, j) => j !==
         </template>
       </div>
       <USelect
-        v-if="!disabled && options.length" :model-value="undefined" :items="options" :placeholder="t('org.form.fallbackAdd')"
+        v-if="!disabled && options.length" :key="addKey" :model-value="undefined" :items="options" :placeholder="t('org.form.fallbackAdd')"
         icon="i-lucide-plus" size="sm" class="w-full sm:w-72" @update:model-value="(v: string) => add(v)"
       />
     </div>

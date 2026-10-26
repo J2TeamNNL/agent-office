@@ -102,7 +102,7 @@ async function add() {
       body: {
         key: form.key, name: form.name, role: form.role, model_tier: form.model_tier,
         description: fromLib.value.description, instructions: fromLib.value.instructions,
-        permissions: fromLib.value.permissions
+        permissions: fromLib.value.permissions, skills: fromLib.value.skills ?? []
       }
     })
     addOpen.value = false
@@ -231,6 +231,11 @@ onMounted(async () => {
         <UFormField :label="t('org.form.role')">
           <UInput v-model="form.role" class="w-full" :placeholder="t('org.form.rolePlaceholder')" />
         </UFormField>
+        <p v-if="fromLib?.skills?.length" class="flex flex-wrap items-center gap-1.5 text-sm">
+          <span class="text-(--ui-text-muted)">{{ t('team.lib.skills') }}</span>
+          <UBadge v-for="sk in fromLib.skills" :key="sk" color="neutral" variant="subtle" class="font-mono" :label="sk" />
+          <InfoTip :text="t('team.lib.skillsHelp')" icon-class="size-3.5 text-(--ui-text-muted)" />
+        </p>
         <UFormField :label="t('org.form.modelTier')">
           <USelect v-model="form.model_tier" :items="Object.entries(modelTierLabel).map(([value, label]) => ({ label, value }))" class="w-full" />
         </UFormField>

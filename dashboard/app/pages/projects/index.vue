@@ -9,10 +9,14 @@ await Promise.all([_f1, _f3]) // started together: one round trip, not 2 (a phon
 const projects = computed(() => data.value?.projects ?? [])
 
 const addOpen = ref(false)
-type Scope = 'folder' | 'clone' | 'idea' | 'machine'
+type Scope = 'folder' | 'clone' | 'idea' | 'template' | 'machine'
 // clone: a pasted git link, cloned into parent/dir (dir from the link when empty)
 // idea: a new, empty repo in parent/dir whose Burn builds it (ADR-139)
-const form = reactive({ scope: 'folder' as Scope, path: '', name: '', url: '', dir: '', parent: '', idea: '', stack: '' })
+// template: a new repo from a pack of office's library (ADR-199); a root pack's head is given the goal
+const form = reactive({ scope: 'folder' as Scope, path: '', name: '', url: '', dir: '', parent: '', idea: '', stack: '', goal: '', template: '' })
+const { data: packData } = useLiveFetch<{ packs: { ref: string, title: string, description: string, root?: boolean, bundle: string }[] }>('/api/project-packs', { lazy: true })
+const packItems = computed(() => (packData.value?.packs ?? []).map(p => ({ label: `${p.title} · ${p.ref}`, value: p.ref })))
+const pickedPack = computed(() => packData.value?.packs.find(p => p.ref === form.template))
 const error = ref('')
 const adding = ref(false)
 const urlDir = computed(() => form.url.trim().replace(/\/+$/, '').split(/[/:]/).pop()?.replace(/\.git$/, '') ?? '')
@@ -25,11 +29,12 @@ const canAdd = computed(() => ({
   folder: !!form.path,
   clone: !!form.url.trim() && !!form.parent,
   idea: !!form.idea.trim() && !!form.dir.trim() && !!form.parent,
+  template: !!form.template && !!form.dir.trim() && !!form.parent,
   machine: !!form.name
 })[form.scope])
 
-function openAdd(path = '', name = '') {
-  Object.assign(form, { scope: 'folder', path, name, url: '', dir: '', parent: sys.value?.clone_root ?? '', idea: '', stack: '' })
+function openAdd(path = '', name = '', template = '') {
+  Object.assign(form, { scope: template ? 'template' : 'folder', path, name, url: '', dir: '', parent: sys.value?.clone_root ?? '', idea: '', stack: '', goal: '', template })
   error.value = ''
   addOpen.value = true
 }
@@ -66,6 +71,15 @@ async function scanMachine() {
   }
 }
 onMounted(() => { if (isAdmin.value) scanMachine() })
+// the Library's project templates open the form with theirs picked (ADR-199)
+const route = useRoute()
+onMounted(() => {
+  const ref = typeof route.query.template === 'string' ? route.query.template : ''
+  if (ref && isAdmin.value) {
+    openAdd('', '', ref)
+    navigateTo({ query: {} }, { replace: true })
+  }
+})
 
 async function add() {
   adding.value = true
@@ -76,18 +90,20 @@ async function add() {
           method: 'POST',
           body: { url: form.url.trim(), parent: form.parent, dir: form.dir.trim(), name: form.name }
         })
-      : form.scope === 'idea'
+      : form.scope === 'idea' || form.scope === 'template'
         ? await $fetch<{ project: Project }>('/api/projects/new', {
             method: 'POST',
-            body: { idea: form.idea.trim(), stack: form.stack.trim(), parent: form.parent, dir: form.dir.trim(), name: form.name }
+            body: form.scope === 'template'
+              ? { template: form.template, goal: pickedPack.value?.root ? form.goal.trim() : '', parent: form.parent, dir: form.dir.trim(), name: form.name }
+              : { idea: form.idea.trim(), stack: form.stack.trim(), parent: form.parent, dir: form.dir.trim(), name: form.name }
           })
         : await $fetch<{ project: Project }>('/api/projects', {
           method: 'POST',
             body: { path: form.scope === 'folder' ? form.path : '', name: form.name }
           })
     addOpen.value = false
-    // it has the starter agent: the setup picks what else it needs from the library (ADR-166)
-    await navigateTo(`/projects/${res.project.id}/setup`)
+    // a template comes set up (its pack); any other has the starter agent: the setup picks what else it needs (ADR-166)
+    await navigateTo(form.scope === 'template' ? `/projects/${res.project.id}` : `/projects/${res.project.id}/setup`)
   } catch (e) {
     error.value = apiError(e)
   } finally {
@@ -182,6 +198,7 @@ async function add() {
                   { value: 'folder', icon: 'i-lucide-folder-git-2', title: t('projects.scopeFolderTitle'), text: t('projects.scopeFolderText') },
                   { value: 'clone', icon: 'i-lucide-git-branch-plus', title: t('projects.scopeCloneTitle'), text: t('projects.scopeCloneText') },
                   { value: 'idea', icon: 'i-lucide-sparkles', title: t('projects.scopeIdeaTitle'), text: t('projects.scopeIdeaText') },
+                  { value: 'template', icon: 'i-lucide-building-2', title: t('projects.scopeTemplateTitle'), text: t('projects.scopeTemplateText') },
                   { value: 'machine', icon: 'i-lucide-monitor', title: t('projects.scopeMachineTitle'), text: t('projects.scopeMachineText') }
                 ]" :key="opt.value" type="button"
                 class="flex items-start gap-3 rounded-lg border p-3 text-left transition"
@@ -228,6 +245,22 @@ async function add() {
                 <UInput v-model="form.dir" class="w-full font-mono" placeholder="my-app" />
               </UFormField>
             </div>
+            <UFormField :label="t('projects.cloneParent')" :help="ideaDest ? t('projects.ideaInto', { path: ideaDest }) : undefined" required>
+              <FolderTree v-model="form.parent" />
+            </UFormField>
+          </template>
+
+          <template v-if="form.scope === 'template'">
+            <UFormField :label="t('projects.templatePick')" required>
+              <USelect v-model="form.template" :items="packItems" :loading="!packData" class="w-full" />
+              <template v-if="pickedPack" #help>{{ pickedPack.description }}</template>
+            </UFormField>
+            <UFormField v-if="pickedPack?.root" :label="t('projects.companyGoal')">
+              <UTextarea v-model="form.goal" :rows="2" autoresize class="w-full" :placeholder="t('projects.companyGoalPlaceholder')" autofocus />
+            </UFormField>
+            <UFormField :label="t('projects.cloneDir')" required>
+              <UInput v-model="form.dir" class="w-full font-mono" placeholder="acme" />
+            </UFormField>
             <UFormField :label="t('projects.cloneParent')" :help="ideaDest ? t('projects.ideaInto', { path: ideaDest }) : undefined" required>
               <FolderTree v-model="form.parent" />
             </UFormField>

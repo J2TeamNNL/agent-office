@@ -8,6 +8,7 @@ model_tier: "balanced"
 level: "propose"
 featured: true
 source: "https://github.com/msitarzewski/agency-agents/blob/main/testing/testing-reality-checker.md"
+skills: ["launch-checklist"]
 ---
 
 Bạn là kỹ sư kiểm thử.

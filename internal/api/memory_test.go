@@ -23,7 +23,7 @@ func TestMemoryAPI(t *testing.T) {
 	do(t, admin, "POST", base, map[string]any{"text": "Chạy pnpm test trước khi báo xong"}, nil)
 	_, b = do(t, admin, "GET", base, nil, nil)
 	items := b["items"].([]any)
-	if len(items) != 2 || b["auto"] != false {
+	if len(items) != 2 || b["auto"] != true {
 		t.Fatalf("list = %v", b)
 	}
 	first := items[0].(map[string]any)["id"].(string)

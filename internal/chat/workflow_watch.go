@@ -107,7 +107,7 @@ func (e *Engine) superviseOnce(run *wfRun, conv storage.Conversation, project st
 	d, _ := run.def.Role(role)
 	input := cmp.Or(run.rec.Input, "(nothing more)")
 	run.watching, run.watchSeen = true, last
-	ceiling, deadline := perm.Read, run.deadline
+	ceiling := perm.Read
 	if run.ceiling != "" {
 		ceiling = perm.Min(ceiling, run.ceiling)
 	}
@@ -116,10 +116,9 @@ func (e *Engine) superviseOnce(run *wfRun, conv storage.Conversation, project st
 		Workflow, Role, Input, Activity, OK, Drift string
 		Roles                                      []roleView
 	}{run.def.Name, d.Name, input, callerContext(msgs), watchOK, watchDrift, roles})
-	limit := time.Until(deadline)
-	t, _ := e.startTurn(conv, project, turnSpec{agent: a, background: true, delegator: run.coord.ID, actor: run.rec.Actor, ceiling: ceiling, tree: run.tree, limit: limit,
+	t, _ := e.startTurn(conv, project, turnSpec{agent: a, background: true, delegator: run.coord.ID, actor: run.rec.Actor, ceiling: ceiling, tree: run.tree,
 		title: "Giám sát " + run.def.Name + " → " + a.Name, prompt: prompt, wfRun: run.rec.ID, wfRole: role, wfWatch: true}) // i18n-ignore
-	if t == nil || limit <= time.Second { // busy (or about to end): next time
+	if t == nil { // busy: next time
 		e.wf.mu.Lock()
 		run.watching, run.watchSeen = false, ""
 		e.wf.mu.Unlock()

@@ -67,6 +67,8 @@ type Step struct {
 	Role   string   `yaml:"role,omitempty" json:"role,omitempty"`
 	Prompt string   `yaml:"prompt,omitempty" json:"prompt,omitempty"`
 	Roles  []string `yaml:"roles,omitempty" json:"roles,omitempty"`
+	// Skill (agent): a project skill whose instructions go with the prompt (ADR-185)
+	Skill string `yaml:"skill,omitempty" json:"skill,omitempty"`
 	// workflow: another workflow of the project, given inputs by key
 	Workflow string            `yaml:"workflow,omitempty" json:"workflow,omitempty"`
 	Inputs   map[string]string `yaml:"inputs,omitempty" json:"inputs,omitempty"`
@@ -235,6 +237,9 @@ func (d Def) CoordinateDef(s Step, body string) Def {
 
 var stepIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,39}$`)
 
+// skillRe is a skill's name as "/name" calls it (plugin ones "<plugin>:<name>").
+var skillRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$`)
+
 // ValidStepID: a step's id; "_" too, as people and agents write it
 // ({{steps.goc_nhin_a.output}} reads it), unlike a workflow's key.
 func ValidStepID(id string) bool { return stepIDRe.MatchString(id) }
@@ -320,6 +325,9 @@ func (d Def) validateSteps(add func(string, ...any)) {
 			}
 			if strings.TrimSpace(s.Prompt) == "" {
 				add("bước %q: thiếu prompt", s.ID)
+			}
+			if s.Skill != "" && !skillRe.MatchString(s.Skill) {
+				add("bước %q: tên skill %q không hợp lệ", s.ID, s.Skill)
 			}
 		case StepCoordinate:
 			if s.Role != "" {
